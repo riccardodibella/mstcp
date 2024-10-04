@@ -18,6 +18,8 @@
 #include <poll.h>
 #include <time.h>
 
+#include <sys/ioctl.h>
+
 #define MAXFRAME 30000
 #define TIMER_USECS 500
 #define RXBUFSIZE 64000
@@ -62,6 +64,60 @@ unsigned char myip[4] = { 88,80,187,84 }; // TODO startup
 unsigned char mymac[6] = {0xf2,0x3c,0x91,0xdb,0xc2,0x98}; // TODO startup
 unsigned char mask[4] = { 255,255,255,0 }; // TODO startup
 unsigned char gateway[4] = { 88,80,187,1 }; // TODO startup
+
+#define INTERFACE_NAME "eth0"
+
+void load_ifconfig(int fd){
+	// https://www.ibm.com/docs/en/aix/7.2?topic=i-ioctl-socket-control-operations#ioctl_socket_control_operations__commtrf2-gen400__title__1
+	struct ifreq ifr;
+	struct sockaddr_in* addr_ptr;
+	strcpy(ifr.ifr_name, INTERFACE_NAME);
+
+	// ifr.ifr_addr is of type "struct sockaddr"
+	addr_ptr = (struct sockaddr_in*) &ifr.ifr_addr;
+
+	if(ioctl(fd, SIOCGIFADDR, &ifr) == -1){
+		perror("ioctl SIOCGIFADDR");
+		exit(EXIT_FAILURE);
+	}
+	memcpy(myip, &(addr_ptr->sin_addr.s_addr), sizeof(myip));
+
+	if(ioctl(fd, SIOCGIFNETMASK, &ifr) == -1){
+		perror("ioctl SIOCGIFNETMASK");
+		exit(EXIT_FAILURE);
+	}
+	memcpy(mask, &(addr_ptr->sin_addr.s_addr), sizeof(mask));
+
+	if(ioctl(fd, SIOCGIFHWADDR, &ifr) == -1){
+		perror("ioctl SIOCGIFHWADDR");
+		exit(EXIT_FAILURE);
+	}
+	memcpy(mymac, ifr.ifr_hwaddr.sa_data, sizeof(mymac));
+
+	FILE* gw_file = popen("ip route show default | awk '{print $3}'", "r");
+	if(gw_file == NULL){
+		perror("popen");
+		exit(EXIT_FAILURE);
+	}
+	
+	char* gw_str = malloc(1024);
+	if (fgets(gw_str, 1024, gw_file) != NULL) {
+		// Remove possible newline at the end of the string
+		for(int i=0; i<strlen(gw_str); i++){
+			if(gw_str[i] == '\n' || gw_str[i] == '\r'){
+				gw_str[i] = 0;
+				break;
+			}
+		}
+
+		*((unsigned int*)gateway) = inet_addr(gw_str);
+	}else{
+		perror("fgets gateway load_ifconfig");
+		exit(EXIT_FAILURE);
+	}
+	free(gw_str);
+	pclose(gw_file);
+}
 
 unsigned long int rtclock(int cmd){
 static struct timeval tv,zero;
@@ -242,7 +298,7 @@ memcpy(ip->payload,payload,payloadlen);
 len=sizeof(sll);
 bzero(&sll,len);
 sll.sll_family=AF_PACKET;
-sll.sll_ifindex = if_nametoindex("eth0");
+sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 t=sendto(unique_s,packet,14+20+payloadlen, 0,(struct sockaddr *)&sll,len);
 if (t == -1) {perror("sendto failed"); return -1;}
 }
@@ -579,7 +635,7 @@ for(i=0;i<4;i++) arp->dstip[i]=((unsigned char*) &destip)[i];
 //printbuf(pkt,14+sizeof(struct arp_packet));
 bzero(&sll,sizeof(struct sockaddr_ll));
 sll.sll_family = AF_PACKET;
-sll.sll_ifindex = if_nametoindex("eth0");
+sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 len = sizeof(sll);
 n=sendto(unique_s,pkt,14+sizeof(struct arp_packet), 0,(struct sockaddr *)&sll,len);
 fl--;
@@ -1201,11 +1257,12 @@ if (unique_s == -1 ) { perror("Socket Failed"); return 1;}
 if (-1 == fcntl(unique_s, F_SETOWN, getpid())){ perror("fcntl setown"); return 1;} 
 fdfl = fcntl(unique_s, F_GETFL, NULL); if(fdfl == -1) { perror("fcntl f_getfl"); return 1;}
 fdfl = fcntl(unique_s, F_SETFL,fdfl|O_ASYNC|O_NONBLOCK); if(fdfl == -1) { perror("fcntl f_setfl"); return 1;}
+load_ifconfig(unique_s);
 fds[0].fd = unique_s;
 fds[0].events= POLLIN|POLLOUT;
 fds[0].revents=0;
 sll.sll_family = AF_PACKET;
-sll.sll_ifindex = if_nametoindex("eth0");
+sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 myt.it_interval.tv_sec=0; /* Interval for periodic timer */
 myt.it_interval.tv_usec=TIMER_USECS; /* Interval for periodic timer */
 myt.it_value.tv_sec=0;    /* Time until next expiration */
@@ -1245,11 +1302,13 @@ if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){m
 if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){myperror("myconnect"); return 1;}
 printf("Sending Req... %s\n", httpreq);
 if ( mywrite(s,httpreq,strlen(httpreq))==1) { myperror("Mywrite Failed\n"); return -1;}
+printf("a\n\n\n\n");
 for (w=0; t=myread(s,httpresp+w,500000-w);w+=t)
 	if(t== -1){myperror("myread"); return 1;}
+printf("b\n\n\n\n");
 printf("Response size = %d\n",w);
 for(int u=0; u<w; u++){
-	//	printf("%c",httpresp[u]);
+		printf("%c",httpresp[u]);
 		}
 if (-1 == myclose(s)){myperror("myclose"); return 1;}
 
