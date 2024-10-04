@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include <arpa/inet.h>
 #include<errno.h>
 #include<stdio.h>
@@ -56,10 +58,10 @@ int printbuf(void * b, int size){
 	printf("\n");
 }
 
-unsigned char myip[4] = { 88,80,187,84 };
-unsigned char mymac[6] = {0xf2,0x3c,0x91,0xdb,0xc2,0x98};
-unsigned char mask[4] = { 255,255,255,0 };
-unsigned char gateway[4] = { 88,80,187,1 };
+unsigned char myip[4] = { 88,80,187,84 }; // TODO startup
+unsigned char mymac[6] = {0xf2,0x3c,0x91,0xdb,0xc2,0x98}; // TODO startup
+unsigned char mask[4] = { 255,255,255,0 }; // TODO startup
+unsigned char gateway[4] = { 88,80,187,1 }; // TODO startup
 
 unsigned long int rtclock(int cmd){
 static struct timeval tv,zero;
