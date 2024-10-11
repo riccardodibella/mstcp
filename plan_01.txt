@@ -1,0 +1,161 @@
+Apertura della connessione (Active open):
+
+Socket: 
+- Quando il TCB viene creato, si imposta ms_state = UNKNOWN, che comunque dovrebbe essere sovrascritto più tardi sia per active che per passive open
+
+Bind: non cambia niente
+
+Connect:
+- Se lo stato nel TCB è BOUND, sempre DISCOVERY-SYN
+- Se lo stato nel TCB è ancora UNBOUND, scorro le connessioni filtrando solo in base a dst IP e port
+	man mano che le scorro (scorro fdinfo), per ogni TCB:
+	- se fdinfo[i].st != TCB_CREATED continue;
+	- confronto fdinfo[i].tcb->st ...
+
+Possibili valori di stato TCB:
+
+#define TCP_CLOSED 10 // initial state
+#define LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
+#define SYN_SENT 12 // represents waiting for a matching connection request after having sent a connection request.
+#define SYN_RECEIVED 13 //  represents waiting for a confirming connection request acknowledgment after having both received and sent a connection request.
+#define ESTABLISHED 14 // - represents an open connection, data received can be delivered to the user.  The normal state for the data transfer phase of the connection.
+#define FIN_WAIT_1 15 // waiting for a connection termination request from the remote TCP, or an acknowledgment of the conne
+#define FIN_WAIT_2 16 // waiting for a connection termination request from the remote TCP.
+#define CLOSE_WAIT 17 // waiting for a connection termination request from the local user.
+#define CLOSING 18  // waiting for a connection termination request acknowledgment from the remote TCP.
+#define LAST_ACK 19 // waiting for an acknowledgment of the connection termination request previously sent to the remote TCP
+#define TIME_WAIT 20 //waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connection
+
+Se lo stato è > ESTABLISHED sto già chiudendo quella connessione (se era MS-TCP vuol dire che tutti gli stream sono stati chiusi) -> continue;
+Se lo stato è LISTEN non c'è nessuna connessione associata a quel TCB specifico, e le connessioni nella backlog sono passive open e quindi non possono essere usate per aprire nuovi stream -> continue;
+Se lo stato è SYN_RECEIVED, sto facendo un passive open e quindi non posso usarla per aprire stream -> continue;
+
+
+Se lo stato è ESTABLISHED, aggiungo un'informazione di stato nel TCB che mi dice se quella connessione è stata creata come passive o come active open
+	- passive open -> continue;
+	- active open -> rimane un candidato utile (vedi dopo)
+
+
+[DOMANDA] Se lo stato è SYN_SENT sto cercando di aprire una connessione quando il primo connect() non è ancora terminato (nonblocking connect?). Ho due opzioni:
+- Scarto il candidato a prescindere senza aspettare che arrivi il SYN+ACK
+- Se IP e porta sono giusti, aspetto che quella connessione venga stabilita, o fino a un timeout. Quando è stata stabilita o il timeout è scaduto rifaccio il controllo. Questo passaggio va
+	pensato un po' meglio.
+
+
+[DOMANDA] Devo implementare SACK anche per TCP normale? Per poter fare i confronti dopo
+[DOMANDA] A rigore, nell'handshake dovrei inviare anche SACK-Permitted giusto?
+
+
+
+
+Trasmissione:
+
+Nel Channel Control Block c'è una linked list con i segmenti unacked che sono già stati accodati per la trasmissione dallo scheduler. Nello Stream Control Block c'è un array che contiene
+i byte nello stream che devono ancora essere consumati dallo scheduler. L'applicazione può continuare a chiamare write() finchè lo spazio nel buffer circolare per quello stream non finisce.
+
+
+Scheduler:
+Lo scheduler è una funzione che viene chiamata quando c'è spazio nella congestion window per trasmettere un nuovo segmento oltre a quelli già presenti nella TX queue del canale.
+Quando lo scheduler inserisce un segmento nella TX queue libera lo spazio del payload corrispondente dal buffer circolare dello stream. Quando il segmento è creato, viene generata l'opzione 
+MS-TCP con gli Stream ID e Stream Segment Number corretti; viene anche associato ad un Sequence Number all'interno del canale. Rimangono da calcolare il cumulative ACK, gli eventuali SACK
+e la checksum, che verranno aggiornati ogni volta che il segmento viene trasmesso e ristrasmesso.
+
+[DOMANDA] Se voglio inserire i SACK al volo quando invio il segmento, posso scegliere se inserire sempre lo spazio di una dimensione fissa per il numero massimo di SACK e se non ci sono
+mettere un padding o far finire prima le opzioni, oppure tenere separati header, opzioni e payload e costruire il segmento copiando le diverse parti in un buffer temporaneo prima di inviarlo.
+
+Lo scheduler viene chiamato dopo ogni pacchetto ricevuto, perchè potrebbe essersi liberato o aggiunto spazio nella congestion window, e alla fine di mywrite, perchè potrei essere stato in
+attesa di nuovi dati da inviare.
+
+
+
+struct scheduler_stream_info{
+	int stream_id;
+	int ready_bytes; // number of bytes that can be read from the local circular buffer of this stream
+	int flow_control_bytes; // number of bytes that can be sent on the stream without violating receiver flow control for this stream
+	int flight_size; // number of unacked bytes in flight
+};
+
+void scheduler(struct channel_control_block* ccb){
+	
+	struct scheduler_stream_info* scheduler_stream_list = (...*) malloc(sizeof(struct scheduler_stream_info) * ccb->active_streams); // one element for each active stream
+
+	/* fill stream_id field in scheduler_stream_list */
+
+	int tot_space = get_free_space_in_cwnd(); // TODO come si fa?
+	nagle_flag = 1 if (already one not full segment in flight) else 0;
+
+	/* fill ready_bytes field in scheduler_stream_list; if nagle_flag == 1 set ready_bytes = 0 if its value is lower than max segment payload */
+
+	for(int i=0; i<ccb->active_streams; i++){
+		scheduler_stream_list[i].flight_size = 0;
+	}
+
+	/* traverse the linked list of unacked segments in flight and accumulate the payload size in flight_size */
+
+	/* somehow (TODO capire come) initialize flow_control_bytes */
+
+	while(tot_space > 0){
+		int space = min(tot_space, max segment payload);
+
+		if(nagle_flag && space < max segment payload){
+			break;
+		}
+
+		int chosen_stream_id = -1;
+		int chosen_stream_flight_size = -1;
+
+		
+
+		for(i=0; i<ccb->active_streams; i++){
+			if(scheduler_stream_list[i].ready_bytes == 0){
+				continue;
+			}
+			if(chosen_stream_id == -1){
+				chosen_stream_id = scheduler_stream_list[i].stream_id;
+				chosen_stream_flight_size = scheduler_stream_list[i].flight_size;
+				continue;
+			}
+			if(scheduler_stream_list[i].flight_size < chosen_stream_flight_size){
+				chosen_stream_id = scheduler_stream_list[i].stream_id;
+				chosen_stream_flight_size = scheduler_stream_list[i].flight_size;
+			}
+		}
+
+
+
+		if(chosen_stream_id == -1){
+			break;
+		}
+
+		int chosen_list_index;
+		for(chosen_list_index = 0; ;chosen_list_index++){
+			if(scheduler_stream_list[chosen_list_index].stream_id == chosen_stream_id){
+				break;
+			}
+		}
+
+		int segment_payload_size = min(space, scheduler_stream_list[chosen_list_index].ready_bytes);
+
+		prepare_tcp(...);
+
+		tot_space -= segment_payload_size;
+		nagle_flag |= (segment_payload_size < max segment payload);
+		scheduler_stream_list[chosen_list_index].ready_bytes -= segment_payload_size;
+		scheduler_stream_list[chosen_list_index].flow_control_bytes -= segment_payload_size;
+		scheduler_stream_list[chosen_list_index].flight_size += segment_payload_size;
+
+
+		if(nagle_flag){
+			for(int i=0; i<ccb->active_streams; i++){
+				if(scheduler_stream_list[i].ready_bytes < max segment payload){
+					scheduler_stream_list[i].ready_bytes = 0;
+				}
+			}
+		}
+	}
+	return;
+}
+
+
+[DOMANDA] per come ho impostato lo scheduler, se lo stream con la flight size minore ha un segmento incompleto da trasmettere lo privilegio rispetto a un altro stream
+con una flight size più alta ma che può trasmettere un segmento intero. Va bene?

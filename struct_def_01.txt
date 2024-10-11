@@ -1,0 +1,178 @@
+struct tcpctrlblk{
+struct txcontrolbuf *txfirst, * txlast;
+int st;
+unsigned short r_port;
+unsigned int r_addr;
+unsigned short adwin;
+unsigned short radwin;
+unsigned char * rxbuffer; 
+unsigned int rx_win_start;
+struct rxcontrol * unack;
+unsigned int cumulativeack;
+unsigned int ack_offs, seq_offs;
+long long timeout;
+unsigned int sequence;
+unsigned int txfree;
+unsigned int mss;
+unsigned int stream_end;
+unsigned int fsm_timer;
+/* CONG CTRL*/
+
+#ifdef CONGCTRL
+unsigned int ssthreshold;
+unsigned int rtt_e;
+unsigned int Drtt_e;
+unsigned int cong_st;
+unsigned int last_ack;
+unsigned int repeated_acks;
+unsigned int flightsize;
+unsigned int cgwin;
+unsigned int lta;
+#endif
+};
+
+struct socket_info{
+struct tcpctrlblk * tcb;
+int st; 
+unsigned short l_port;
+unsigned int l_addr;
+struct tcpctrlblk * tcblist; //Backlog listen queue
+int bl; //backlog length;
+}fdinfo[MAX_FD];
+
+
+
+
+
+
+
+
+
+
+#define CTRLBLK_TYPE_NONE 0 // used for socket_info.cb_type
+#define CTRLBLK_TYPE_TCP 1
+#define CTRLBLK_TYPE_STREAM 2
+#define CTRLBLK_TYPE_CHANNEL 3
+
+// Generic control block (TCP / Stream / Channel control block)
+struct genctrlblk{
+	int cb_type;
+};
+
+
+/*
+	cb_type potrebbe essere aggreagato in st dividendo TCB created in TCB_CREATED and SCB_CREATED
+*/
+struct socket_info{
+int st; 
+int cb_type;
+struct genctrlblk * gcb;
+unsigned short l_port;
+unsigned int l_addr;
+
+/* TODO passive open */
+struct tcpctrlblk * tcblist; //Backlog listen queue
+int bl; //backlog length;
+}fdinfo[MAX_FD];
+
+#define ACTIVE_SIDE_SERVER false
+#define ACTIVE_SIDE_CLIENT true
+
+struct tcpctrlblk{
+	int cb_type; // CTRBLK_TYPE_TCP
+
+	struct txcontrolbuf *txfirst, * txlast; <= MANCA
+	int st;
+	bool is_active_side;
+	unsigned short r_port;
+	unsigned int r_addr;
+	unsigned short adwin; <= MANCA
+	unsigned short radwin; <= MANCA
+	unsigned char * rxbuffer;  <= MANCA
+	unsigned int rx_win_start; <= MANCA
+	struct rxcontrol * unack; <= MANCA
+	unsigned int cumulativeack; <= MANCA
+	unsigned int ack_offs, seq_offs; <= MANCA
+	long long timeout; <= MANCA
+	unsigned int sequence; <= MANCA
+	unsigned int txfree; <= MANCA
+	unsigned int mss;
+	unsigned int stream_end; <= MANCA
+	unsigned int fsm_timer; <= MANCA
+
+	/* CONG CTRL*/
+	#ifdef CONGCTRL
+	unsigned int ssthreshold;
+	unsigned int rtt_e;
+	unsigned int Drtt_e;
+	unsigned int cong_st;
+	unsigned int last_ack;
+	unsigned int repeated_acks;
+	unsigned int flightsize;
+	unsigned int cgwin;
+	unsigned int lta;
+	#endif
+};
+
+struct chnctrlblk{
+	int cb_type; // CTRBLK_TYPE_CHANNEL
+	int st; // Channel state starts from ESTABLISHED and behaves in the same way as that of TCP control block for channel closing
+	bool is_active_side;
+	int used_streams; // number of already allocated streams (equal to the next stream number that will be assigned)
+	int active_streams; // number of non-closed streams (equal to the size of the stream_list array)
+
+	/*
+		having a list of pointers allows to avoid moving around a bunch of struct strctrblk when you close a stream 
+		that is at the beginning of the list to remove it before resizing the array with realloc()
+	*/
+	struct strctrlblk** scb_ptr_list;
+
+	struct txcontrolbuf *txfirst, * txlast;
+
+	unsigned short r_port;
+	unsigned int r_addr;
+
+
+
+
+
+
+
+
+	unsigned int mss;
+
+	
+
+	/* CONG CTRL*/
+	#ifdef CONGCTRL
+	unsigned int ssthreshold;
+	unsigned int rtt_e;
+	unsigned int Drtt_e;
+	unsigned int cong_st;
+	unsigned int last_ack;
+	unsigned int repeated_acks;
+	unsigned int flightsize;
+	unsigned int cgwin;
+	unsigned int lta;
+	#endif
+};
+
+
+
+/* 
+fields read from the corresponding channel control block:
+- mss
+- is_active_side
+*/
+struct strctrlblk{
+	int cb_type; // CTRBLK_TYPE_STREAM
+
+	struct txcontrolbuf *txfirst, * txlast;
+
+
+
+
+
+
+	
+};

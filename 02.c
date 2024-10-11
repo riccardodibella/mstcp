@@ -19,6 +19,9 @@
 #include <time.h>
 
 #include <sys/ioctl.h>
+#include <stdbool.h>
+#include <inttypes.h>
+
 
 #define MAXFRAME 30000
 #define TIMER_USECS 500
@@ -40,6 +43,7 @@ int g_argc; // Global Argc
 
 char * usage_string = "%s <port> [<TXBUFSIZE (default 100K)>] [<TIMEOUT msec (default 300)>] [MODE: <SRV|CLN> (default SRV)] [1/LOSSRATE <1/N> (default 10000)\n";
 unsigned char  mssopt[4] = { 0x02, 0x04, 0x05, 0x90};
+unsigned char mss_ms_opt[] = {0x02, 0x04, 0x05, 0x90, 253, 4, 0, 0};
 struct sigaction action_io, action_timer;
 sigset_t mymask;
 unsigned char l2buffer[MAXFRAME];
@@ -347,6 +351,15 @@ unsigned char mac[6]; //Mac address
 #define PSH 0x08
 #define ACK 0x10
 #define URG 0x20
+
+#define MS_ENABLED 1
+
+#define MS_STATE_UNSUPPORTED -1
+#define MS_STATE_UNKNOWN 0
+#define MS_STATE_SYN_SENT 1
+#define MS_STATE_ESTABLISHED 2
+
+
 int myerrno;
 
 void myperror(char *message) {;//printf("%s: %s\n",message,strerror(myerrno));
@@ -429,6 +442,9 @@ unsigned int flightsize;
 unsigned int cgwin;
 unsigned int lta;
 #endif
+
+/* MS-TCP */
+int ms_state;
 };
 
 struct socket_info{
@@ -711,21 +727,21 @@ return 0;
 }
 
 int mybind(int s, struct sockaddr * addr, int addrlen){
-if((addr->sa_family == AF_INET)){
-	struct sockaddr_in * a = (struct sockaddr_in*) addr;
-	if ( s >= 3 && s<MAX_FD){
-		if(fdinfo[s].st != TCP_UNBOUND){myerrno = EINVAL; return -1;}
-		if(a->sin_port && port_in_use(a->sin_port)) {myerrno = EADDRINUSE; return -1;} 
-		fdinfo[s].l_port = (a->sin_port)?a->sin_port:get_free_port();   
-		if(fdinfo[s].l_port == 0 ) {myerrno = ENOMEM; return -1;}
-		fdinfo[s].l_addr = (a->sin_addr.s_addr)?a->sin_addr.s_addr:*(unsigned int*)myip;
-		fdinfo[s].st = TCP_BOUND;
-		myerrno = 0;
-		return 0;
+	if((addr->sa_family == AF_INET)){
+		struct sockaddr_in * a = (struct sockaddr_in*) addr;
+		if ( s >= 3 && s<MAX_FD){
+			if(fdinfo[s].st != TCP_UNBOUND){myerrno = EINVAL; return -1;}
+			if(a->sin_port && port_in_use(a->sin_port)) {myerrno = EADDRINUSE; return -1;} 
+			fdinfo[s].l_port = (a->sin_port)?a->sin_port:get_free_port();   
+			if(fdinfo[s].l_port == 0 ) {myerrno = ENOMEM; return -1;}
+			fdinfo[s].l_addr = (a->sin_addr.s_addr)?a->sin_addr.s_addr:*(unsigned int*)myip;
+			fdinfo[s].st = TCP_BOUND;
+			myerrno = 0;
+			return 0;
+		}
+		else { myerrno = EBADF ; return -1;}
 	}
-	else { myerrno = EBADF ; return -1;}
-}
-else { myerrno = EINVAL; return -1; }
+	else { myerrno = EINVAL; return -1; }
 }
 
 int fsm(int s, int event, struct ip_datagram * ip)
@@ -752,17 +768,23 @@ switch(tcb->st){
 			tcb->adwin =RXBUFSIZE;
 			tcb->radwin =RXBUFSIZE;
 
-#ifdef CONGCTRL
-    tcb->ssthreshold = INIT_THRESH * TCP_MSS;
-    tcb->cgwin = INIT_CGWIN* TCP_MSS;
-    tcb->timeout = INIT_TIMEOUT;
-    tcb->rtt_e = 0;
-    tcb->Drtt_e = 0;
-    tcb->cong_st = SLOW_START;
-#endif  
-			prepare_tcp(s,SYN,NULL,0,mssopt,sizeof(mssopt));
+			#ifdef CONGCTRL
+				tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+				tcb->cgwin = INIT_CGWIN* TCP_MSS;
+				tcb->timeout = INIT_TIMEOUT;
+				tcb->rtt_e = 0;
+				tcb->Drtt_e = 0;
+				tcb->cong_st = SLOW_START;
+			#endif
+
+			if(MS_ENABLED){
+				prepare_tcp(s,SYN,NULL,0,mss_ms_opt,sizeof(mss_ms_opt));
+				tcb->ms_state = MS_STATE_SYN_SENT;
+			}else{
+				prepare_tcp(s,SYN,NULL,0,mssopt,sizeof(mssopt));
+				tcb->ms_state = MS_STATE_UNSUPPORTED;
+			}
 			tcb->st = SYN_SENT;	
-			
 		}
 		break;
 	
@@ -776,8 +798,34 @@ switch(tcb->st){
 				tcb->txfirst = tcb->txlast = NULL;	
 				prepare_tcp(s,ACK,NULL,0,NULL,0);	
 				tcb->st = ESTABLISHED;
+
+				// MS-TCP option ACK check
+				if(tcb->ms_state == SYN_SENT){
+					bool option_found = false;
+
+					int options_length = (tcp->d_offs_res >> 4) * 4 - 20;
+					for(int options_cursor = 0; options_cursor < options_length; options_cursor++){
+						uint8_t optkind = tcp->payload[options_cursor];
+						if(optkind == 0){
+							break;
+						}
+						if(optkind == 1){
+							continue;
+						}
+						uint8_t optlen = tcp->payload[options_cursor + 1];
+						options_cursor += (optlen - 1); // 1 is added at the beginning of the next iteration
+						if(optkind == 253){
+							option_found = true;
+							break;
+						}
+					}
+					printf("TODO continuare da qui\n");
+					exit(0);
+
+					tcb->ms_state = option_found ? MS_STATE_ESTABLISHED : MS_STATE_UNSUPPORTED;
 				}
 			}
+		}
 		break;
 
 	 case ESTABLISHED: 
@@ -918,77 +966,77 @@ if((addr->sa_family == AF_INET)){
 	struct sockaddr_in * a = (struct sockaddr_in*) addr;
 	struct sockaddr_in local;
 	if ( s >= 3 && s<MAX_FD){
-			if(fdinfo[s].st == TCP_UNBOUND){
-					local.sin_port=htons(0);
-					local.sin_addr.s_addr = htonl(0);
-					local.sin_family = AF_INET;
-					if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{myperror("implicit binding failed\n"); return -1; }
-			}
-			if(fdinfo[s].st == TCP_BOUND){
-					fdinfo[s].tcb = (struct tcpctrlblk *) malloc(sizeof(struct tcpctrlblk));
-					bzero(fdinfo[s].tcb, sizeof(struct tcpctrlblk));
-					fdinfo[s].st = TCB_CREATED;
-					fdinfo[s].tcb->st = TCP_CLOSED;
-					fdinfo[s].tcb->r_port = a->sin_port;
-					fdinfo[s].tcb->r_addr = a->sin_addr.s_addr;
-					printf("%.7ld: Reset clock\n",rtclock(1));
-					fsm(s,APP_ACTIVE_OPEN,NULL); 				
-			} else {myerrno = EBADF; return -1; } 	
-			while(sleep(10)){
-					if(fdinfo[s].tcb->st == ESTABLISHED ) return 0;
-					if(fdinfo[s].tcb->st == TCP_CLOSED ){ myerrno = ECONNREFUSED; return -1;} 
-			}	
-			myerrno=ETIMEDOUT; return -1;
-}
-else { myerrno = EBADF; return -1; }
+		if(fdinfo[s].st == TCP_UNBOUND){
+				local.sin_port=htons(0);
+				local.sin_addr.s_addr = htonl(0);
+				local.sin_family = AF_INET;
+				if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{myperror("implicit binding failed\n"); return -1; }
+		}
+		if(fdinfo[s].st == TCP_BOUND){
+				fdinfo[s].tcb = (struct tcpctrlblk *) malloc(sizeof(struct tcpctrlblk));
+				bzero(fdinfo[s].tcb, sizeof(struct tcpctrlblk));
+				fdinfo[s].st = TCB_CREATED;
+				fdinfo[s].tcb->st = TCP_CLOSED;
+				fdinfo[s].tcb->r_port = a->sin_port;
+				fdinfo[s].tcb->r_addr = a->sin_addr.s_addr;
+				printf("%.7ld: Reset clock\n",rtclock(1));
+				fsm(s,APP_ACTIVE_OPEN,NULL); 				
+		} else {myerrno = EBADF; return -1; } 	
+		while(sleep(10)){
+				if(fdinfo[s].tcb->st == ESTABLISHED ) return 0;
+				if(fdinfo[s].tcb->st == TCP_CLOSED ){ myerrno = ECONNREFUSED; return -1;} 
+		}	
+		myerrno=ETIMEDOUT; return -1;
+	}
+	else { myerrno = EBADF; return -1; }
 }
 else { myerrno = EINVAL; return -1; }
 }
 
 int mywrite(int s, unsigned char * buffer, int maxlen){
-int len,totlen=0,j,actual_len;
-if(fdinfo[s].st != TCB_CREATED || fdinfo[s].tcb->st != ESTABLISHED ){ myerrno = EINVAL; return -1; }
-if(maxlen == 0) return 0;
+	int len,totlen=0,j,actual_len;
+	if(fdinfo[s].st != TCB_CREATED || fdinfo[s].tcb->st != ESTABLISHED ){ myerrno = EINVAL; return -1; }
+	if(maxlen == 0) return 0;
 
-do{
-actual_len = MIN(maxlen,fdinfo[s].tcb->txfree);
-if ((actual_len !=0) || (fdinfo[s].tcb->st == TCP_CLOSED)) break;
-}while(pause());
+	do{
+		actual_len = MIN(maxlen,fdinfo[s].tcb->txfree);
+		if ((actual_len !=0) || (fdinfo[s].tcb->st == TCP_CLOSED)) break;
+	}while(pause());
 
-for(j=0;j<actual_len; j+=fdinfo[s].tcb->mss){
+	for(j=0;j<actual_len; j+=fdinfo[s].tcb->mss){
 		len = MIN(fdinfo[s].tcb->mss, actual_len-j);
-if(-1 == sigprocmask(SIG_BLOCK, &mymask, NULL)){perror("sigprocmask"); return -1 ;}
+		if(-1 == sigprocmask(SIG_BLOCK, &mymask, NULL)){perror("sigprocmask"); return -1 ;}
 		prepare_tcp(s,ACK,buffer+j,len,NULL,0);
-if(-1 == sigprocmask(SIG_UNBLOCK, &mymask, NULL)){perror("sigprocmask"); return -1 ;}
+		if(-1 == sigprocmask(SIG_UNBLOCK, &mymask, NULL)){perror("sigprocmask"); return -1 ;}
 		fdinfo[s].tcb->txfree -= len;
 		totlen += len;
 	}
-return totlen;	
+	return totlen;	
 } 
 
 
 int myread(int s, unsigned char *buffer, int maxlen)
 {
-int j,actual_len;
-if((fdinfo[s].st != TCB_CREATED) || (fdinfo[s].tcb->st < ESTABLISHED )){ myerrno = EINVAL; return -1; }
-if (maxlen==0) return 0;
-actual_len = MIN(maxlen,fdinfo[s].tcb->cumulativeack - fdinfo[s].tcb->rx_win_start);
-if(fdinfo[s].tcb->cumulativeack > fdinfo[s].tcb->stream_end) actual_len --;
-if(actual_len==0){
+	int j,actual_len;
+	if((fdinfo[s].st != TCB_CREATED) || (fdinfo[s].tcb->st < ESTABLISHED )){ myerrno = EINVAL; return -1; }
+	if (maxlen==0) return 0;
+	actual_len = MIN(maxlen,fdinfo[s].tcb->cumulativeack - fdinfo[s].tcb->rx_win_start);
+	if(fdinfo[s].tcb->cumulativeack > fdinfo[s].tcb->stream_end) actual_len --;
+	if(actual_len==0){
 		while(pause()){
 			actual_len = MIN(maxlen,fdinfo[s].tcb->cumulativeack - fdinfo[s].tcb->rx_win_start);
 			if(actual_len>0 && (fdinfo[s].tcb->cumulativeack > fdinfo[s].tcb->stream_end)) actual_len --;
 			if(actual_len!=0) break;		
 			if(fdinfo[s].tcb->rx_win_start) 
 				if(fdinfo[s].tcb->rx_win_start==fdinfo[s].tcb->stream_end) {return 0;}
-    	if ((fdinfo[s].tcb->st == CLOSE_WAIT) && (fdinfo[s].tcb->unack == NULL ) ) {return 0;} // FIN received and acknowledged
+			if ((fdinfo[s].tcb->st == CLOSE_WAIT) && (fdinfo[s].tcb->unack == NULL ) ) {return 0;} // FIN received and acknowledged
 		}
 	}
-for(j=0; j<actual_len; j++){
-	buffer[j]=fdinfo[s].tcb->rxbuffer[(fdinfo[s].tcb->rx_win_start + j)%RXBUFSIZE];
-}
-fdinfo[s].tcb->rx_win_start+=j;
-return j;
+	for(j=0; j<actual_len; j++){
+		buffer[j]=fdinfo[s].tcb->rxbuffer[(fdinfo[s].tcb->rx_win_start + j)%RXBUFSIZE];
+	}
+	fdinfo[s].tcb->rx_win_start+=j;
+	return j;
 }
 
 int myclose(int s){
