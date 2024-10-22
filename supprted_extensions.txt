@@ -1,0 +1,47 @@
+Maximum # of option bytes: 40
+
+-------------- Handshake options
+
+MS-TCP
+Kind: 253
+Length: 4
+LSS | SID | SSN (2 bytes)
+
+SACK-Permitted
+Kind: 4
+Length: 2
+
+Window Scale:
+Kind: 3
+Length: 3
+Value: shft_cnt (1 byte)
+
+Timestamps:
+Kind: 8
+Length: 10
+Value: TS Value (4 bytes) | TS Echo Reply (4 bytes)
+
+
+
+-------------- Payload options
+
+MS-TCP
+Kind: 253
+Length: 4
+Value: LSS | SID | SSN (2 bytes)
+
+SACK
+Kind: 5
+Length: 2 bytes + (8 bytes * number of records)
+Records composed of 2 seq numbers for each block (left and right edge)
+
+Timestamps:
+Kind: 8
+Length: 10
+Value: TS Value (4 bytes) | TS Echo Reply (4 bytes)
+
+
+
+
+Payload options structure:
+Timestamps (10 byte) | MS-TCP (4 bytes) | SACK (3 records: 2 + 3*8 = 24)
