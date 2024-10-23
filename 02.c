@@ -1261,33 +1261,33 @@ fdinfo[s].bl = bl; //Backlog length size;
 
 int myaccept(int s, struct sockaddr * addr, int * len)
 {
-int i,j;
-if (addr->sa_family == AF_INET){
-  struct sockaddr_in * a = (struct sockaddr_in *) addr;
-  *len = sizeof(struct sockaddr_in);
-  if (fdinfo[s].tcb->st!=LISTEN) {myerrno=EBADF; return -1;}
-  if (fdinfo[s].tcblist == NULL) {myerrno=EBADF; return -1;}
-  do{
-      for(i=0;i<fdinfo[s].bl;i++){
-        if(fdinfo[s].tcblist[i].st==ESTABLISHED){ //Not Fifo Queue
-          for(j=3;j<MAX_FD && fdinfo[j].st!=FREE;j++); // Searching for free d
-          if (j == MAX_FD) { myerrno=ENFILE; return -1;} //Not free descriptor
-          else  { //Free File descriptor found
-            fdinfo[j]=fdinfo[s];
+	int i,j;
+	if (addr->sa_family == AF_INET){
+		struct sockaddr_in * a = (struct sockaddr_in *) addr;
+		*len = sizeof(struct sockaddr_in);
+		if (fdinfo[s].tcb->st!=LISTEN) {myerrno=EBADF; return -1;}
+		if (fdinfo[s].tcblist == NULL) {myerrno=EBADF; return -1;}
+		do{
+			for(i=0;i<fdinfo[s].bl;i++){
+				if(fdinfo[s].tcblist[i].st==ESTABLISHED){ //Not Fifo Queue
+					for(j=3;j<MAX_FD && fdinfo[j].st!=FREE;j++); // Searching for free d
+					if (j == MAX_FD) { myerrno=ENFILE; return -1;} //Not free descriptor
+					else  { //Free File descriptor found
+						fdinfo[j]=fdinfo[s];
 						fdinfo[j].tcb=(struct tcpctrlblk *) malloc(sizeof(struct tcpctrlblk));
 						memcpy(fdinfo[j].tcb,fdinfo[s].tcblist+i,sizeof(struct tcpctrlblk)); //Tcb of j is copied from this pending connection on backlog
-            a->sin_port = fdinfo[j].tcb->r_port; //report on remote port
-            a->sin_addr.s_addr = fdinfo[j].tcb->r_addr;//report on remote IP a
-            fdinfo[j].bl=0; //twin socket has not backlog queue
-            fdinfo[s].tcblist[i].st=FREE;
+						a->sin_port = fdinfo[j].tcb->r_port; //report on remote port
+						a->sin_addr.s_addr = fdinfo[j].tcb->r_addr;//report on remote IP a
+						fdinfo[j].bl=0; //twin socket has not backlog queue
+						fdinfo[s].tcblist[i].st=FREE;
 						printf("%.7ld: Reset clock\n",rtclock(1));
-            prepare_tcp(j,ACK,NULL,0,NULL,0);
-            return j; //New socket connect is returned
-          }
-        }//if pending connection
-      }//for each fd
-    } while(pause()); //Accept never ends
-  }else { myerrno=EINVAL; return -1;}
+						prepare_tcp(j,ACK,NULL,0,NULL,0);
+						return j; //New socket connect is returned
+					}
+				}//if pending connection
+			}//for each fd
+		} while(pause()); //Accept never ends
+  	}else { myerrno=EINVAL; return -1;}
 }
 
 

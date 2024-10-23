@@ -47,10 +47,16 @@ int bl; //backlog length;
 
 
 
+
+
+
+
+
 #define CTRLBLK_TYPE_NONE 0 // used for socket_info.cb_type
 #define CTRLBLK_TYPE_TCP 1
 #define CTRLBLK_TYPE_STREAM 2
 #define CTRLBLK_TYPE_CHANNEL 3
+
 
 // Generic control block (TCP / Stream / Channel control block)
 struct genctrlblk{
@@ -58,20 +64,21 @@ struct genctrlblk{
 };
 
 
+
 /*
 	cb_type potrebbe essere aggreagato in st dividendo TCB created in TCB_CREATED and SCB_CREATED
 */
-struct socket_info{
-int st; 
-int cb_type;
-struct genctrlblk * gcb;
-unsigned short l_port;
-unsigned int l_addr;
+struct socket_info {
+	int st; 
+	int cb_type;
+	struct genctrlblk * gcb;
+	unsigned short l_port;
+	unsigned int l_addr;
 
-/* TODO passive open */
-struct tcpctrlblk * tcblist; //Backlog listen queue
-int bl; //backlog length;
+	struct genctrlblk** backlog; // Backlog listen queue (TCP or Channel Control Blocks). An empty location is NULL
+	int backlog_length; // backlog length;
 }fdinfo[MAX_FD];
+
 
 #define ACTIVE_SIDE_SERVER false
 #define ACTIVE_SIDE_CLIENT true
@@ -118,6 +125,7 @@ struct chnctrlblk{
 	bool is_active_side;
 	int used_streams; // number of already allocated streams (equal to the next stream number that will be assigned)
 	int active_streams; // number of non-closed streams (equal to the size of the stream_list array)
+	int accepted_streams; // number of streams that have already been linked to the fdinfo_ptrs list with an accept(), used to understand when to move a CCB from the listening TCB to the chinfo_ptrs list
 
 	/*
 		having a list of pointers allows to avoid moving around a bunch of struct strctrblk when you close a stream 

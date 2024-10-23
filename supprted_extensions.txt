@@ -21,6 +21,11 @@ Kind: 8
 Length: 10
 Value: TS Value (4 bytes) | TS Echo Reply (4 bytes)
 
+Maximum Segment Size:
+Kind: 2
+Length: 4
+Value: 2 bytes
+
 
 
 -------------- Payload options
@@ -44,4 +49,4 @@ Value: TS Value (4 bytes) | TS Echo Reply (4 bytes)
 
 
 Payload options structure:
-Timestamps (10 byte) | MS-TCP (4 bytes) | SACK (3 records: 2 + 3*8 = 24)
+MS-TCP (4 bytes) | Timestamps (10 byte) | SACK (3 records: 2 + 3*8 = 24)
