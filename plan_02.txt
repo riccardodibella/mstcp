@@ -172,7 +172,8 @@ in questo modo si cambia per forza la semantica della backlog length che può in
 
 [DOMANDA] Per i TCB dei socket listening, va aggiunto un campo per salvare, quando lo stato è SYN_SENT, se si sta aprendo una connessione MS-TCP o meno. Dato che tanti campi non servono, ha senso fare
 un altro tipo di Control Block (LCB Listen Control Block) che ha meno campi del TCB a parte questo campo aggiunto oppure tengo il TCB normale e ci aggiungo solo un campo, che viene riazzerato quando
-duplico il TCB quando ricevo l'ACK che fa tornare in stato LISTEN?
+duplico il TCB quando ricevo l'ACK che fa tornare in stato LISTEN? Se si sceglie di creare un LCB, quando in SYN_RECEIVED ricevo un ACK prima di tornare a LISTEN devo creare un TCB dal LCB corrente se
+non viene negoziato il Multi-Stream, altrimenti se uso il TCB basta clonarlo come viene fatto adesso.
 
 Il ciclo LISTEN/SYN_RECEIVED funziona in modo simile al TCP normale, con la modifica che quando viene aggiunto un Control Block alla backlog il suo tipo dipende dal valore del campo aggiuntivo inserito
 nel listening TCB, che dice se si sta aprendo canale Multi-Stream o no. In caso venga creato un CCB da aggiungere alla backlog, viene già creato anche lo SCB per lo stream 0 (in modo analogo a quello che
@@ -180,10 +181,21 @@ succede per l'active open) e viene aggiunto alla lista di stream del CCB.
 
 Quando viene chiamato accept(), si scorre tutta la lista di GCB che è salvata nella entry di fdinfo del listening socket. Se scorrendo trova un TCB, rimuove quel TCB dalla lista e lo associa a un file descriptor
 libero. Se non c'è nessun TCB, scorre di nuovo la lista per cercare un CCB. Se non ne trova nessuno (tutta la lista è NULL) si rimette ad aspettare. Se trova un CCB, associa ad un file descriptor il primo stream
-non assegnato (spiegato dopo come trovarlo [TODO]), incrementa il contatore accepted_streams e se accepted_streams == used_streams rimuove il CCB dalla backlog e lo inserisce in chinfo_ptrs. Vengono tolti dalla coda 
-i TCB prima dei CCB per tenere libero il massimo numero possibile di locazioni nella backlog della entry di fdinfo, dato che rimuovere un TCB libera sicuramente una locazione, e rimuovere uno stream da un CCB
+non assegnato (spiegato dopo come trovarlo [TODO]), incrementa il contatore accepted_streams e se accepted_streams == used_streams rimuove il CCB dalla backlog e lo inserisce in chinfo_ptrs. Vengono tolti dalla 
+coda i TCB prima dei CCB per tenere libero il massimo numero possibile di locazioni nella backlog della entry di fdinfo, dato che rimuovere un TCB libera sicuramente una locazione, e rimuovere uno stream da un CCB
 non sempre causerà la rimozione del CCB dalla backlog.
 
 [DOMANDA] Al momento myaccept() funziona solo se lo stato del TCB del listening socket è LISTEN. Dato che per quel socket lo stato passa per ogni connessione da LISTEN a SYN_RECEIVED, dovrei consentire
 entrambi gli stati, giusto? Quindi diventerebbe if(fdinfo[s].tcb->st!=LISTEN && fdinfo[s].tcb->st!=SYN_RECEIVED).
 
+[DOMANDA] Cosa faccio con la variabile "fl" che controlla il blocco dei segnali?
+[DOMANDA] Quando costruisco il parametro di poll(), va bene mettere solo POLLIN come evento giusto? Al momento c'è POLLIN | POLLOUT anche se POLL viene usato solo in myio, non capisco perchè
+
+[DOMANDA] La interazione tra TCP Options e Nagle's Algorithm è standardizzata? L'MSS (inviato nell'opzione durante l'handshake) include solo le parti fisse degli header, quindi se MTU=1500B allora MSS=1460B. Dato
+che a regime ci sono sempre opzioni nell'header, è giusto impostare la generazione di pacchetti in questo modo?
+1. Prima di iniziare a generare i pacchetti, calcolo quanti byte di header mi servono per ogni pacchetto (opts). Questo è un valore fisso che dipende solo dal tipo di connessione (MS o meno).
+2. Per MS, il nagle_flag (che vale 1 se ho almeno un pacchetto in volo con size non massima) lo calcolo controllando se uno di quei pacchetti ha dimensione totale IP < 1500, oppure se la lunghezza del payload 
+è MSS - opts.
+3. Consumo i dati da trasmettere normalmente, in blocchi di MSS - opts byte.
+Se faccio così, c'è qualche controindicazione nel mettere MSS = 1460 invece di 1400 come era impostato in mytcp? Questo mi consente di creare i segmenti usando sizeof(struct tcp_segment) e mettendo come size
+del campo payload (che include anche le opzioni) 1460 nella definizione di struct tcp_segment.
