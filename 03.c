@@ -27,12 +27,25 @@
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 #define MAX_ARP 200 // number of lines in the ARP cache
+#define MAX_FD 8 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
+
+#define MIN_PORT 19000
+#define MAX_PORT 19999
 
 #define TCP_PROTO 6 // protocol field inside IP header
 
 #define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
 
+#define FDINFO_ST_FREE 0 // mytcp: FREE
+#define FDINFO_ST_UNBOUND 1 // mytcp: TCP_UNBOUND
+#define FDINFO_ST_BOUND 2 // mytcp: TCP_BOUND 
+#define FDINFO_ST_GCB_CREATED 3 // mytcp: TCB_CREATED
+
+#define CTRLBLK_TYPE_NONE 0 // used for socket_info.cb_type
+#define CTRLBLK_TYPE_TCP 1
+#define CTRLBLK_TYPE_STREAM 2
+#define CTRLBLK_TYPE_CHANNEL 3
 
 /* STRUCT DEFINITIONS */
 
@@ -87,6 +100,22 @@ unsigned int key; //IP address
 unsigned char mac[6]; //Mac address
 };
 
+struct socket_info {
+	int st; 
+	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_STREAM
+	struct genctrlblk * gcb;
+	unsigned short l_port;
+	unsigned int l_addr;
+
+	struct genctrlblk** backlog; // Backlog listen queue (TCP or Channel Control Blocks). An empty location is NULL
+	int backlog_length; // backlog length;
+};
+
+struct gcb_list_node {
+	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_CHANNEL
+	struct genctrlblk * gcb;
+	struct channel_info_node* next;
+};
 
 
 
@@ -101,15 +130,19 @@ unsigned char gateway[4];
 
 int unique_raw_socket_fd = -1; // mytcp: unique_s
 
+int last_port=MIN_PORT; // Last assigned port during bind()
+
+int myerrno;
+
 sigset_t global_signal_mask; // mytcp: mymask
 
 struct arpcacheline arpcache[MAX_ARP];
 
 uint8_t l2_rx_buf[L2_RX_BUF_SIZE]; // mytcp: l2buf
 
+struct socket_info fdinfo[MAX_FD]; // locations 0, 1 and 2 are left empty
 
-
-
+struct gcb_list_node chinfo_head;
 
 /* FUNCTION DEFINITIONS */
 
@@ -122,6 +155,13 @@ void ERROR(char* c, ...){
     printf("\n");
     exit(EXIT_FAILURE);
 }
+
+void myperror(char* message) {
+	printf("MYPERROR %s: %s\n", message, strerror(myerrno));
+}
+
+
+
 
 #pragma region STARTUP_FUNCTIONS
 void raw_socket_setup(){
@@ -363,7 +403,9 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 
-#pragma region PACKET_RECEPTION
+
+
+
 void myio(int ignored){
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
@@ -430,6 +472,78 @@ void myio(int ignored){
 void mytimer(int ignored){}
 
 
+bool port_in_use( unsigned short port ){
+	int s;
+	for ( s=3; s<MAX_FD; s++)
+	if (fdinfo[s].st != FDINFO_ST_FREE && fdinfo[s].st!=FDINFO_ST_UNBOUND){
+		if(fdinfo[s].l_port == port){
+			return true;
+		}
+	}
+	return false;
+}
+
+unsigned short int get_free_port(){
+	unsigned short p;
+	for ( p = last_port; p<MAX_PORT && port_in_use(p); p++);
+	if (p<MAX_PORT){
+		return last_port=p;
+	}
+	for ( p = MIN_PORT; p<last_port && port_in_use(p); p++);
+	if (p<last_port){
+		return last_port=p;
+	}
+	return 0;
+}
+
+int mybind(int s, struct sockaddr * addr, int addrlen){
+	if((addr->sa_family != AF_INET)){
+		myerrno = EINVAL; 
+		return -1;
+	}
+	if(s < 3 || s >= MAX_FD){
+		myerrno = EBADF; 
+		return -1;
+	}
+	if(fdinfo[s].st != FDINFO_ST_UNBOUND){
+		myerrno = EINVAL; 
+		return -1;
+	}
+	struct sockaddr_in * a = (struct sockaddr_in*) addr;
+	if(a->sin_port != 0 && port_in_use(a->sin_port)) {
+		myerrno = EADDRINUSE; 
+		return -1;
+	} 
+	fdinfo[s].l_port = (a->sin_port != 0) ? a->sin_port : get_free_port();   
+	if(fdinfo[s].l_port == 0 ) {
+		myerrno = EADDRINUSE; // mytcp: ENOMEM 
+		return -1;
+	}
+	fdinfo[s].l_addr = (a->sin_addr.s_addr)?a->sin_addr.s_addr:*(unsigned int*)myip;
+	fdinfo[s].st = FDINFO_ST_UNBOUND;
+	myerrno = 0;
+	return 0;
+
+}
+
+int mysocket(int family, int type, int proto){
+	int i;
+	if(family != AF_INET ||  type != SOCK_STREAM || proto != 0){
+		myerrno = EINVAL; 
+		return -1;
+	}
+	for(i=3; i<MAX_FD && fdinfo[i].st!=FDINFO_ST_FREE;i++){}
+	if(i==MAX_FD) {
+		myerrno = ENFILE; 
+		return -1;
+	}  
+	else {
+		bzero(fdinfo+i, sizeof(struct socket_info));
+		fdinfo[i].st = FDINFO_ST_UNBOUND;
+		myerrno = 0;
+		return i;
+	}
+}
 
 int main(){
 	raw_socket_setup();

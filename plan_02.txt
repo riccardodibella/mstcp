@@ -2,6 +2,7 @@ Apertura della connessione (Active open):
 
 Socket: 
 - Quando il TCB viene creato, si imposta ms_state = UNKNOWN, che comunque dovrebbe essere sovrascritto più tardi sia per active che per passive open
+Rettifica: il TCB non viene creato durante socket, quindi basta impostare cb_type = CB_TYPE_NONE
 
 Bind: non cambia niente
 
