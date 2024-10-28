@@ -139,6 +139,15 @@ int last_port=MIN_PORT; // Last assigned port during bind()
 
 int myerrno;
 
+/* 
+	1: The lock is available (there is no handler running) 
+	0: The lock is taken (there is already a handler running)
+
+	Note that this behaviour is the opposite of what was done with the global variable fl in mytcp,
+	but this is more aligned with a "mutex" semaphore interpretation.
+*/
+char global_handler_lock = 1; // acquire_handler_lock, release_handler_lock
+
 sigset_t global_signal_mask; // mytcp: mymask
 
 struct arpcacheline arpcache[MAX_ARP];
@@ -163,6 +172,20 @@ void ERROR(char* c, ...){
 
 void myperror(char* message) {
 	printf("MYPERROR %s: %s\n", message, strerror(myerrno));
+}
+
+void acquire_handler_lock(){
+	if(global_handler_lock != 0){
+		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
+	}
+	global_handler_lock--;
+}
+
+void release_handler_lock(){
+	if(global_handler_lock != 0){
+		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
+	}
+	global_handler_lock--;
 }
 
 
@@ -292,7 +315,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac) {
 
 	n=sendto(unique_raw_socket_fd,pkt,14+sizeof(struct arp_packet), 0,(struct sockaddr *)&sll,len);
 
-	//fl--;
+	release_handler_lock();
 
 	sigset_t tmpmask=global_signal_mask;
 	if( -1 == sigdelset(&tmpmask, SIGALRM)){
@@ -312,7 +335,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac) {
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 			
-			//fl++;
+			acquire_handler_lock();
 			
 			return 0;
 		}
@@ -322,7 +345,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac) {
 	}
 	sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 	
-	// fl++;
+	acquire_handler_lock();
 	
 	ERROR("resolve_mac not resolved");
 	return -1; //Not resolved
@@ -416,7 +439,7 @@ void myio(int ignored){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
-	//fl++;
+	acquire_handler_lock();
 
 	struct pollfd fds[1];
 	fds[0].fd = unique_raw_socket_fd;
@@ -467,7 +490,7 @@ void myio(int ignored){
 		}
 	}//packet reception while end
 
-	// fl--;
+	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
