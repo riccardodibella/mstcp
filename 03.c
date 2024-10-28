@@ -100,6 +100,11 @@ unsigned int key; //IP address
 unsigned char mac[6]; //Mac address
 };
 
+// Generic control block (TCP / Stream / Channel control block)
+struct genctrlblk{
+	int cb_type;
+};
+
 struct socket_info {
 	int st; 
 	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_STREAM
@@ -353,7 +358,7 @@ void forge_ip(struct ip_datagram * ip, int payloadsize, char proto, unsigned int
 	ip->checksum=htons(0);
 	ip->srcaddr= *(unsigned int*)myip;
 	ip->dstaddr= target;
-	ip->checksum = htons(checksum((unsigned char *)ip,20)); 
+	ip->checksum = htons(ip_checksum((unsigned char *)ip,20));
 }
 
 void forge_ethernet(struct ethernet_frame * eth, unsigned char * dest, unsigned short type){
