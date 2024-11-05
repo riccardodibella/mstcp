@@ -24,11 +24,15 @@
 
 /* DEFINE MACROS */
 
+#define MS_ENABLED true
+
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 8 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
+#define RXBUFSIZE 64000
+#define MAXTIMEOUT 2000
 
 #define MIN_PORT 19000
 #define MAX_PORT 19999
@@ -36,6 +40,10 @@
 #define TCP_PROTO 6 // protocol field inside IP header
 
 #define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
+#define FIXED_OPTIONS_LENGTH 40
+#define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
+
+#define DEFAULT_WINDOW_SCALE 0 // Default parameter sent during the handshake
 
 #define FDINFO_ST_FREE 0 // mytcp: FREE
 #define FDINFO_ST_UNBOUND 1 // mytcp: TCP_UNBOUND
@@ -46,6 +54,43 @@
 #define CTRLBLK_TYPE_TCP 1
 #define CTRLBLK_TYPE_STREAM 2
 #define CTRLBLK_TYPE_CHANNEL 3
+
+#define FSM_EVENT_APP_ACTIVE_OPEN 1
+#define FSM_EVENT_APP_PASSIVE_OPEN 2
+#define FSM_EVENT_PKT_RCV 3
+#define FSM_EVENT_APP_CLOSE 4
+#define FSM_EVENT_TIMEOUT 5
+
+#define TCP_ST_CLOSED 10 // initial state
+#define TCP_ST_LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
+#define TCP_ST_SYN_SENT 12 // represents waiting for a matching connection request after having sent a connection request.
+#define TCP_ST_SYN_RECEIVED 13 // represents waiting for a confirming connection request acknowledgment after having both received and sent a connection request.
+#define TCP_ST_ESTABLISHED 14 // represents an open connection, data received can be delivered to the user.  The normal state for the data transfer phase of the connection.
+#define TCP_ST_FIN_WAIT_1 15 // waiting for a connection termination request from the remote TCP, or an acknowledgment of the conne
+#define TCP_ST_FIN_WAIT_2 16 // waiting for a connection termination request from the remote TCP.
+#define TCP_ST_CLOSE_WAIT 17 // waiting for a connection termination request from the local user.
+#define TCP_ST_CLOSING 18  // waiting for a connection termination request acknowledgment from the remote TCP.
+#define TCP_ST_LAST_ACK 19 // waiting for an acknowledgment of the connection termination request previously sent to the remote TCP
+#define TCP_ST_TIME_WAIT 20 // waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connecti
+
+#define FIN 0x001
+#define SYN 0x002
+#define RST	0x004
+#define PSH 0x008
+#define ACK 0x010
+#define URG 0x020
+#define ECE 0x040
+#define CWR 0x080
+#define DMP 0x100 // Dummy Payload
+
+#define OPT_KIND_END_OF_OPT 0
+#define OPT_KIND_NO_OP 1
+#define OPT_KIND_MSS 2
+#define OPT_KIND_WIN_SCALE 3
+#define OPT_KIND_SACK_PERM 4
+#define OPT_KIND_SACK 5
+#define OPT_KIND_TIMESTAMPS 8
+#define OPT_KIND_MS_TCP 253
 
 /* STRUCT DEFINITIONS */
 
@@ -95,14 +140,64 @@ struct tcp_segment {
 	unsigned char payload[TCP_MSS];
 };
 
+struct txcontrolbuf{
+	struct tcp_segment * segment;
+	int totlen;
+	int payloadlen;
+	long long int txtime;
+	struct txcontrolbuf * next;
+	int retry;
+};
+
 struct arpcacheline {
-unsigned int key; //IP address
-unsigned char mac[6]; //Mac address
+	unsigned int key; //IP address
+	unsigned char mac[6]; //Mac address
 };
 
 // Generic control block (TCP / Stream / Channel control block)
 struct genctrlblk{
 	int cb_type;
+};
+
+struct tcpctrlblk{
+	int cb_type; // CTRBLK_TYPE_TCP
+
+	struct txcontrolbuf *txfirst, * txlast;
+	int st;
+	bool is_active_side;
+	unsigned short l_port; // replicated from fdinfo
+	unsigned short r_port;
+	unsigned int r_addr;
+	unsigned short adwin;
+	unsigned short radwin;
+	unsigned char * rxbuffer;
+	unsigned int rx_win_start; 
+	struct rxcontrol* unack;
+	unsigned int cumulativeack;
+	unsigned int ack_offs, seq_offs;
+	long long timeout; 
+	unsigned int sequence; 
+	unsigned int txfree; 
+	unsigned int mss;
+	unsigned int stream_end; 
+	unsigned int fsm_timer; 
+
+	bool ms_option_requested; // true if the MS option is inserted in the SYN. This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
+	uint8_t out_window_scale_factor;
+	uint8_t in_window_scale_factor;
+
+	/* CONG CTRL*/
+	#ifdef CONGCTRL
+	unsigned int ssthreshold;
+	unsigned int rtt_e;
+	unsigned int Drtt_e;
+	unsigned int cong_st;
+	unsigned int last_ack;
+	unsigned int repeated_acks;
+	unsigned int flightsize;
+	unsigned int cgwin;
+	unsigned int lta;
+	#endif
 };
 
 struct socket_info {
@@ -112,15 +207,17 @@ struct socket_info {
 	unsigned short l_port;
 	unsigned int l_addr;
 
-	struct genctrlblk** backlog; // Backlog listen queue (TCP or Channel Control Blocks). An empty location is NULL
-	int backlog_length; // backlog length;
+	struct gcb_list_node backlog_head; // Backlog listen queue (TCP or Channel Control Blocks)
+	int ready_streams; // Number of ready streams that can be consumed by accept(). If ready_streams == backlog_length new connections or streams have to be refused
+	int backlog_length; // Maximum number of streams that can be ready before starting to reset new connections/streams (mytcp: bl)
 };
 
 struct gcb_list_node {
 	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_CHANNEL
-	struct genctrlblk * gcb;
+	struct genctrlblk* gcb;
 	struct channel_info_node* next;
 };
+
 
 
 
@@ -132,6 +229,10 @@ unsigned char myip[4];
 unsigned char mymac[6];
 unsigned char mask[4];
 unsigned char gateway[4];
+
+/* TXBUFSIZE and INIT_TIMEOUT may be modified at program startup */
+int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
+int INIT_TIMEOUT = 300*1000; // #define INIT_TIMEOUT (((g_argc<4) ?(300*1000):(atoi(g_argv[3])*1000))/TIMER_USECS)
 
 int unique_raw_socket_fd = -1; // mytcp: unique_s
 
@@ -161,13 +262,13 @@ struct gcb_list_node chinfo_head;
 /* FUNCTION DEFINITIONS */
 
 void ERROR(char* c, ...){
-    printf("ERROR: ");
-    va_list args;
-    va_start(args, c);
-    vprintf(c, args);
-    va_end(args);
-    printf("\n");
-    exit(EXIT_FAILURE);
+	printf("ERROR: ");
+	va_list args;
+	va_start(args, c);
+	vprintf(c, args);
+	va_end(args);
+	printf("\n");
+	exit(EXIT_FAILURE);
 }
 
 void myperror(char* message) {
@@ -185,9 +286,53 @@ void release_handler_lock(){
 	if(global_handler_lock != 0){
 		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
-	global_handler_lock--;
+	global_handler_lock++;
 }
 
+struct gcb_list_node* create_gcb_list_node(struct genctrlblk* gcb){
+	struct gcb_list_node* to_return = malloc(sizeof(struct gcb_list_node));
+	memset(to_return, 0, sizeof(struct gcb_list_node));
+	to_return->gcb = gcb;
+}
+
+int gcb_list_length(struct gcb_list_node* head_ptr){
+	if(head_ptr == NULL){
+		ERROR("gcb_list_node_length head_ptr NULL");
+	}
+	int to_return = 0;
+	struct gcb_list_node* cursor = head_ptr;
+	while(cursor != NULL){
+		cursor = cursor->next;
+		to_return++;
+	}
+	return to_return;
+}
+
+void gcb_list_insert_at(struct gcb_list_node* head_ptr, struct gcb_list_node* new_node, int index){
+	if(head_ptr == NULL || new_node == NULL){
+		ERROR("gcb_list_node_length ptr NULL");
+	}
+	if(new_node->next != NULL){
+		// This may be intended, but it is more likely that there is a bug
+		ERROR("gcb_list_insert_at new_node next != NULL");
+	}
+	int list_length = gcb_list_length(head_ptr);
+	if(index < 0 || index >= list_length){
+		ERROR("gcb_list_insert_at invalid index %d", index);
+	}
+
+	struct gcb_list_node* cursor = head_ptr;
+	for(int i=0; i<index; i++){
+		cursor = cursor->next;
+	}
+	new_node->next = cursor->next;
+	cursor->next = new_node;
+}
+
+void gcb_list_append(struct gcb_list_node* head_ptr, struct gcb_list_node* new_node){
+	// This could be done much more efficiently, but it is easier to find bugs, it can be optimized later
+	gcb_list_insert_at(head_ptr, new_node, gcb_list_length(head_ptr));
+}
 
 
 
@@ -433,6 +578,108 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 
+void prepare_tcp(struct genctrlblk* gcb, uint16_t flags /* Host order */, unsigned char * payload, int payloadlen,unsigned char * options, int optlen){
+	if(gcb == NULL){
+		ERROR("prepare_tcp gcb NULL");
+	}
+
+	/* 
+	To create the outgoing packet we need some fields of the Control Block:
+	- l_port
+	- r_port
+	- seq_offs
+	- sequence
+	*/
+	uint16_t local_port, remote_port;
+	uint16_t sequence, seq_offs;
+	switch(gcb->cb_type){
+		case CTRLBLK_TYPE_TCP:
+			struct tcpctrlblk* tcb = (struct tcpctrlblk*)gcb;
+			local_port = tcb->l_port;
+			remote_port = tcb->r_port;
+			seq_offs = tcb->seq_offs;
+			sequence = tcb->sequence;
+			break;
+		case CTRLBLK_TYPE_CHANNEL:
+			ERROR("TODO prepare_tcp CTRLBLK_TYPE_CHANNEL");
+			break;
+		case CTRLBLK_TYPE_STREAM:
+			ERROR("TODO prepare_tcp CTRLBLK_TYPE_STREAM");
+			break;
+		default:
+			ERROR("prepare_tcp invalid gcb->cb_type");
+	}
+	if(local_port == 0 || remote_port == 0){
+		ERROR("prepare_tcp invalid port l %u s %u\n", htons(local_port), htons(remote_port));
+	}
+	struct txcontrolbuf * new_txcb = (struct txcontrolbuf*) malloc(sizeof(struct txcontrolbuf));
+	new_txcb->txtime = -MAXTIMEOUT; 
+	new_txcb->payloadlen = payloadlen;
+	new_txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
+	new_txcb->retry = 0;
+
+	struct tcp_segment * tcp = new_txcb->segment = (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
+
+	tcp->s_port = local_port;
+	tcp->d_port = remote_port;
+
+	tcp->seq = htonl(seq_offs+sequence);
+	tcp->d_offs_res=((5+FIXED_OPTIONS_LENGTH/4) << 4) | ((flags >> 8)&0b1111);
+	tcp->flags = flags & 0xFF;
+	tcp->urgp=0;
+
+	for(int i=0; i<FIXED_OPTIONS_LENGTH; i++){
+		tcp->payload[i] = (i<optlen) ? options[i] : OPT_KIND_END_OF_OPT;
+	}
+
+	if((payload != NULL) != (payloadlen != 0)){
+		// probably there is an error in the code, if this behaviour is intended it is weird
+		ERROR("prepare_tcp payload is not null and payloadlen = 0, or vice versa");
+	}
+	if(payloadlen != 0){
+		memcpy(tcp->payload+FIXED_OPTIONS_LENGTH, payload, payloadlen);
+	}
+
+
+	// Insertion of the new node in the TX queue
+	new_txcb->next=NULL;
+	switch(gcb->cb_type){
+		case CTRLBLK_TYPE_TCP:
+			struct tcpctrlblk* tcb = (struct tcpctrlblk*)gcb;
+			if(tcb->txfirst == NULL) { 
+				tcb->txlast = tcb->txfirst = new_txcb;
+			}
+			else {
+				tcb->txlast->next = new_txcb; 
+				tcb->txlast = tcb->txlast->next; // tcb->txlast = new_txcb;
+			}
+			tcb->sequence += payloadlen;
+			break;
+		case CTRLBLK_TYPE_CHANNEL:
+			// Should be the same of normal TCP
+			ERROR("TODO prepare_tcp CTRLBLK_TYPE_CHANNEL");
+			break;
+		case CTRLBLK_TYPE_STREAM:
+			// Should insert into the corresponding channel TX queue
+			ERROR("TODO prepare_tcp CTRLBLK_TYPE_STREAM");
+			break;
+		default:
+			ERROR("prepare_tcp invalid gcb->cb_type");
+	}
+
+	/*
+	DEFERRED FIELDS
+	tcp->ack;
+	tcp->window;
+	tcp->checksum;
+
+	DEFERRED OPTIONS
+	Timestamps (Fill TS Echo Reply if not SYN packet)
+	SACK (Add up to 3 records and change length accordingly)
+	*/
+}
+
+
 
 void myio(int ignored){
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
@@ -498,6 +745,161 @@ void myio(int ignored){
 }
 
 void mytimer(int ignored){}
+
+
+
+
+
+
+
+
+/* 
+The returned TCB is already linked inside fdinfo[fd].gcb. 
+It is returned just to avoid having to cast the pointer from the TCB after 
+this function returns, but it can be ignored safely without creating leaks.
+*/
+struct tcpctrlblk* create_closed_tcb(int fd){
+	if(fdinfo[fd].gcb != NULL){
+		ERRR("create_closed_tcb gcb != NULL");
+	}
+	fdinfo[fd].gcb = (struct tcpctrlblk *) malloc(sizeof(struct tcpctrlblk));
+	bzero(fdinfo[fd].gcb, sizeof(struct tcpctrlblk));
+	struct tcpctrlblk* tcb = (struct tcpctrlblk*) fdinfo[fd].gcb;
+	fdinfo[fd].st = CTRLBLK_TYPE_TCP;
+	tcb->cb_type = CTRLBLK_TYPE_TCP;
+	tcb->st = TCP_ST_CLOSED;
+}
+
+void init_closed_tcb_default_values(struct tcpctrlblk* tcb){
+	/* This function could be changed to initialize any type of
+	control block, with fields that depend on the specific type */
+
+	tcb->rxbuffer = (unsigned char*) malloc(RXBUFSIZE);
+	tcb->txfree = TXBUFSIZE;
+	tcb->seq_offs=rand();
+	tcb->ack_offs=0;
+	tcb->stream_end=0xFFFFFFFF; //Max file
+	tcb->mss = TCP_MSS;
+	tcb->sequence=0;
+	tcb->rx_win_start=0;
+	tcb->cumulativeack =0;
+	tcb->timeout = INIT_TIMEOUT;
+	tcb->adwin =RXBUFSIZE;
+	tcb->radwin =RXBUFSIZE;
+	tcb->ms_option_requested = false;
+	tcb->is_active_side = false;
+	tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
+	tcb->in_window_scale_factor = 0;
+
+	#ifdef CONGCTRL
+		tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+		tcb->cgwin = INIT_CGWIN* TCP_MSS;
+		tcb->timeout = INIT_TIMEOUT;
+		tcb->rtt_e = 0;
+		tcb->Drtt_e = 0;
+		tcb->cong_st = SLOW_START;
+	#endif
+}
+
+
+
+int fsm(int s, int event, struct ip_datagram * ip){
+	switch(event){
+		case FSM_EVENT_APP_ACTIVE_OPEN:
+			if(fdinfo[s].cb_type != CTRLBLK_TYPE_TCP){
+				// TODO cosa bisogna fare nella FSM per l'active open di uno stream?
+				ERROR("Invalid GCB for FSM active open");
+			}
+			// At this point we know that we have a TCB
+			struct tcpctrlblk * tcb = (struct tcpctrlblk*) fdinfo[s].gcb;
+			
+			if(tcb->st != TCP_ST_SYN_SENT){
+				ERROR("Invalid state %d FSM active open", tcb->st);
+			}
+			
+			init_closed_tcb_default_values(tcb);
+			tcb->is_active_side = true;
+
+			uint8_t* opt_ptr = NULL;
+			int opt_len;
+
+			if(MS_ENABLED){
+				opt_len = 23;
+				opt_ptr = malloc(opt_len);
+
+				opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+				opt_ptr[1] = 4; // MSS Length
+				opt_ptr[2] = TCP_MSS >> 8;
+				opt_ptr[3] = TCP_MSS & 0xFF;
+				opt_ptr[4] = OPT_KIND_MS_TCP; // MS Kind
+				opt_ptr[5] = 4; // MS Length
+				opt_ptr[6] = 0;
+				opt_ptr[7] = 0;
+				opt_ptr[8] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+				opt_ptr[9] = 10; // Timestamps Length
+				opt_ptr[10] = 0;
+				opt_ptr[11] = 0;
+				opt_ptr[12] = 0;
+				opt_ptr[13] = 0;
+				opt_ptr[14] = 0;
+				opt_ptr[15] = 0;
+				opt_ptr[16] = 0;
+				opt_ptr[17] = 0; 
+				opt_ptr[18] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+				opt_ptr[19] = 2; // SACK permitted Length
+				opt_ptr[20] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+				opt_ptr[21] = 3; // Window Scale Length
+				opt_ptr[22] = DEFAULT_WINDOW_SCALE;
+
+				tcb->ms_option_requested = true;
+			}else{
+				opt_len = 19;
+				opt_ptr = malloc(opt_len);
+
+				opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+				opt_ptr[1] = 4; // MSS Length
+				opt_ptr[2] = TCP_MSS >> 8;
+				opt_ptr[3] = TCP_MSS & 0xFF;
+				opt_ptr[4] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+				opt_ptr[5] = 10; // Timestamps Length
+				opt_ptr[6] = 0;
+				opt_ptr[7] = 0;
+				opt_ptr[8] = 0;
+				opt_ptr[9] = 0;
+				opt_ptr[10] = 0;
+				opt_ptr[11] = 0;
+				opt_ptr[12] = 0;
+				opt_ptr[13] = 0; 
+				opt_ptr[14] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+				opt_ptr[15] = 2; // SACK permitted Length
+				opt_ptr[16] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+				opt_ptr[17] = 3; // Window Scale Length
+				opt_ptr[18] = DEFAULT_WINDOW_SCALE;
+
+				tcb->ms_option_requested = false;
+			}
+
+			prepare_tcp(s, SYN, NULL,0,opt_ptr,opt_len);
+			tcb->st = TCP_ST_SYN_SENT;
+			if(opt_ptr != NULL){
+				free(opt_ptr);
+			}
+
+			// New TCB is added to the channel linked list
+			gcb_list_append(&chinfo_head, create_gcb_list_node(tcb));
+			/*
+			struct gcb_list_node* chinfo_last = &chinfo_head;
+			while(chinfo_last->next == NULL){
+				chinfo_last = chinfo_last->next;
+			}
+			chinfo_last->next = create_gcb_list_node(tcb);
+			*/
+			
+			break;
+		default:
+			ERROR("fsm invalid event %d", event);
+	}
+}
 
 
 bool port_in_use( unsigned short port ){
@@ -571,6 +973,59 @@ int mysocket(int family, int type, int proto){
 		myerrno = 0;
 		return i;
 	}
+}
+
+
+int myconnect(int s, struct sockaddr * addr, int addrlen){
+	if((addr->sa_family != AF_INET)){
+		myerrno = EINVAL; 
+		return -1;
+	}
+	if ( s < 3 || s >= MAX_FD){
+		myerrno = EBADF; 
+		return -1;
+	}
+	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
+	
+	if(!MS_ENABLED){
+		if(fdinfo[s].st == FDINFO_ST_UNBOUND){
+			struct sockaddr_in local;
+			local.sin_port=htons(0);
+			local.sin_addr.s_addr = htonl(0);
+			local.sin_family = AF_INET;
+			if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
+				myperror("implicit binding failed\n"); 
+				return -1; 
+			}
+		}
+		if(fdinfo[s].st != FDINFO_ST_BOUND){
+			myerrno = EBADF; 
+			return -1; 
+		}
+
+		// TODO spostare da qui nella FSM
+		struct tcpctrlblk* tcb = create_closed_tcb(s);
+		tcb->l_port = fdinfo[s].l_port;
+		tcb->r_port = remote_addr->sin_port;
+		tcb->r_addr = remote_addr->sin_addr.s_addr;
+
+		fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL); 
+		while(sleep(10)){
+			if(tcb->st == TCP_ST_ESTABLISHED ){
+				return 0;
+			}
+			if(tcb->st == TCP_ST_CLOSED){ 
+				myerrno = ECONNREFUSED; 
+				return -1;
+			}
+		}
+	}else{
+		ERROR("TODO myconnect Multi-Stream");
+	}
+	
+	// If the connection is not established within the timeout
+	myerrno=ETIMEDOUT; 
+	return -1;
 }
 
 int main(){

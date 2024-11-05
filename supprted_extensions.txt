@@ -26,6 +26,11 @@ Kind: 2
 Length: 4
 Value: 2 bytes
 
+SYN options with MS:  MSS (4) | MS-TCP (4) | Timestamps (10) | SACK-Permitted (2) | Window Scale (3)
+Total: 4+4+10+2+3=23
+
+SYN options without MS: MSS (4) | Timestamps (10) | SACK-Permitted (2) | Window Scale (3)
+Total: 4+10+2+3=19
 
 
 -------------- Payload options
@@ -50,3 +55,5 @@ Value: TS Value (4 bytes) | TS Echo Reply (4 bytes)
 
 Payload options structure:
 MS-TCP (4 bytes) | Timestamps (10 byte) | SACK (3 records: 2 + 3*8 = 24)
+
+Calculation of Timestamps Echo Reply: https://www.ietf.org/rfc/rfc1323.txt pp. 15-16

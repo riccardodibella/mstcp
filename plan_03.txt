@@ -201,4 +201,11 @@ Quando viene chiamato accept(), si prende la prima entry della lista concatenata
 	- Si associa quello SCB ad un nuovo file descriptor
 	- Si incrementa accepted_streams del CCB e si diminuisce il numero di connessioni pendenti in fdinfo per quel listening socket
 
-I CCB non vengono mai rimossi dalla backlog queue fino a quando il canale non viene chiuso.
+I CCB non vengono mai rimossi dalla backlog queue fino a quando il canale non viene chiuso. Dato che i channel creati con una Passive Open non sono inseriti in chinfo, non possono (correttamente) essere usati 
+per aprire nuovi stream dato che non vengono considerati durante la ricerca di un channel accettabile in cui aprire un nuovo stream. Questo comportamento è corretto, perchè l'apertura degli stream è unidirezionale
+(nuovi stream in una connessione possono essere aperti solo dall'endpoint che ha fatto l'active open in quella connessione).
+
+[DOMANDA] E' presto per porsi il problema ma intanto capisco cosa fare... Per queste prove, dato che includo comunque sempre l'opzione di timestamp, posso usare direttamente sempre solo quella per il calcolo
+dell'RTT oppure devo continuare a mantenere la fallback se non è supportato dall'altro endpoint? Come va gestita la fallback in questi casi?
+
+[DOMANDA] Che tempo uso per l'opzione Timestamps? Uso il "tick" incrementato ad ogni chiamata a mytimer, una volta ogni 500us?
