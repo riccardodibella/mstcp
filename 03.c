@@ -92,6 +92,16 @@
 #define OPT_KIND_TIMESTAMPS 8
 #define OPT_KIND_MS_TCP 253
 
+/* Congestion Control Parameters*/
+#define ALPHA 1
+#define BETA 4
+#define KRTO 6
+#define CONGCTRL_ST_SLOW_START 0
+#define CONGCTRL_ST_CONG_AVOID 1
+#define CONGCTRL_ST_FAST_RECOV 2
+#define INIT_CGWIN 1 //in MSS
+#define INIT_THRESH 8 //in MSS
+
 /* STRUCT DEFINITIONS */
 
 struct ethernet_frame {
@@ -125,6 +135,13 @@ struct ip_datagram {
 	unsigned int srcaddr;
 	unsigned int dstaddr;
 	unsigned char payload[20];
+};
+
+struct pseudoheader {
+	unsigned int s_addr, d_addr;
+	unsigned char zero;
+	unsigned char prot;
+	unsigned short len;
 };
 
 struct tcp_segment {
@@ -185,9 +202,10 @@ struct tcpctrlblk{
 	bool ms_option_requested; // true if the MS option is inserted in the SYN. This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
 	uint8_t out_window_scale_factor;
 	uint8_t in_window_scale_factor;
+	uint32_t ts_recent; // https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
 	/* CONG CTRL*/
-	#ifdef CONGCTRL
+	//#ifdef CONGCTRL
 	unsigned int ssthreshold;
 	unsigned int rtt_e;
 	unsigned int Drtt_e;
@@ -197,7 +215,13 @@ struct tcpctrlblk{
 	unsigned int flightsize;
 	unsigned int cgwin;
 	unsigned int lta;
-	#endif
+	//#endif
+};
+
+struct gcb_list_node {
+	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_CHANNEL
+	struct genctrlblk* gcb;
+	struct gcb_list_node* next;
 };
 
 struct socket_info {
@@ -212,11 +236,6 @@ struct socket_info {
 	int backlog_length; // Maximum number of streams that can be ready before starting to reset new connections/streams (mytcp: bl)
 };
 
-struct gcb_list_node {
-	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_CHANNEL
-	struct genctrlblk* gcb;
-	struct channel_info_node* next;
-};
 
 
 
@@ -239,6 +258,8 @@ int unique_raw_socket_fd = -1; // mytcp: unique_s
 int last_port=MIN_PORT; // Last assigned port during bind()
 
 int myerrno;
+
+uint64_t tick; // global variable incremented by mytimer() every TIMER_USECS ms
 
 /* 
 	1: The lock is available (there is no handler running) 
@@ -679,76 +700,104 @@ void prepare_tcp(struct genctrlblk* gcb, uint16_t flags /* Host order */, unsign
 	*/
 }
 
-
-
-void myio(int ignored){
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	acquire_handler_lock();
-
-	struct pollfd fds[1];
-	fds[0].fd = unique_raw_socket_fd;
-	fds[0].events = POLLIN;
-	fds[0].revents=0;
-	if( poll(fds,1,0) == -1) { 
-		perror("Poll myio failed"); 
-		exit(EXIT_FAILURE);
-	}
-
-	if(!(fds[0].revents & POLLIN)){
-		// There is nothing to read
-		return;
-	}
-
-	int received_packet_size; // mytcp: size
-	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
-		if(received_packet_size < sizeof(struct ethernet_frame)){
-			continue;
-		}
-		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
-		if(eth->type == htons(0x0806)){
-			// ARP
-			struct arp_packet * arp = (struct arp_packet *) eth->payload;
-			if(htons(arp->op) == 2){// It is ARP response
-				int i;
-				for(i=0;(i<MAX_ARP) && (arpcache[i].key!=0);i++){
-					if(!memcmp(&arpcache[i].key,arp->srcip,4)){
-						memcpy(arpcache[i].mac,arp->srcmac,6); // Update
-						break;
-					}
-				}
-				if(i < MAX_ARP && arpcache[i].key==0){
-					memcpy(arpcache[i].mac,arp->srcmac,6); //new insert
-					memcpy(&arpcache[i].key,arp->srcip,4); // Update
-				}
-			}
-		}else if(eth->type == htons(0x0800)){
-			// IP
-			struct ip_datagram * ip = (struct ip_datagram *) eth->payload;
-			if(ip->proto != TCP_PROTO){
-				continue;
-			}
-
-			// TCP
-			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
-			ERROR("TODO myio tcp");
-		}
-	}//packet reception while end
-
-	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
+uint16_t compl1(uint8_t* b, int len){
+	uint16_t total = 0;
+	uint16_t prev = 0;
+	uint16_t *p = (uint16_t* ) b;
+	int i;
+	for(i=0; i < len/2 ; i++){
+		total += ntohs(p[i]);
+		if (total < prev ) total++;
+		prev = total;
+	} 
+	if (i*2 != len){
+		//total += htons(b[len-1]<<8); 
+		total += htons(p[len/2])&0xFF00;
+		if (total < prev ) total++;
+		prev = total;
+	} 
+	return total;
+}
+unsigned short int tcp_checksum(uint8_t* b1, int len1, uint8_t* b2, int len2){
+	uint16_t prev, total;
+	prev = compl1(b1,len1); 
+	total = (prev + compl1(b2,len2));
+	if (total < prev ) total++;
+	return (0xFFFF - total);
 }
 
-void mytimer(int ignored){}
+void update_tcp_header(struct genctrlblk* gcb, struct txcontrolbuf *txctrl){
+	if(gcb == NULL || txctrl == NULL){
+		ERROR("update_tcp_header NULL param");
+	}
+	/*
+	DEFERRED FIELDS
+	tcp->ack;
+	tcp->window;
+	tcp->checksum;
 
+	DEFERRED OPTIONS
+	Timestamps (Fill TS Echo Reply if not SYN packet)
+	SACK (Add up to 3 records and change length accordingly)
+	*/
+	uint32_t r_addr, ack_offs, cumulativeack, adwin, ts_recent;
+	switch(gcb->cb_type){
+		case CTRLBLK_TYPE_TCP:
+			struct tcpctrlblk* tcb = (struct tcpctrlblk*) gcb;
+			r_addr = tcb->r_addr;
+			ack_offs = tcb->ack_offs;
+			cumulativeack = tcb->cumulativeack;
+			adwin = tcb->adwin;
+			ts_recent = tcb->ts_recent;
+			break;
+		case CTRLBLK_TYPE_CHANNEL:
+			ERROR("TODO update_tcp_header CTRLBLK_TYPE_CHANNEL");
+			break;
+		default:
+			ERROR("update_tcp_header invalid gcb type");
+	}
 
+	struct tcp_segment* tcp = txctrl->segment;
 
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	for(int i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+		if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
+			if(tcp->flags & SYN){
+				// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
+				// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
+				*(uint32_t*) (tcp->payload+2) = htonl(tick);
+
+				// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
+				*(uint32_t*) (tcp->payload+6) = htonl(ts_recent);
+			}
+		}
+		if(tcp->payload[i] == OPT_KIND_SACK){
+			ERROR("TODO SACK update");
+		}
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	
+
+	struct pseudoheader pseudo;
+	pseudo.s_addr = *(uint32_t*)myip;
+	pseudo.d_addr = r_addr;
+	pseudo.zero = 0;
+	pseudo.prot = TCP_PROTO;
+	pseudo.len = htons(txctrl->totlen);
+
+	tcp->checksum = htons(0);
+	tcp->ack = htonl(ack_offs + cumulativeack);
+	tcp->window = htons(adwin);
+	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, txctrl->totlen));
+}
 
 
 
@@ -760,9 +809,9 @@ this function returns, but it can be ignored safely without creating leaks.
 */
 struct tcpctrlblk* create_closed_tcb(int fd){
 	if(fdinfo[fd].gcb != NULL){
-		ERRR("create_closed_tcb gcb != NULL");
+		ERROR("create_closed_tcb gcb != NULL");
 	}
-	fdinfo[fd].gcb = (struct tcpctrlblk *) malloc(sizeof(struct tcpctrlblk));
+	fdinfo[fd].gcb = (struct genctrlblk *) malloc(sizeof(struct tcpctrlblk));
 	bzero(fdinfo[fd].gcb, sizeof(struct tcpctrlblk));
 	struct tcpctrlblk* tcb = (struct tcpctrlblk*) fdinfo[fd].gcb;
 	fdinfo[fd].st = CTRLBLK_TYPE_TCP;
@@ -786,32 +835,33 @@ void init_closed_tcb_default_values(struct tcpctrlblk* tcb){
 	tcb->timeout = INIT_TIMEOUT;
 	tcb->adwin =RXBUFSIZE;
 	tcb->radwin =RXBUFSIZE;
+	tcb->fsm_timer = 0;
 	tcb->ms_option_requested = false;
 	tcb->is_active_side = false;
 	tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 	tcb->in_window_scale_factor = 0;
+	tcb->ts_recent = 0;
 
-	#ifdef CONGCTRL
-		tcb->ssthreshold = INIT_THRESH * TCP_MSS;
-		tcb->cgwin = INIT_CGWIN* TCP_MSS;
-		tcb->timeout = INIT_TIMEOUT;
-		tcb->rtt_e = 0;
-		tcb->Drtt_e = 0;
-		tcb->cong_st = SLOW_START;
-	#endif
+	//#ifdef CONGCTRL
+	tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+	tcb->cgwin = INIT_CGWIN* TCP_MSS;
+	tcb->timeout = INIT_TIMEOUT;
+	tcb->rtt_e = 0;
+	tcb->Drtt_e = 0;
+	tcb->cong_st = CONGCTRL_ST_SLOW_START;
+	//#endif
 }
 
 
-
-int fsm(int s, int event, struct ip_datagram * ip){
+int fsm(struct genctrlblk* gcb, int event, struct ip_datagram * ip){
 	switch(event){
 		case FSM_EVENT_APP_ACTIVE_OPEN:
-			if(fdinfo[s].cb_type != CTRLBLK_TYPE_TCP){
+			if(gcb->cb_type != CTRLBLK_TYPE_TCP){
 				// TODO cosa bisogna fare nella FSM per l'active open di uno stream?
 				ERROR("Invalid GCB for FSM active open");
 			}
 			// At this point we know that we have a TCB
-			struct tcpctrlblk * tcb = (struct tcpctrlblk*) fdinfo[s].gcb;
+			struct tcpctrlblk * tcb = (struct tcpctrlblk*) gcb;
 			
 			if(tcb->st != TCP_ST_SYN_SENT){
 				ERROR("Invalid state %d FSM active open", tcb->st);
@@ -879,14 +929,14 @@ int fsm(int s, int event, struct ip_datagram * ip){
 				tcb->ms_option_requested = false;
 			}
 
-			prepare_tcp(s, SYN, NULL,0,opt_ptr,opt_len);
+			prepare_tcp((struct genctrlblk*) tcb, SYN, NULL,0,opt_ptr,opt_len);
 			tcb->st = TCP_ST_SYN_SENT;
 			if(opt_ptr != NULL){
 				free(opt_ptr);
 			}
 
 			// New TCB is added to the channel linked list
-			gcb_list_append(&chinfo_head, create_gcb_list_node(tcb));
+			gcb_list_append(&chinfo_head, create_gcb_list_node((struct genctrlblk*) tcb));
 			/*
 			struct gcb_list_node* chinfo_last = &chinfo_head;
 			while(chinfo_last->next == NULL){
@@ -900,6 +950,143 @@ int fsm(int s, int event, struct ip_datagram * ip){
 			ERROR("fsm invalid event %d", event);
 	}
 }
+
+
+
+void myio(int ignored){
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+
+	struct pollfd fds[1];
+	fds[0].fd = unique_raw_socket_fd;
+	fds[0].events = POLLIN;
+	fds[0].revents=0;
+	if( poll(fds,1,0) == -1) { 
+		perror("Poll myio failed"); 
+		exit(EXIT_FAILURE);
+	}
+
+	if(!(fds[0].revents & POLLIN)){
+		// There is nothing to read
+		return;
+	}
+
+	int received_packet_size; // mytcp: size
+	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
+		if(received_packet_size < sizeof(struct ethernet_frame)){
+			continue;
+		}
+		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
+		if(eth->type == htons(0x0806)){
+			// ARP
+			struct arp_packet * arp = (struct arp_packet *) eth->payload;
+			if(htons(arp->op) == 2){// It is ARP response
+				int i;
+				for(i=0;(i<MAX_ARP) && (arpcache[i].key!=0);i++){
+					if(!memcmp(&arpcache[i].key,arp->srcip,4)){
+						memcpy(arpcache[i].mac,arp->srcmac,6); // Update
+						break;
+					}
+				}
+				if(i < MAX_ARP && arpcache[i].key==0){
+					memcpy(arpcache[i].mac,arp->srcmac,6); //new insert
+					memcpy(&arpcache[i].key,arp->srcip,4); // Update
+				}
+			}
+		}else if(eth->type == htons(0x0800)){
+			// IP
+			struct ip_datagram * ip = (struct ip_datagram *) eth->payload;
+			if(ip->proto != TCP_PROTO){
+				continue;
+			}
+
+			// TCP
+			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
+			ERROR("TODO myio tcp");
+
+			// Note: When copying from mytcp, be careful of the bug that deletes the last ACK of the three-way handshake after the connection state changes
+			// WP msg: "La soluzione più facile sarebbe fare il ciclo sulla tx queue solo se il pacchetto ricevuto non è un SYN"
+		}
+	}//packet reception while end
+
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+}
+
+void mytimer(int ignored){
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+
+	tick++;
+
+	struct gcb_list_node* cursor = chinfo_head.next;
+	while(cursor != NULL){
+		switch(cursor->cb_type){
+			case CTRLBLK_TYPE_TCP:
+				struct tcpctrlblk* tcb = (struct tcpctrlblk*) cursor->gcb;
+				if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
+					fsm((struct genctrlblk*) tcb, FSM_EVENT_TIMEOUT, NULL);
+					// TODO: da qualche parte devo togliere il nodo di questo tcb dalla linked list, ma questo va gestito bene nelle iterazioni di questo ciclo con cursor
+					ERROR("TODO read the comment");
+					continue;
+				}
+
+				/* For TCP, we traverse the TX queue until the congestion window is full, (re)transmitting the packets according to their transmission time */
+				struct txcontrolbuf* txcb = tcb->txfirst;
+				int acc = 0; // payload bytes accumulator
+				while(txcb != NULL && acc < tcb->cgwin+tcb->lta){
+					// Karn invalidation not handled
+
+					if(txcb->retry == 0){
+						// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
+						tcb->flightsize += txcb->payloadlen;
+					}
+					if(txcb->txtime+tcb->timeout > tick ){
+						acc += txcb->totlen;
+						txcb = txcb->next;
+						continue;
+					}
+					bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
+					txcb->txtime = tick;
+					txcb->retry++;
+
+					update_tcp_header((struct genctrlblk*) tcb, txcb);
+					send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
+
+					acc += txcb->totlen;
+					txcb = txcb->next;
+				}
+				
+				break;
+			case CTRLBLK_TYPE_CHANNEL:
+				/* In principle, for a MS channel we wouldn't need to keep track of the value of the congestion window as we traverse the TX queue, because packets
+				are inserted by the scheduler only when there is enough space available for that packet. This is not true though: the congestion window may decrease
+				in case of a congestion event, and in this case we need to transmit only the first unacked packets. */
+				ERROR("TODO mytimer CTRLBLK_TYPE_CHANNEL");
+				break;
+			default:
+				ERROR("mytimer unsupported cursor->cb_type %d", cursor->cb_type);
+		}
+	}
+
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+}
+
+
+
 
 
 bool port_in_use( unsigned short port ){
@@ -1009,7 +1196,7 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		tcb->r_port = remote_addr->sin_port;
 		tcb->r_addr = remote_addr->sin_addr.s_addr;
 
-		fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL); 
+		fsm((struct genctrlblk*) tcb, FSM_EVENT_APP_ACTIVE_OPEN, NULL); 
 		while(sleep(10)){
 			if(tcb->st == TCP_ST_ESTABLISHED ){
 				return 0;

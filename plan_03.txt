@@ -206,6 +206,20 @@ per aprire nuovi stream dato che non vengono considerati durante la ricerca di u
 (nuovi stream in una connessione possono essere aperti solo dall'endpoint che ha fatto l'active open in quella connessione).
 
 [DOMANDA] E' presto per porsi il problema ma intanto capisco cosa fare... Per queste prove, dato che includo comunque sempre l'opzione di timestamp, posso usare direttamente sempre solo quella per il calcolo
-dell'RTT oppure devo continuare a mantenere la fallback se non è supportato dall'altro endpoint? Come va gestita la fallback in questi casi?
+dell'RTT oppure devo continuare a mantenere la fallback se non è supportato dall'altro endpoint? Come va gestita la fallback in questi casi? Se non posso usare il timestamp sempre per l'rtt, devo aggiungere
+la Karn invalidation in mytimer.
+
+[DOMANDA] E' giusto, per Timestamps, quando invio un pacchetto (in update header) inviare sempre il tick corrente in TS Value? Per TS Echo Reply uso https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
 [DOMANDA] Che tempo uso per l'opzione Timestamps? Uso il "tick" incrementato ad ogni chiamata a mytimer, una volta ogni 500us?
+
+[DOMANDA] Sarebbe un problema grave per il momento scorporare alcune operazioni dalla fsm, finchè non c'è una visione più chiara delle cose da fare, e reinserirle quando già funziona qualcosa? Perchè sennò
+per provare a tenere alcune operazioni nella FSM solo perchè prima erano lì rischio di "ingarbugliare" inutilmente il codice, finchè non ho una visione completa di tutte le operazioni che andranno fatte
+per la gestione dei due tipi di connessioni e posso capire precisamente cosa va messo nella FSM, e dove. (Esempio: per l'apertura della connessione, in questo momento sono più comodo a fare la creazione del
+TCB fuori dalla fsm e lì dentro inviare il SYN e fare la transizione da CLOSED a SYN_SENT).
+
+[DOMANDA] Penso di sì ma per sicurezza chiedo, tolgo i segmenti SACKed dalla TX queue del CCB giusto? Quindi quando la cwnd diminuisce per una congestione, so che tutti i pacchetti che ho nella TX queue
+devono essere ritrasmessi perchè non sono ancora stati ACKed, ne con il Cumulative ACK ne con SACK.
+
+[DOMANDA] Non mi è chiara la relazione tra flightsize, congestion window, e l'accumulatore usato quando scorre la TX queue, nel caso in cui ci siano opzioni. Alcune volte si usa l'MSS, altre volte la totlen
+del segmento, altre volte la payload length.
