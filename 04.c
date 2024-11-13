@@ -799,6 +799,9 @@ int mysocket(int family, int type, int proto){
 	}
 }
 
+void fsm(int s, int event, struct ip_datagram * ip){
+	ERROR("TODO fsm");
+};
 
 
 
@@ -879,7 +882,40 @@ void mytimer(int ignored){
 
 
 
-	ERROR("TODO mytimer body");
+	for(int i=0;i<MAX_FD;i++){
+		if(fdinfo[i].st != FDINFO_ST_TCB_CREATED){
+			continue;
+		}
+		struct tcpctrlblk* tcb = fdinfo[i].tcb;
+		if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
+			fsm(i,FSM_EVENT_TIMEOUT,NULL);
+			continue;
+		}
+		struct txcontrolbuf* txcb = tcb->txfirst;
+		int acc = 0; // payload bytes accumulator
+		while(txcb != NULL && acc < tcb->cgwin+tcb->lta){
+			// Karn invalidation not handled
+
+			if(txcb->retry == 0){
+				// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
+				tcb->flightsize += txcb->payloadlen;
+			}
+			if(txcb->txtime+tcb->timeout > tick){
+				acc += txcb->totlen;
+				txcb = txcb->next;
+				continue;
+			}
+			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
+			txcb->txtime = tick;
+			txcb->retry++;
+
+			update_tcp_header(i, txcb);
+			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
+
+			acc += txcb->totlen;
+			txcb = txcb->next;
+		}
+	}
 
 
 
