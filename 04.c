@@ -428,8 +428,6 @@ void load_ifconfig(){
 
 
 
-
-
 #pragma region RAW_SOCKET_ACCESS
 int resolve_mac(unsigned int destip, unsigned char * destmac){
 	int len,n,i;
@@ -584,6 +582,150 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 
+
+
+
+int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
+	struct tcpctrlblk*tcb = fdinfo[s].tcb;
+	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
+	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
+		ERROR("prepare_tcp invalid port l %u s %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
+	}
+
+	txcb->txtime = -MAXTIMEOUT ; 
+	txcb->payloadlen = payloadlen;
+	txcb->totlen = payloadlen + 20+FIXED_OPTIONS_LENGTH;
+	txcb->retry = 0;
+	struct tcp_segment * tcp = txcb->segment = (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
+	tcp->s_port = fdinfo[s].l_port;
+	tcp->d_port = tcb->r_port;
+	tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
+	tcp->d_offs_res=((5+FIXED_OPTIONS_LENGTH/4) << 4) | ((flags >> 8)&0b1111);
+	tcp->flags = flags & 0xFF;
+	tcp->urgp=0;
+	for(int i=0; i<FIXED_OPTIONS_LENGTH; i++){
+		tcp->payload[i] = (i<optlen) ? options[i] : OPT_KIND_END_OF_OPT;
+	}
+	if((payload != NULL) != (payloadlen != 0)){
+		// probably there is an error in the code, if this behaviour is intended it is weird
+		ERROR("prepare_tcp payload is not null and payloadlen = 0, or vice versa");
+	}
+	if(payloadlen != 0){
+		memcpy(tcp->payload+FIXED_OPTIONS_LENGTH, payload, payloadlen);
+	}
+
+	// Insertion in the TX queue
+	txcb->next=NULL;
+	if(tcb->txfirst == NULL) { 
+		tcb->txlast = tcb->txfirst = txcb;
+	}
+	else {
+		tcb->txlast->next = txcb; 
+		tcb->txlast = tcb->txlast->next; // tcb->txlast = txcb;
+	}
+	tcb->sequence += payloadlen;
+
+	/*
+	DEFERRED FIELDS
+	tcp->ack;
+	tcp->window;
+	tcp->checksum;
+
+	DEFERRED OPTIONS
+	Timestamps (Fill TS Echo Reply if not SYN packet)
+	SACK (Add up to 3 records and change length accordingly)
+	*/
+}
+
+uint16_t compl1(uint8_t* b, int len){
+	uint16_t total = 0;
+	uint16_t prev = 0;
+	uint16_t *p = (uint16_t* ) b;
+	int i;
+	for(i=0; i < len/2 ; i++){
+		total += ntohs(p[i]);
+		if (total < prev ) total++;
+		prev = total;
+	} 
+	if (i*2 != len){
+		//total += htons(b[len-1]<<8); 
+		total += htons(p[len/2])&0xFF00;
+		if (total < prev ) total++;
+		prev = total;
+	} 
+	return total;
+}
+unsigned short int tcp_checksum(uint8_t* b1, int len1, uint8_t* b2, int len2){
+	uint16_t prev, total;
+	prev = compl1(b1,len1); 
+	total = (prev + compl1(b2,len2));
+	if (total < prev ) total++;
+	return (0xFFFF - total);
+}
+
+void update_tcp_header(int s, struct txcontrolbuf *txctrl){
+	if(txctrl == NULL){
+		ERROR("update_tcp_header NULL txctrl");
+	}
+	/*
+	DEFERRED FIELDS
+	tcp->ack;
+	tcp->window;
+	tcp->checksum;
+
+	DEFERRED OPTIONS
+	Timestamps (Fill TS Echo Reply if not SYN packet)
+	SACK (Add up to 3 records and change length accordingly)
+	*/
+
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+
+	struct tcp_segment* tcp = txctrl->segment;
+
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	for(int i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+		if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
+			if(tcp->flags & SYN){
+				// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
+
+				// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
+				*(uint32_t*) (tcp->payload+2) = htonl(tick);
+
+				// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
+				*(uint32_t*) (tcp->payload+6) = htonl(tcb->ts_recent);
+			}
+		}
+		if(tcp->payload[i] == OPT_KIND_SACK){
+			ERROR("TODO SACK update");
+		}
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	
+
+	struct pseudoheader pseudo;
+	pseudo.s_addr = fdinfo[s].l_addr;
+	pseudo.d_addr = tcb->r_addr;
+	pseudo.zero = 0;
+	pseudo.prot = TCP_PROTO;
+	pseudo.len = htons(txctrl->totlen);
+
+	tcp->checksum = htons(0);
+	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
+	tcp->window = htons(tcb->adwin);
+	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, txctrl->totlen));
+}
+
+
+
+
+
 bool port_in_use(unsigned short port){
 	int s;
 	for (s=3; s<MAX_FD; s++){
@@ -661,8 +803,92 @@ int mysocket(int family, int type, int proto){
 
 
 
-void myio(int ignored){}
-void mytimer(int ignored){}
+void myio(int ignored){
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+
+	struct pollfd fds[1];
+	fds[0].fd = unique_raw_socket_fd;
+	fds[0].events = POLLIN;
+	fds[0].revents=0;
+	if( poll(fds,1,0) == -1) { 
+		perror("Poll myio failed"); 
+		exit(EXIT_FAILURE);
+	}
+
+	if(!(fds[0].revents & POLLIN)){
+		// There is nothing to read
+		return;
+	}
+
+	int received_packet_size; // mytcp: size
+	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
+		if(received_packet_size < sizeof(struct ethernet_frame)){
+			continue;
+		}
+		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
+		if(eth->type == htons(0x0806)){
+			// ARP
+			struct arp_packet * arp = (struct arp_packet *) eth->payload;
+			if(htons(arp->op) == 2){// It is ARP response
+				int i;
+				for(i=0;(i<MAX_ARP) && (arpcache[i].key!=0);i++){
+					if(!memcmp(&arpcache[i].key,arp->srcip,4)){
+						memcpy(arpcache[i].mac,arp->srcmac,6); // Update
+						break;
+					}
+				}
+				if(i < MAX_ARP && arpcache[i].key==0){
+					memcpy(arpcache[i].mac,arp->srcmac,6); //new insert
+					memcpy(&arpcache[i].key,arp->srcip,4); // Update
+				}
+			}
+		}else if(eth->type == htons(0x0800)){
+			// IP
+			struct ip_datagram * ip = (struct ip_datagram *) eth->payload;
+			if(ip->proto != TCP_PROTO){
+				continue;
+			}
+
+			// TCP
+			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
+			ERROR("TODO myio tcp");
+
+			// Note: When copying from mytcp, be careful of the bug that deletes the last ACK of the three-way handshake after the connection state changes
+			// WP msg: "La soluzione più facile sarebbe fare il ciclo sulla tx queue solo se il pacchetto ricevuto non è un SYN"
+		}
+	}//packet reception while end
+
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+}
+void mytimer(int ignored){
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+
+	tick++;
+
+
+
+	ERROR("TODO mytimer body");
+
+
+
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+}
 
 int main(){
 	raw_socket_setup();
