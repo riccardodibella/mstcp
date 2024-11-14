@@ -45,6 +45,11 @@
 
 #define DEFAULT_WINDOW_SCALE 0 // Default parameter sent during the handshake
 
+// SID = Stream ID
+#define SID_UNASSIGNED -1
+#define TOT_SID 32
+#define MAX_SID (TOT_SID - 1)
+
 #define FDINFO_ST_FREE 0 // mytcp: FREE
 #define FDINFO_ST_UNBOUND 1 // mytcp: TCP_UNBOUND
 #define FDINFO_ST_BOUND 2 // mytcp: TCP_BOUND 
@@ -214,8 +219,8 @@ struct tcb_list_node {
 
 struct socket_info {
 	int st; 
-	int cb_type; // CTRLBLK_TYPE_NONE, CTRLBLK_TYPE_TCP or CTRLBLK_TYPE_STREAM
-	struct tcpctrlblk * tcb;
+	int sid; // stream id
+	struct tcpctrlblk * tcb; // the TCB is created in the FSM during myconnect and mylisten (active and passive open events)
 	unsigned short l_port;
 	unsigned int l_addr;
 
@@ -794,15 +799,182 @@ int mysocket(int family, int type, int proto){
 	else {
 		bzero(fdinfo+i, sizeof(struct socket_info));
 		fdinfo[i].st = FDINFO_ST_UNBOUND;
+		fdinfo[i].sid = SID_UNASSIGNED;
 		myerrno = 0;
 		return i;
 	}
 }
 
-void fsm(int s, int event, struct ip_datagram * ip){
+
+int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("FSM invalid s %d", s);
+	}
+	if(event == FSM_EVENT_APP_ACTIVE_OPEN){
+		if(fdinfo[s].st != FDINFO_ST_UNBOUND && fdinfo[s].st != FDINFO_ST_BOUND){
+			ERROR("FSM active open invalid fdinfo state %d", fdinfo[s].st);
+		}
+
+		/*
+		We have different cases for MS enabled and not. For MS disabled, we do the automatic bind if the socket
+		is not already bound, then we create the TCB, and we send the SYN packet without the MS-TCP option.
+		If the MS is enabled, TODO spiegare
+		*/
+		if(!MS_ENABLED){
+			if(fdinfo[s].st == FDINFO_ST_UNBOUND){
+				struct sockaddr_in local;
+				local.sin_port=htons(0);
+				local.sin_addr.s_addr = htonl(0);
+				local.sin_family = AF_INET;
+				if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
+					myperror("implicit binding failed\n"); 
+					return -1;
+				}
+			}
+			if(fdinfo[s].st != FDINFO_ST_BOUND){
+				myerrno = EBADF; 
+				return -1;
+			}
+
+			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			bzero(tcb, sizeof(struct tcpctrlblk));
+			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+			tcb->st = TCP_ST_CLOSED;
+
+			tcb->rxbuffer = (unsigned char*) malloc(RXBUFSIZE);
+			tcb->txfree = TXBUFSIZE;
+			tcb->seq_offs=rand();
+			tcb->ack_offs=0;
+			tcb->stream_end=0xFFFFFFFF; //Max file
+			tcb->mss = TCP_MSS;
+			tcb->sequence=0;
+			tcb->rx_win_start=0;
+			tcb->cumulativeack =0;
+			tcb->timeout = INIT_TIMEOUT;
+			tcb->adwin =RXBUFSIZE;
+			tcb->radwin =RXBUFSIZE;
+			tcb->fsm_timer = 0;
+			tcb->ms_option_requested = false;
+			tcb->is_active_side = false;
+			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
+			tcb->in_window_scale_factor = 0;
+			tcb->ts_recent = 0;
+
+			//#ifdef CONGCTRL
+			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+			tcb->cgwin = INIT_CGWIN* TCP_MSS;
+			tcb->timeout = INIT_TIMEOUT;
+			tcb->rtt_e = 0;
+			tcb->Drtt_e = 0;
+			tcb->cong_st = CONGCTRL_ST_SLOW_START;
+			//#endif
+			tcb->r_port = active_open_remote_addr->sin_port;
+			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
+
+
+			// send SYN without MS option
+			uint8_t* opt_ptr = NULL;
+			int opt_len;
+
+			opt_len = 19;
+			opt_ptr = malloc(opt_len);
+
+			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+			opt_ptr[1] = 4; // MSS Length
+			opt_ptr[2] = TCP_MSS >> 8;
+			opt_ptr[3] = TCP_MSS & 0xFF;
+			opt_ptr[4] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+			opt_ptr[5] = 10; // Timestamps Length
+			opt_ptr[6] = 0;
+			opt_ptr[7] = 0;
+			opt_ptr[8] = 0;
+			opt_ptr[9] = 0;
+			opt_ptr[10] = 0;
+			opt_ptr[11] = 0;
+			opt_ptr[12] = 0;
+			opt_ptr[13] = 0; 
+			opt_ptr[14] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+			opt_ptr[15] = 2; // SACK permitted Length
+			opt_ptr[16] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+			opt_ptr[17] = 3; // Window Scale Length
+			opt_ptr[18] = DEFAULT_WINDOW_SCALE;
+
+			tcb->ms_option_requested = false;
+			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
+			free(opt_ptr);
+
+			tcb->st = TCP_ST_SYN_SENT;
+			
+			return 0;
+		}else{
+			ERROR("TODO myconnect Multi-Stream");
+		}
+	}
 	ERROR("TODO fsm");
 };
 
+
+
+
+int myconnect(int s, struct sockaddr * addr, int addrlen){
+	if((addr->sa_family != AF_INET)){
+		myerrno = EINVAL; 
+		return -1;
+	}
+	if ( s < 3 || s >= MAX_FD){
+		myerrno = EBADF; 
+		return -1;
+	}
+
+	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
+
+	/*
+	if(!MS_ENABLED){
+		if(fdinfo[s].st == FDINFO_ST_UNBOUND){
+			struct sockaddr_in local;
+			local.sin_port=htons(0);
+			local.sin_addr.s_addr = htonl(0);
+			local.sin_family = AF_INET;
+			if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
+				myperror("implicit binding failed\n"); 
+				return -1; 
+			}
+		}
+		if(fdinfo[s].st != FDINFO_ST_BOUND){
+			myerrno = EBADF; 
+			return -1; 
+		}
+
+		// TODO spostare da qui nella FSM
+		struct tcpctrlblk* tcb = create_closed_tcb(s);
+		tcb->r_port = remote_addr->sin_port;
+		tcb->r_addr = remote_addr->sin_addr.s_addr;
+
+		fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL); 
+		
+		while(sleep(10)){
+			if(tcb->st == TCP_ST_ESTABLISHED ){
+				return 0;
+			}
+			if(tcb->st == TCP_ST_CLOSED){ 
+				myerrno = ECONNREFUSED; 
+				return -1;
+			}
+		}
+	}else{
+		ERROR("TODO myconnect Multi-Stream");
+	}
+	*/
+	int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
+	if(res < 0){
+		// Bind may fail, or other errors
+		return res;
+	}
+
+	// If the connection is not established within the timeout
+	myerrno=ETIMEDOUT; 
+	return -1;
+}
 
 
 
@@ -888,7 +1060,7 @@ void mytimer(int ignored){
 		}
 		struct tcpctrlblk* tcb = fdinfo[i].tcb;
 		if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
-			fsm(i,FSM_EVENT_TIMEOUT,NULL);
+			fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
 			continue;
 		}
 		struct txcontrolbuf* txcb = tcb->txfirst;
