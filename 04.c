@@ -24,7 +24,7 @@
 
 /* DEFINE MACROS */
 
-#define MS_ENABLED true
+#define MS_ENABLED false
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
@@ -61,17 +61,17 @@
 #define FSM_EVENT_APP_CLOSE 4
 #define FSM_EVENT_TIMEOUT 5
 
-#define TCP_ST_CLOSED 10 // initial state
-#define TCP_ST_LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
-#define TCP_ST_SYN_SENT 12 // represents waiting for a matching connection request after having sent a connection request.
-#define TCP_ST_SYN_RECEIVED 13 // represents waiting for a confirming connection request acknowledgment after having both received and sent a connection request.
-#define TCP_ST_ESTABLISHED 14 // represents an open connection, data received can be delivered to the user.  The normal state for the data transfer phase of the connection.
-#define TCP_ST_FIN_WAIT_1 15 // waiting for a connection termination request from the remote TCP, or an acknowledgment of the conne
-#define TCP_ST_FIN_WAIT_2 16 // waiting for a connection termination request from the remote TCP.
-#define TCP_ST_CLOSE_WAIT 17 // waiting for a connection termination request from the local user.
-#define TCP_ST_CLOSING 18  // waiting for a connection termination request acknowledgment from the remote TCP.
-#define TCP_ST_LAST_ACK 19 // waiting for an acknowledgment of the connection termination request previously sent to the remote TCP
-#define TCP_ST_TIME_WAIT 20 // waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connecti
+#define TCB_ST_CLOSED 10 // initial state
+#define TCB_ST_LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
+#define TCB_ST_SYN_SENT 12 // represents waiting for a matching connection request after having sent a connection request.
+#define TCB_ST_SYN_RECEIVED 13 // represents waiting for a confirming connection request acknowledgment after having both received and sent a connection request.
+#define TCB_ST_ESTABLISHED 14 // represents an open connection, data received can be delivered to the user.  The normal state for the data transfer phase of the connection.
+#define TCB_ST_FIN_WAIT_1 15 // waiting for a connection termination request from the remote TCP, or an acknowledgment of the conne
+#define TCB_ST_FIN_WAIT_2 16 // waiting for a connection termination request from the remote TCP.
+#define TCB_ST_CLOSE_WAIT 17 // waiting for a connection termination request from the local user.
+#define TCB_ST_CLOSING 18  // waiting for a connection termination request acknowledgment from the remote TCP.
+#define TCB_ST_LAST_ACK 19 // waiting for an acknowledgment of the connection termination request previously sent to the remote TCP
+#define TCB_ST_TIME_WAIT 20 // waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connecti
 
 #define FIN 0x001
 #define SYN 0x002
@@ -244,7 +244,8 @@ unsigned char gateway[4];
 
 /* TXBUFSIZE and INIT_TIMEOUT may be modified at program startup */
 int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
-int INIT_TIMEOUT = 300*1000; // #define INIT_TIMEOUT (((g_argc<4) ?(300*1000):(atoi(g_argv[3])*1000))/TIMER_USECS)
+// int INIT_TIMEOUT = 300*1000; // #define INIT_TIMEOUT (((g_argc<4) ?(300*1000):(atoi(g_argv[3])*1000))/TIMER_USECS)
+int INIT_TIMEOUT = MAXTIMEOUT;
 
 int unique_raw_socket_fd = -1; // mytcp: unique_s
 
@@ -284,18 +285,92 @@ void ERROR(char* c, ...){
 	exit(EXIT_FAILURE);
 }
 
+void DEBUG(char* c, ...){
+	printf("DEBUG: ");
+	va_list args;
+	va_start(args, c);
+	vprintf(c, args);
+	va_end(args);
+	printf("\n");
+}
+
+void print_tcp_segment(struct tcp_segment* tcp){
+	printf("----TCP SEGMENT----\n");
+	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
+	printf("FLAGS: ");
+	/*
+	#define FIN 0x001
+	#define SYN 0x002
+	#define RST	0x004
+	#define PSH 0x008
+	#define ACK 0x010
+	#define URG 0x020
+	#define ECE 0x040
+	#define CWR 0x080
+	#define DMP 0x100 // Dummy Payload
+	*/
+	if(tcp->flags & FIN){
+		printf("FIN ");
+	}
+	if(tcp->flags & SYN){
+		printf("SYN ");
+	}
+	if(tcp->flags & RST){
+		printf("RST ");
+	}
+	if(tcp->flags & PSH){
+		printf("PSH ");
+	}
+	if(tcp->flags & ACK){
+		printf("ACK ");
+	}
+	if(tcp->flags & URG){
+		printf("URG ");
+	}
+	if(tcp->flags & ECE){
+		printf("ECE ");
+	}
+	if(tcp->flags & CWR){
+		printf("CWR ");
+	}
+	if(tcp->d_offs_res & (DMP >> 8)){
+		printf("DMP ");
+	}
+	printf("\n");
+
+	printf("-------------------\n");
+}
+
+void print_ip_datagram(struct ip_datagram* ip){
+	printf("----IP DATAGRAM----\n");
+	printf("VER_IHL: 0x%.2x\n", ip->ver_ihl);
+
+	printf("L4 protocol: %d\n", ip->proto);
+	if(ip->proto == TCP_PROTO){
+		print_tcp_segment((struct tcp_segment*) ip->payload + (((ip->ver_ihl & 0x0F) * 4) - 20));
+	}
+	printf("-------------------\n");
+}
+void print_l2_packet(uint8_t* packet){
+	printf("---- L2 PACKET ----\n");
+	print_ip_datagram((struct ip_datagram*) (packet+14));
+	printf("-------------------\n");
+}
+
 void myperror(char* message) {
 	printf("MYPERROR %s: %s\n", message, strerror(myerrno));
 }
 
 void acquire_handler_lock(){
-	if(global_handler_lock != 0){
-		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
+	return; // TODO toglimi
+	if(global_handler_lock != 1){
+		ERROR("acquire_handler_lock global_handler_lock %d != 1", global_handler_lock);
 	}
 	global_handler_lock--;
 }
 
 void release_handler_lock(){
+	return; // TODO toglimi
 	if(global_handler_lock != 0){
 		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
@@ -470,7 +545,11 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 
 	n=sendto(unique_raw_socket_fd,pkt,14+sizeof(struct arp_packet), 0,(struct sockaddr *)&sll,len);
-
+	if(n < 0){
+		perror("resolve_mac sento failed");
+		exit(EXIT_FAILURE);
+	}
+	DEBUG("release mac");
 	release_handler_lock();
 
 	sigset_t tmpmask=global_signal_mask;
@@ -490,7 +569,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 			// found in cache
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
-			
+			DEBUG("acquire mac found");
 			acquire_handler_lock();
 			
 			return 0;
@@ -501,6 +580,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	}
 	sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 	
+	DEBUG("acquire mac not found");
 	acquire_handler_lock();
 	
 	ERROR("resolve_mac not resolved");
@@ -576,6 +656,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
+	print_l2_packet(packet);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		perror("send_ip sendto failed"); 
@@ -774,11 +855,12 @@ int mybind(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EADDRINUSE; 
 		return -1;
 	}
-	fdinfo[s].l_port = (a->sin_port != 0) ? a->sin_port : get_free_port();   
+	fdinfo[s].l_port = (a->sin_port != 0) ? a->sin_port : htons(get_free_port());   
 	if(fdinfo[s].l_port == 0) {
 		myerrno = EADDRINUSE; // mytcp: ENOMEM 
 		return -1;
 	}
+	DEBUG("mybind assigned port %d", fdinfo[s].l_port);
 	fdinfo[s].l_addr = (a->sin_addr.s_addr) ? a->sin_addr.s_addr : *(unsigned int*)myip;
 	fdinfo[s].st = FDINFO_ST_BOUND;
 	myerrno = 0;
@@ -839,7 +921,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
 			bzero(tcb, sizeof(struct tcpctrlblk));
 			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
-			tcb->st = TCP_ST_CLOSED;
+			tcb->st = TCB_ST_CLOSED;
 
 			tcb->rxbuffer = (unsigned char*) malloc(RXBUFSIZE);
 			tcb->txfree = TXBUFSIZE;
@@ -863,7 +945,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			//#ifdef CONGCTRL
 			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
 			tcb->cgwin = INIT_CGWIN* TCP_MSS;
-			tcb->timeout = INIT_TIMEOUT;
+			//tcb->timeout = INIT_TIMEOUT;
 			tcb->rtt_e = 0;
 			tcb->Drtt_e = 0;
 			tcb->cong_st = CONGCTRL_ST_SLOW_START;
@@ -903,11 +985,11 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
-			tcb->st = TCP_ST_SYN_SENT;
+			tcb->st = TCB_ST_SYN_SENT;
 			
 			return 0;
 		}else{
-			ERROR("TODO myconnect Multi-Stream");
+			ERROR("TODO FSM active open Multi-Stream");
 		}
 	}
 	ERROR("TODO fsm");
@@ -928,49 +1010,22 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 
 	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
 
-	/*
-	if(!MS_ENABLED){
-		if(fdinfo[s].st == FDINFO_ST_UNBOUND){
-			struct sockaddr_in local;
-			local.sin_port=htons(0);
-			local.sin_addr.s_addr = htonl(0);
-			local.sin_family = AF_INET;
-			if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
-				myperror("implicit binding failed\n"); 
-				return -1; 
-			}
-		}
-		if(fdinfo[s].st != FDINFO_ST_BOUND){
-			myerrno = EBADF; 
-			return -1; 
-		}
-
-		// TODO spostare da qui nella FSM
-		struct tcpctrlblk* tcb = create_closed_tcb(s);
-		tcb->r_port = remote_addr->sin_port;
-		tcb->r_addr = remote_addr->sin_addr.s_addr;
-
-		fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL); 
-		
-		while(sleep(10)){
-			if(tcb->st == TCP_ST_ESTABLISHED ){
-				return 0;
-			}
-			if(tcb->st == TCP_ST_CLOSED){ 
-				myerrno = ECONNREFUSED; 
-				return -1;
-			}
-		}
-	}else{
-		ERROR("TODO myconnect Multi-Stream");
-	}
-	*/
 	int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
 	if(res < 0){
 		// Bind may fail, or other errors
 		return res;
 	}
-
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	DEBUG("waiting for ack in myconnect...");
+	while(sleep(10)){
+		if(tcb->st == TCB_ST_ESTABLISHED ){
+			return 0;
+		}
+		if(tcb->st == TCB_ST_CLOSED){ 
+			myerrno = ECONNREFUSED; 
+			return -1;
+		}
+	}
 	// If the connection is not established within the timeout
 	myerrno=ETIMEDOUT; 
 	return -1;
@@ -989,7 +1044,7 @@ void myio(int ignored){
 	fds[0].fd = unique_raw_socket_fd;
 	fds[0].events = POLLIN;
 	fds[0].revents=0;
-	if( poll(fds,1,0) == -1) { 
+	if(poll(fds,1,0) == -1) { 
 		perror("Poll myio failed"); 
 		exit(EXIT_FAILURE);
 	}
@@ -1030,7 +1085,33 @@ void myio(int ignored){
 
 			// TCP
 			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
-			ERROR("TODO myio tcp");
+			print_tcp_segment(tcp);
+			if(htons(tcp->d_port) == MIN_PORT){
+				ERROR("TODO myio tcp");
+			}
+			int i;
+			for(i=0;i<MAX_FD;i++){
+				if(
+					(fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)
+					||
+					((fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st==TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port))
+				){
+					break;
+				}
+			}
+			if(i == MAX_FD){
+				// The packet is not for me
+				continue; // go to the processing of the next received packet, if any
+			}
+
+			struct tcpctrlblk * tcb = fdinfo[i].tcb;
+
+			fsm(i, FSM_EVENT_PKT_RCV, ip, NULL);
+
+			if(tcb->st < TCB_ST_ESTABLISHED){
+				break;
+			}
+			ERROR("TODO myio TCP processing after FSM");
 
 			// Note: When copying from mytcp, be careful of the bug that deletes the last ACK of the three-way handshake after the connection state changes
 			// WP msg: "La soluzione più facile sarebbe fare il ciclo sulla tx queue solo se il pacchetto ricevuto non è un SYN"
@@ -1051,7 +1132,7 @@ void mytimer(int ignored){
 	acquire_handler_lock();
 
 	tick++;
-
+	DEBUG("mytimer tick %"PRIu64, tick);
 
 
 	for(int i=0;i<MAX_FD;i++){
@@ -1067,7 +1148,6 @@ void mytimer(int ignored){
 		int acc = 0; // payload bytes accumulator
 		while(txcb != NULL && acc < tcb->cgwin+tcb->lta){
 			// Karn invalidation not handled
-
 			if(txcb->retry == 0){
 				// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
 				tcb->flightsize += txcb->payloadlen;
@@ -1088,8 +1168,6 @@ void mytimer(int ignored){
 			txcb = txcb->next;
 		}
 	}
-
-
 
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
@@ -1126,5 +1204,32 @@ int main(){
 		return EXIT_FAILURE;
 	}
 	
-	printf("Startup OK\n");
+	DEBUG("Startup OK");
+
+
+	// Client code to connect to a server
+	int s;
+	struct sockaddr_in addr, loc_addr;
+	s=mysocket(AF_INET,SOCK_STREAM,0);
+	if(s == -1){
+		myperror("mysocket");
+		exit(EXIT_FAILURE);
+	}
+	DEBUG("mysocket OK");
+	addr.sin_family = AF_INET;
+	addr.sin_port =htons(80);
+	addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
+	loc_addr.sin_family = AF_INET;
+	loc_addr.sin_port = 0; // Automatic port 
+	loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
+	if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
+		myperror("mybind"); 
+		exit(EXIT_FAILURE);
+	}
+	DEBUG("mybind OK");
+	if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
+		myperror("myconnect"); 
+		exit(EXIT_FAILURE);
+	}
+	DEBUG("myconnect OK");
 }
