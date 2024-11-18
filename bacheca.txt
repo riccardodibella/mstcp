@@ -2,8 +2,10 @@ Domande:
 - Se devo mandare un ACK senza payload, lo associo allo stream 0?
 - La stima iniziale dell'RTT (lato active open) la faccio già considerando il SYN+ACK, giusto?
 - Una volta che ho una sequenza di misure dell'RTT, come si calcola la stima dell'RTT da usare per il timeout?
+
 Problemi di MYTCP:
 - Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
 - Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
 - Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
 - Confermo che viene accettata solo una connessione alla volta
+- In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"

@@ -304,7 +304,7 @@ void ERROR(char* c, ...){
 }
 
 void DEBUG(char* c, ...){
-	printf("DEBUG %.10u: ", (uint32_t) tick);
+	printf("DEBUG %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
 	vprintf(c, args);
@@ -690,6 +690,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
+	DEBUG("Outgoing send_ip packet:");
 	print_l2_packet(packet);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
@@ -820,7 +821,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
 		}
 		if(tcp->payload[i] == OPT_KIND_SACK){
-			ERROR("TODO SACK update");
+			DEBUG("TODO SACK update");
 		}
 		int length = tcp->payload[i+1];
 		i += length - 1; // with the i++ we go to the start of the next option
@@ -1130,7 +1131,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 		default:
 			ERROR("FSM unknown tcb->st %d", tcb->st);
 	}
-	ERROR("TODO fsm");
+	return 0;
 };
 
 
@@ -1240,7 +1241,7 @@ void myio(int ignored){
 				continue; // go to the processing of the next received packet, if any
 			}
 
-			printf("Incoming TCP segment:\n");
+			DEBUG("Incoming TCP segment:");
 			print_tcp_segment(tcp);
 
 			struct tcpctrlblk * tcb = fdinfo[i].tcb;
@@ -1248,12 +1249,34 @@ void myio(int ignored){
 			fsm(i, FSM_EVENT_PKT_RCV, ip, NULL);
 
 			if(tcb->st < TCB_ST_ESTABLISHED){
-				break;
+				continue;
 			}
-			ERROR("TODO myio TCP processing after FSM");
+
+			if(tcb->txfirst !=NULL && ! (tcp->flags & SYN) ){
+				// Removal from TX queue for the cumulative ACK
+
+				int shifter = htonl(tcb->txfirst->segment->seq);
+
+				if((htonl(tcp->ack)-shifter >= 0) && (htonl(tcp->ack)-shifter-(tcb->stream_end)?1:0 <= htonl(tcb->txlast->segment->seq) + tcb->txlast->payloadlen - shifter)){ // -1 is to compensate the FIN	
+					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen
+						struct txcontrolbuf * temp = tcb->txfirst;
+						tcb->txfirst = tcb->txfirst->next;
+						fdinfo[i].tcb->txfree+=temp->payloadlen;
+						// RTT calculation removed
+
+						fdinfo[i].tcb->flightsize-=temp->payloadlen;
+
+						free(temp->segment);
+						free(temp);
+						if(tcb->txfirst	== NULL) tcb->txlast = NULL;
+					}//While
+				}
+			}
 
 			// Note: When copying from mytcp, be careful of the bug that deletes the last ACK of the three-way handshake after the connection state changes
 			// WP msg: "La soluzione più facile sarebbe fare il ciclo sulla tx queue solo se il pacchetto ricevuto non è un SYN"
+
+			DEBUG("TODO myio TCP insertion in RX buffer");
 		}
 	}//packet reception while end
 
