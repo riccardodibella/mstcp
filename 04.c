@@ -194,8 +194,9 @@ struct tcpctrlblk{
 
 	bool is_active_side;
 	bool ms_option_requested; // true if the MS option is inserted in the SYN. This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
-	uint8_t out_window_scale_factor;
-	uint8_t in_window_scale_factor;
+	bool ms_option_enabled;
+	uint8_t out_window_scale_factor; // packets that are sent by the local node contain a window that is scaled down by this factor (2^factor)
+	uint8_t in_window_scale_factor; // the remote window is scaled up by this factor (2^factor)
 	uint32_t ts_recent; // https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
 	/* CONG CTRL*/
@@ -236,7 +237,6 @@ struct socket_info {
 
 /* GLOBAL VARIABLES */
 
-
 unsigned char myip[4];
 unsigned char mymac[6];
 unsigned char mask[4];
@@ -272,6 +272,24 @@ uint8_t l2_rx_buf[L2_RX_BUF_SIZE]; // mytcp: l2buf
 
 struct socket_info fdinfo[MAX_FD]; // locations 0, 1 and 2 are left empty
 
+uint8_t PAYLOAD_OPTIONS_TEMPLATE_MS[] = {
+	OPT_KIND_MS_TCP,
+	4,
+	0,0,
+	OPT_KIND_TIMESTAMPS,
+	10,
+	0,0,0,0,0,0,0,0,
+	OPT_KIND_SACK,
+	2
+};
+uint8_t PAYLOAD_OPTIONS_TEMPLATE[] = {
+	OPT_KIND_TIMESTAMPS,
+	10,
+	0,0,0,0,0,0,0,0,
+	OPT_KIND_SACK,
+	2
+};
+
 
 /* FUNCTION DEFINITIONS */
 
@@ -286,7 +304,7 @@ void ERROR(char* c, ...){
 }
 
 void DEBUG(char* c, ...){
-	printf("DEBUG: ");
+	printf("DEBUG %.10u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
 	vprintf(c, args);
@@ -337,6 +355,14 @@ void print_tcp_segment(struct tcp_segment* tcp){
 		printf("DMP ");
 	}
 	printf("\n");
+	int optlen = (tcp->d_offs_res >> 4)*4 - 20;
+	printf("Option bytes: %d\n", optlen);
+	for(int i=0; i<optlen; i++){
+		printf("0x%.2x ", tcp->payload[i]);
+		if(i>0 && ((i % 4)==3 || (i == optlen - 1))){
+			printf("\n");
+		}
+	}
 
 	printf("-------------------\n");
 }
@@ -344,15 +370,23 @@ void print_tcp_segment(struct tcp_segment* tcp){
 void print_ip_datagram(struct ip_datagram* ip){
 	printf("----IP DATAGRAM----\n");
 	printf("VER_IHL: 0x%.2x\n", ip->ver_ihl);
-
 	printf("L4 protocol: %d\n", ip->proto);
 	if(ip->proto == TCP_PROTO){
 		print_tcp_segment((struct tcp_segment*) ip->payload + (((ip->ver_ihl & 0x0F) * 4) - 20));
 	}
 	printf("-------------------\n");
 }
+void print_mac(uint8_t* mac){
+	for(int i=0; i<6; i++){
+		printf("%.2X%s", mac[i],i!=5?":":"\n");
+	}
+}
 void print_l2_packet(uint8_t* packet){
 	printf("---- L2 PACKET ----\n");
+	printf("SRC MAC: ");
+	print_mac(packet + 8);
+	printf("DST MAC: ");
+	print_mac(packet);
 	print_ip_datagram((struct ip_datagram*) (packet+14));
 	printf("-------------------\n");
 }
@@ -372,7 +406,7 @@ void acquire_handler_lock(){
 void release_handler_lock(){
 	return; // TODO toglimi
 	if(global_handler_lock != 0){
-		ERROR("acquire_handler_lock global_handler_lock %d != 0", global_handler_lock);
+		ERROR("release_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
 	global_handler_lock++;
 }
@@ -549,7 +583,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 		perror("resolve_mac sento failed");
 		exit(EXIT_FAILURE);
 	}
-	DEBUG("release mac");
+	//DEBUG("release mac");
 	release_handler_lock();
 
 	sigset_t tmpmask=global_signal_mask;
@@ -569,7 +603,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 			// found in cache
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
-			DEBUG("acquire mac found");
+			//DEBUG("acquire mac found");
 			acquire_handler_lock();
 			
 			return 0;
@@ -580,7 +614,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	}
 	sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 	
-	DEBUG("acquire mac not found");
+	//DEBUG("acquire mac not found");
 	acquire_handler_lock();
 	
 	ERROR("resolve_mac not resolved");
@@ -680,7 +714,7 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 
 	txcb->txtime = -MAXTIMEOUT ; 
 	txcb->payloadlen = payloadlen;
-	txcb->totlen = payloadlen + 20+FIXED_OPTIONS_LENGTH;
+	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
 	txcb->retry = 0;
 	struct tcp_segment * tcp = txcb->segment = (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
 	tcp->s_port = fdinfo[s].l_port;
@@ -777,15 +811,13 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			continue;
 		}
 		if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
-			if(tcp->flags & SYN){
-				// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
+			// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
-				// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
-				*(uint32_t*) (tcp->payload+2) = htonl(tick);
+			// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
+			*(uint32_t*) (tcp->payload+i+2) = htonl(tick);
 
-				// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
-				*(uint32_t*) (tcp->payload+6) = htonl(tcb->ts_recent);
-			}
+			// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
+			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
 		}
 		if(tcp->payload[i] == OPT_KIND_SACK){
 			ERROR("TODO SACK update");
@@ -860,7 +892,7 @@ int mybind(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EADDRINUSE; // mytcp: ENOMEM 
 		return -1;
 	}
-	DEBUG("mybind assigned port %d", fdinfo[s].l_port);
+	DEBUG("mybind assigned port %d", ntohs(fdinfo[s].l_port));
 	fdinfo[s].l_addr = (a->sin_addr.s_addr) ? a->sin_addr.s_addr : *(unsigned int*)myip;
 	fdinfo[s].st = FDINFO_ST_BOUND;
 	myerrno = 0;
@@ -937,6 +969,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->radwin =RXBUFSIZE;
 			tcb->fsm_timer = 0;
 			tcb->ms_option_requested = false;
+			tcb->ms_option_enabled = false;
 			tcb->is_active_side = false;
 			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 			tcb->in_window_scale_factor = 0;
@@ -992,6 +1025,111 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			ERROR("TODO FSM active open Multi-Stream");
 		}
 	}
+
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED){
+		ERROR("FSM invalid fdinfo state %d", fdinfo[s].st);
+	}
+
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	struct tcp_segment * tcp = NULL;
+	if(ip != NULL){
+		tcp = (struct tcp_segment*)((uint8_t*)ip+((ip->ver_ihl&0xF)*4));
+	}
+	switch(tcb->st){
+		case TCB_ST_SYN_SENT:
+			if(event == FSM_EVENT_PKT_RCV){
+				if((tcp->flags&SYN) && (tcp->flags&ACK) && (htonl(tcp->ack)==tcb->seq_offs + 1)){
+					tcb->seq_offs++;
+					tcb->ack_offs = htonl(tcp->seq) + 1;	
+					free(tcb->txfirst->segment);
+					free(tcb->txfirst);
+					tcb->txfirst = tcb->txlast = NULL;
+					
+					
+					bool ms_received = false;
+					bool sack_perm_received = false;
+					bool timestamps_received = false;
+					uint32_t received_remote_timestamp;
+					uint32_t tick_diff_timestamp;
+					uint8_t win_scale_factor_received = 0;
+					uint16_t mss_received = TCP_MSS;
+
+					int optlen = ((tcp->d_offs_res)>>4)*4-20;
+					for(int i=0; i<optlen; i++){
+						if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+							break;
+						}
+						if(tcp->payload[i] == OPT_KIND_NO_OP){
+							continue;
+						}
+						if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
+							timestamps_received = true;
+
+							received_remote_timestamp = ntohl(*(uint32_t*) (tcp->payload+2));
+							tick_diff_timestamp = tick - ntohl(*(uint32_t*) (tcp->payload+6));
+						}
+						if(tcp->payload[i] == OPT_KIND_SACK_PERM){
+							sack_perm_received = true;
+						}
+						if(tcp->payload[i] == OPT_KIND_MSS){
+							mss_received = tcp->payload[i+2] << 8 | tcp->payload[i+3];
+						}
+						if(tcp->payload[i] == OPT_KIND_WIN_SCALE){
+							win_scale_factor_received = tcp->payload[i+2];
+						}
+						if(tcp->payload[i] == OPT_KIND_MS_TCP){
+							ms_received = true;
+						}
+						int length = tcp->payload[i+1];
+						i += length - 1; // with the i++ we go to the start of the next option
+					}
+
+					if(!timestamps_received){
+						ERROR("Timestamps not enabled with the SYN+ACK");
+					}
+					if(!sack_perm_received){
+						ERROR("SACK not enabled with the SYN+ACK");
+					}
+
+					tcb->in_window_scale_factor = win_scale_factor_received;
+					if(mss_received < tcb->mss){
+						tcb->mss = mss_received;
+					}
+					tcb->ts_recent = received_remote_timestamp;
+					DEBUG("TODO tick_diff_timestamp ignored (fsm SYN_SENT PKT_RCV)");
+					if(!tcb->ms_option_requested && ms_received){
+						ERROR("Received MS-TCP option without request");
+					}
+
+					/* 
+					equivalent to just doing tcb->ms_option_enabled = ms_received , but in this way we keep the correct semantic that enables the option
+					only if it was requested, so it remains correct even if the check for unrequested MS-TCP option is removed
+					*/
+					tcb->ms_option_enabled = tcb->ms_option_requested && ms_received; 
+
+
+					/*
+					We include all the usual payload options in this ACK
+					(we could avoid inserting the SACK, but it is simpler to do like this)
+					*/
+					uint8_t* ack_opt;
+					int ack_opt_len;
+					if(tcb->ms_option_enabled){
+						ack_opt = PAYLOAD_OPTIONS_TEMPLATE_MS;
+						ack_opt_len = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					}else{
+						ack_opt = PAYLOAD_OPTIONS_TEMPLATE;
+						ack_opt_len = sizeof(PAYLOAD_OPTIONS_TEMPLATE);
+					}
+					prepare_tcp(s, ACK, NULL, 0, ack_opt, ack_opt_len);
+
+					tcb->st = TCB_ST_ESTABLISHED;
+				}
+			}
+			break;
+		default:
+			ERROR("FSM unknown tcb->st %d", tcb->st);
+	}
 	ERROR("TODO fsm");
 };
 
@@ -1038,6 +1176,7 @@ void myio(int ignored){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
+	//DEBUG("acquire_handler_lock myio");
 	acquire_handler_lock();
 
 	struct pollfd fds[1];
@@ -1085,10 +1224,7 @@ void myio(int ignored){
 
 			// TCP
 			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
-			print_tcp_segment(tcp);
-			if(htons(tcp->d_port) == MIN_PORT){
-				ERROR("TODO myio tcp");
-			}
+
 			int i;
 			for(i=0;i<MAX_FD;i++){
 				if(
@@ -1104,6 +1240,9 @@ void myio(int ignored){
 				continue; // go to the processing of the next received packet, if any
 			}
 
+			printf("Incoming TCP segment:\n");
+			print_tcp_segment(tcp);
+
 			struct tcpctrlblk * tcb = fdinfo[i].tcb;
 
 			fsm(i, FSM_EVENT_PKT_RCV, ip, NULL);
@@ -1118,6 +1257,7 @@ void myio(int ignored){
 		}
 	}//packet reception while end
 
+	//DEBUG("release_handler_lock myio");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
@@ -1129,10 +1269,11 @@ void mytimer(int ignored){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
+	//DEBUG("acquire_handler_lock mytimer");
 	acquire_handler_lock();
 
 	tick++;
-	DEBUG("mytimer tick %"PRIu64, tick);
+	//DEBUG("mytimer tick %"PRIu64, tick);
 
 
 	for(int i=0;i<MAX_FD;i++){
@@ -1169,6 +1310,7 @@ void mytimer(int ignored){
 		}
 	}
 
+	//DEBUG("release_handler_lock mytimer");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
@@ -1189,8 +1331,8 @@ int main(){
 
 	// Enable the reception of signals
 	if( -1 == sigemptyset(&global_signal_mask)) {perror("sigemtpyset"); return EXIT_FAILURE;}
-	if( -1 == sigaddset(&global_signal_mask, SIGIO)){perror("sigaddset SIGIO");return EXIT_FAILURE;} 
-	if( -1 == sigaddset(&global_signal_mask, SIGALRM)){perror("sigaddset SIGALRM");return EXIT_FAILURE;} 
+	if( -1 == sigaddset(&global_signal_mask, SIGIO)){perror("sigaddset SIGIO"); return EXIT_FAILURE;} 
+	if( -1 == sigaddset(&global_signal_mask, SIGALRM)){perror("sigaddset SIGALRM"); return EXIT_FAILURE;} 
 	if( -1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){perror("sigprocmask"); return EXIT_FAILURE;}
 
 	// Create and start the periodic timer
@@ -1217,8 +1359,9 @@ int main(){
 	}
 	DEBUG("mysocket OK");
 	addr.sin_family = AF_INET;
-	addr.sin_port =htons(80);
-	addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
+	addr.sin_port = htons(80);
+	addr.sin_addr.s_addr = inet_addr("93.184.215.14");
+	//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
 	loc_addr.sin_family = AF_INET;
 	loc_addr.sin_port = 0; // Automatic port 
 	loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
