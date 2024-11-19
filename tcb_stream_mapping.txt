@@ -1,0 +1,119 @@
+#define STREAM_STATE_UNUSED 0
+#define STREAM_STATE_OPENED 1
+#define STREAM_STATE_LSS_SENT 2
+#define STREAM_STATE_LSS_RCV 3
+#define STREAM_STATE_CLOSED 4
+
+/* Modified TCB with streams (05.c) */
+struct tcpctrlblk{
+	bool stream_state[TOT_SID];
+	unsigned short adwin[TOT_SID];
+	unsigned short radwin[TOT_SID];
+	unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
+	unsigned int rx_win_start[TOT_SID];
+	unsigned int txfree[TOT_SID];
+	unsigned char* stream_tx_buffer[TOT_SID];
+
+
+    int st; // Channel property
+
+    /* 
+    Channel TX queue pointers 
+    They are a channel property, but they are filled differently between 
+    standard TCP (new data is inserted in the queue as soon as it is available) 
+    and MS-TCP (data to TX is consumed and inserted in this queue by a scheduler)
+    */
+	struct txcontrolbuf *txfirst, * txlast;
+
+	unsigned short r_port; // Channel property
+	unsigned int r_addr; // Channel property
+	struct rxcontrol* unack; // Channel queue of RXed packets yet to be acked
+	unsigned int cumulativeack; // Channel property
+	unsigned int ack_offs; // Channel property
+    unsigned int seq_offs; // Channel property
+	long long timeout; // Channel property
+	unsigned int sequence; // Channel property 
+	unsigned int mss; // Channel property
+	unsigned int stream_end; // Channel property (bad name)
+	unsigned int fsm_timer; // Channel property
+
+	bool is_active_side; // Channel property
+    /* 
+    True if the MS option is inserted in the SYN. 
+    This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
+    */
+	bool ms_option_requested; // Channel property
+    bool ms_option_enabled; // Channel property
+    /*
+    Packets that are sent by the local node contain a window that is scaled down by this factor (2^factor)
+    */
+	uint8_t out_window_scale_factor; // Channel property
+    /*
+    The remote window is scaled up by this factor (2^factor)
+    */
+	uint8_t in_window_scale_factor; // Channel property
+    /*
+    https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
+    */
+	uint32_t ts_recent; // Channel property
+
+	/* CONG CTRL (channel properties) */
+	//#ifdef CONGCTRL
+	unsigned int ssthreshold;
+	unsigned int rtt_e;
+	unsigned int Drtt_e;
+	unsigned int cong_st;
+	unsigned int last_ack;
+	unsigned int repeated_acks;
+	unsigned int flightsize;
+	unsigned int cgwin;
+	unsigned int lta;
+	//#endif
+};
+
+
+
+
+
+
+/* Original TCB without streams (04.c) */
+struct tcpctrlblk{
+	struct txcontrolbuf *txfirst, * txlast;
+	int st;
+	// unsigned short l_port; // replicated from fdinfo
+	unsigned short r_port;
+	unsigned int r_addr;
+	unsigned short adwin;
+	unsigned short radwin;
+	unsigned char * rxbuffer;
+	unsigned int rx_win_start; 
+	struct rxcontrol* unack;
+	unsigned int cumulativeack;
+	unsigned int ack_offs, seq_offs;
+	long long timeout; 
+	unsigned int sequence; 
+	unsigned int txfree; 
+	unsigned int mss;
+	unsigned int stream_end; 
+	unsigned int fsm_timer; 
+
+	bool is_active_side;
+	bool ms_option_requested; // true if the MS option is inserted in the SYN. This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
+	bool ms_option_enabled;
+	uint8_t out_window_scale_factor; // packets that are sent by the local node contain a window that is scaled down by this factor (2^factor)
+	uint8_t in_window_scale_factor; // the remote window is scaled up by this factor (2^factor)
+	uint32_t ts_recent; // https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
+
+	/* CONG CTRL*/
+	//#ifdef CONGCTRL
+	unsigned int ssthreshold;
+	unsigned int rtt_e;
+	unsigned int Drtt_e;
+	unsigned int cong_st;
+	unsigned int last_ack;
+	unsigned int repeated_acks;
+	unsigned int flightsize;
+	unsigned int cgwin;
+	unsigned int lta;
+	//#endif
+};
