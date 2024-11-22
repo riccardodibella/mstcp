@@ -1,16 +1,10 @@
 Domande:
-- Se devo mandare un ACK senza payload, lo associo allo stream 0?
-- La stima iniziale dell'RTT (lato active open) la faccio già considerando il SYN+ACK, giusto?
-- Una volta che ho una sequenza di misure dell'RTT, come si calcola la stima dell'RTT da usare per il timeout?
-- Non devo tenere nessuno stato relativo ai SACK ricevuti, giusto? Quando ricevo un SACK libero lo spazio di quel 
-pacchetto dalla flightsize dello stream corrispondente (e evito di ritrasmetterlo), ma è inutile salvare una "lista
-di SACK ricevuti dopo il cumulative ACK" giusto?
-- A quanto avevamo detto, in MS c'è uno scheduler che man mano che appena si libera spazio nella congestion window
-cerca di riempirlo con i dati dai tx buffer di ogni stream. Questo meccanismo del tx buffer non c'era nel tcp normale,
-in cui i dati venivano segmentati direttamente ed inseriti subito nella tx queue. Metto lo stesso meccanismo anche nel
-TCP normale, quindi introduco anche lì un TX buffer (che sarà associato solo allo stream 0 invece di essere per ogni
-stream), oppure lascio così com'è e non creo nessun TX buffer per tcp normale?
-- Mi serve qualcosa di diverso da STREAM_STATE_CLOSED per gestire il broken pipe per backlog piena?
+- Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
+analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
+Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
+c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effettivamente per la dimensione di
+un buffer, solo per inizializzare il campo txfree dei TCB.
+
 
 Problemi di MYTCP:
 - Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
@@ -18,3 +12,26 @@ Problemi di MYTCP:
 - Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
 - Confermo che viene accettata solo una connessione alla volta
 - In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"
+
+Risposte:
+- Se devo mandare un ACK senza payload, lo associo allo stream 0?
+    => NO, non inserire proprio l'opzione MS, in questo modo non si consuma un segment sequence number, che va bene
+    dato che non si sta facendo avanzare il sequence number e quindi non ci interessa avere un ACK dell'ACK che si
+    sta inviando
+- La stima iniziale dell'RTT (lato active open) la faccio già considerando il SYN+ACK, giusto?
+    => Probabilmente no, ma serve leggere sull'RFC (RFC 6298)
+- Una volta che ho una sequenza di misure dell'RTT, come si calcola la stima dell'RTT da usare per il timeout?
+    => Stesso meccanismo di mytcp, con rtt_e e Drtt_e (RFC 6298)
+- Non devo tenere nessuno stato relativo ai SACK ricevuti, giusto? Quando ricevo un SACK libero lo spazio di quel 
+pacchetto dalla flightsize dello stream corrispondente (e evito di ritrasmetterlo), ma è inutile salvare una "lista
+di SACK ricevuti dopo il cumulative ACK" giusto?
+    => Esatto
+- A quanto avevamo detto, in MS c'è uno scheduler che man mano che appena si libera spazio nella congestion window
+cerca di riempirlo con i dati dai tx buffer di ogni stream. Questo meccanismo del tx buffer non c'era nel tcp normale,
+in cui i dati venivano segmentati direttamente ed inseriti subito nella tx queue. Metto lo stesso meccanismo anche nel
+TCP normale, quindi introduco anche lì un TX buffer (che sarà associato solo allo stream 0 invece di essere per ogni
+stream), oppure lascio così com'è e non creo nessun TX buffer per tcp normale?
+    => Va bene inserire lo stesso meccanismo con un buffer e un "consumatore" (equivalente allo scheduler di MS-TCP) 
+    anche in TCP normale
+- Mi serve qualcosa di diverso da STREAM_STATE_CLOSED per gestire il broken pipe per backlog piena?
+    => Credo basti STREAM_STATE_CLOSED

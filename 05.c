@@ -31,8 +31,8 @@
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 8 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
-#define RXBUFSIZE 64000
 #define MAXTIMEOUT 2000
+#define TODO_BUFFER_SIZE 64000
 
 #define MIN_PORT 19000
 #define MAX_PORT 19999
@@ -183,10 +183,11 @@ struct tcpctrlblk{
 	bool stream_state[TOT_SID];
 	unsigned short adwin[TOT_SID];
 	unsigned short radwin[TOT_SID];
+	unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
 	unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
 	unsigned int rx_win_start[TOT_SID];
 	unsigned int txfree[TOT_SID];
-	unsigned char* stream_tx_buffer[TOT_SID];
+	uint16_t next_ssn[TOT_SID];
 
 
     int st; // Channel property
@@ -869,7 +870,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 
 	tcp->checksum = htons(0);
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
-	tcp->window = htons(tcb->adwin);
+	tcp->window = htons(tcb->adwin[fdinfo[s].sid]);
 	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, txctrl->totlen));
 }
 
@@ -1003,16 +1004,39 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->in_window_scale_factor = 0;
 			tcb->ts_recent = 0;
 
-			//#ifdef CONGCTRL
 			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
 			tcb->cgwin = INIT_CGWIN* TCP_MSS;
-			//tcb->timeout = INIT_TIMEOUT;
 			tcb->rtt_e = 0;
 			tcb->Drtt_e = 0;
 			tcb->cong_st = CONGCTRL_ST_SLOW_START;
-			//#endif
+
 			tcb->r_port = active_open_remote_addr->sin_port;
 			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
+
+			// Initialization of stream-specific fields
+			for(int i=0; i<TOT_SID; i++){
+				/*
+					bool stream_state[TOT_SID];
+					unsigned short adwin[TOT_SID];
+					unsigned short radwin[TOT_SID];
+					unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
+					unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
+					unsigned int rx_win_start[TOT_SID];
+					unsigned int txfree[TOT_SID];
+					uint16_t next_ssn[TOT_SID];
+				*/
+				tcb->stream_state[i] = STREAM_STATE_UNUSED;
+				tcb->stream_tx_buffer[i] = NULL;
+				tcb->stream_rx_buffer[i] = NULL;
+				tcb->adwin[i] = TODO_BUFFER_SIZE; // RX Buffer Size
+				if(tcb->out_window_scale_factor != 0){
+					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
+				}
+				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->rx_win_start[i] = 0;
+				tcb->txfree[i] = 0;
+				tcb->next_ssn[i] = 0;
+			}
 
 
 			// send SYN without MS option
@@ -1072,7 +1096,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					free(tcb->txfirst->segment);
 					free(tcb->txfirst);
 					tcb->txfirst = tcb->txlast = NULL;
-					
 					
 					bool ms_received = false;
 					bool sack_perm_received = false;
@@ -1137,25 +1160,18 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 
 					fdinfo[s].sid = 0; // The first opened stream is always stream 0
-					fdinfo[s].tcb->stream_state[0] = STREAM_STATE_OPENED;
+					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
-
-
+					tcb->radwin[0] = htons(tcp->window);
+					tcb->txfree[0] = TODO_BUFFER_SIZE;
+					tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
 
 					/*
 					We include all the usual payload options in this ACK
 					(we could avoid inserting the SACK, but it is simpler to do like this)
 					*/
-					uint8_t* ack_opt;
-					int ack_opt_len;
-					if(tcb->ms_option_enabled){
-						ack_opt = PAYLOAD_OPTIONS_TEMPLATE_MS;
-						ack_opt_len = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					}else{
-						ack_opt = PAYLOAD_OPTIONS_TEMPLATE;
-						ack_opt_len = sizeof(PAYLOAD_OPTIONS_TEMPLATE);
-					}
-					prepare_tcp(s, ACK, NULL, 0, ack_opt, ack_opt_len);
+					prepare_tcp(s, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 
 					tcb->st = TCB_ST_ESTABLISHED;
 				}
