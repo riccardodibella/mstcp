@@ -1101,7 +1101,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					bool sack_perm_received = false;
 					bool timestamps_received = false;
 					uint32_t received_remote_timestamp;
-					uint32_t tick_diff_timestamp;
+					// uint32_t tick_diff_timestamp; Not used (calculated again in rtt_estimate called from myio after the FSM returns)
 					uint8_t win_scale_factor_received = 0;
 					uint16_t mss_received = TCP_MSS;
 
@@ -1116,8 +1116,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
 							timestamps_received = true;
 
-							received_remote_timestamp = ntohl(*(uint32_t*) (tcp->payload+2));
-							tick_diff_timestamp = tick - ntohl(*(uint32_t*) (tcp->payload+6));
+							received_remote_timestamp = ntohl(*(uint32_t*) (tcp->payload+i+2));
+							// tick_diff_timestamp = tick - ntohl(*(uint32_t*) (tcp->payload+i+6));
 						}
 						if(tcp->payload[i] == OPT_KIND_SACK_PERM){
 							sack_perm_received = true;
@@ -1133,6 +1133,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						}
 						int length = tcp->payload[i+1];
 						i += length - 1; // with the i++ we go to the start of the next option
+						if(i>=optlen){
+							ERROR("FSM TCB_ST_SYN_SENT FSM_EVENT_PKT_RCV misaligned end of options (invalid last length)");
+						}
 					}
 
 					if(!timestamps_received){
@@ -1147,7 +1150,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						tcb->mss = mss_received;
 					}
 					tcb->ts_recent = received_remote_timestamp;
-					DEBUG("TODO tick_diff_timestamp ignored (fsm SYN_SENT PKT_RCV)");
+
 					if(!tcb->ms_option_requested && ms_received){
 						ERROR("Received MS-TCP option without request");
 					}
@@ -1219,7 +1222,62 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	return -1;
 }
 
+// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
+int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
+	if(tcp == NULL){
+		ERROR("search_tcp_option tcp NULL");
+	}
+	bool to_return = -1;
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	int i;
+	for(i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
 
+		if(tcp->payload[i] == kind){
+			to_return = i;
+			break;
+		}
+		
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	if(i>optlen){
+		/* 
+		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
+		the implementation at both sides of the connection this could allow to catch some bugs. We do not
+		always check if the field is well formed, this check is useful only if the option is not found
+		*/
+		ERROR("search_tcp_option misaligned end of options (invalid last length)");
+	}
+	return to_return;
+	
+}
+
+// Called only in myio, for every received packet, if after the FSM the connection is at least established
+void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
+	if(tcb == NULL || tcp == NULL){
+		ERROR("rtt_estimate NULL param");
+	}
+	int ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
+	if(ts_index == -1){
+		ERROR("rtt_estimate segment without Timestamps option");
+	}
+	uint32_t rtt = tick - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
+	if(tcb->rtt_e == 0) {
+		tcb->rtt_e = rtt; 
+		tcb->Drtt_e = rtt/2; 
+	}
+	else{
+		tcb->Drtt_e = ((8-BETA)*tcb->Drtt_e + BETA*abs(rtt-tcb->rtt_e))>>3;
+		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt)>>3;
+	}
+	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
+}
 
 void myio(int ignored){
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
@@ -1301,7 +1359,20 @@ void myio(int ignored){
 				continue;
 			}
 
-			if(tcb->txfirst !=NULL && ! (tcp->flags & SYN) ){
+			if(tcp->flags & ACK){
+				/* 
+				At this point I know that the connection is established, Timestamps is always supported, and I can modify my RTT estimate using the received segment.
+				For the Active Open side, this estimate includes also the RTT for the first SYN / SYN+ACK exchange
+				*/
+				rtt_estimate(tcb, tcp);
+			}
+
+			if(tcp->flags & SYN){
+				// SYN or SYN+ACK packets don't need to remove anything from the queue and don't generate any ack after the FSM (everything is done in there)
+				continue;
+			}
+
+			if(tcb->txfirst !=NULL ){
 				// Removal from TX queue for the cumulative ACK
 
 				int shifter = htonl(tcb->txfirst->segment->seq);
@@ -1323,10 +1394,9 @@ void myio(int ignored){
 				}
 			}
 
-			// Note: When copying from mytcp, be careful of the bug that deletes the last ACK of the three-way handshake after the connection state changes
-			// WP msg: "La soluzione più facile sarebbe fare il ciclo sulla tx queue solo se il pacchetto ricevuto non è un SYN"
+			DEBUG("TODO myio TCP insertion in RX buffer and ACK generation (remember to update ts.recent and last ack sent)");
 
-			DEBUG("TODO myio TCP insertion in RX buffer");
+			DEBUG("TODO ts.recent update"); // https://datatracker.ietf.org/doc/html/rfc7323#section-4.3
 		}
 	}//packet reception while end
 

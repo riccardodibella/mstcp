@@ -4,6 +4,8 @@ analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normal
 Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
 c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effettivamente per la dimensione di
 un buffer, solo per inizializzare il campo txfree dei TCB.
+- Se non sbaglio, al momento il retransmission timer può andare da 300ms a 2000 tick (10s). Da dove arrivano
+questi valori?
 
 
 Problemi di MYTCP:
