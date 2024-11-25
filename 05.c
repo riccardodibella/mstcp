@@ -234,6 +234,7 @@ struct tcpctrlblk{
     https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
     */
 	uint32_t ts_recent; // Channel property
+	uint32_t ts_offset; // Channel property, assumes the value of the 1st TS received from the peer
 
 	/* CONG CTRL (channel properties) */
 	//#ifdef CONGCTRL
@@ -501,7 +502,7 @@ void raw_socket_setup(){
 		perror("Socket raw failed"); 
 		exit(EXIT_FAILURE);
 	}
-	
+
 	if (-1 == fcntl(unique_raw_socket_fd, F_SETOWN, getpid())){ 
 		perror("fcntl setown"); 
 		exit(EXIT_FAILURE);
@@ -1004,7 +1005,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->stream_end=0xFFFFFFFF; //Max file
 			tcb->mss = TCP_MSS;
 			tcb->sequence=0;
-			tcb->cumulativeack =0;
+			tcb->cumulativeack = 0;
 			tcb->timeout = INIT_TIMEOUT;
 			tcb->fsm_timer = 0;
 			tcb->ms_option_requested = false;
@@ -1013,6 +1014,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 			tcb->in_window_scale_factor = 0;
 			tcb->ts_recent = 0;
+			tcb->ts_offset = 0;
 
 			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
 			tcb->cgwin = INIT_CGWIN* TCP_MSS;
@@ -1159,7 +1161,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					if(mss_received < tcb->mss){
 						tcb->mss = mss_received;
 					}
-					tcb->ts_recent = received_remote_timestamp;
+					tcb->ts_offset = tcb->ts_recent = received_remote_timestamp;
 
 					if(!tcb->ms_option_requested && ms_received){
 						ERROR("Received MS-TCP option without request");
@@ -1404,9 +1406,15 @@ void myio(int ignored){
 				}
 			}
 
-			DEBUG("TODO myio TCP insertion in RX buffer and ACK generation (remember to update ts.recent and last ack sent)");
+			DEBUG("TODO myio TCP insertion in RX buffer and ACK generation");
 
-			DEBUG("TODO ts.recent update"); // https://datatracker.ietf.org/doc/html/rfc7323#section-4.3
+			// ts_recent update ( https://datatracker.ietf.org/doc/html/rfc7323#section-4.3 )
+			uint32_t ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
+			uint32_t segment_ts_val = ntohl(*(uint32_t*) (tcp->payload+ts_index+2));
+			uint32_t segment_seq = ntohl(tcp->seq);
+			if((segment_ts_val - tcb->ts_offset) >= (tcb->ts_recent - tcb->ts_offset) && (segment_seq - tcb->ack_offs) <= tcb->cumulativeack){
+				tcb->ts_recent = segment_ts_val;
+			}
 		}
 	}//packet reception while end
 

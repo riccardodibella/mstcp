@@ -57,6 +57,7 @@ struct tcpctrlblk{
     https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
     */
 	uint32_t ts_recent; // Channel property
+	uint32_t ts_offset; // Channel property, assumes the value of the 1st TS received from the peer
 
 	/* CONG CTRL (channel properties) */
 	//#ifdef CONGCTRL
