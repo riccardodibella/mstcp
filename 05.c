@@ -24,6 +24,9 @@
 
 /* DEFINE MACROS */
 
+#define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
+#define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
+
 #define MS_ENABLED false
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
@@ -498,6 +501,7 @@ void raw_socket_setup(){
 		perror("Socket raw failed"); 
 		exit(EXIT_FAILURE);
 	}
+	
 	if (-1 == fcntl(unique_raw_socket_fd, F_SETOWN, getpid())){ 
 		perror("fcntl setown"); 
 		exit(EXIT_FAILURE);
@@ -515,7 +519,8 @@ void raw_socket_setup(){
 }
 
 void load_ifconfig(){
-	if(-1 == unique_raw_socket_fd){
+	int temp_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if(-1 == temp_socket){
 		ERROR("load_ifconfig fd -1");
 	}
 
@@ -527,19 +532,19 @@ void load_ifconfig(){
 	// ifr.ifr_addr is of type "struct sockaddr"
 	addr_ptr = (struct sockaddr_in*) &ifr.ifr_addr;
 
-	if(ioctl(unique_raw_socket_fd, SIOCGIFADDR, &ifr) == -1){
+	if(ioctl(temp_socket, SIOCGIFADDR, &ifr) == -1){
 		perror("ioctl SIOCGIFADDR");
 		exit(EXIT_FAILURE);
 	}
 	memcpy(myip, &(addr_ptr->sin_addr.s_addr), sizeof(myip));
 
-	if(ioctl(unique_raw_socket_fd, SIOCGIFNETMASK, &ifr) == -1){
+	if(ioctl(temp_socket, SIOCGIFNETMASK, &ifr) == -1){
 		perror("ioctl SIOCGIFNETMASK");
 		exit(EXIT_FAILURE);
 	}
 	memcpy(mask, &(addr_ptr->sin_addr.s_addr), sizeof(mask));
 
-	if(ioctl(unique_raw_socket_fd, SIOCGIFHWADDR, &ifr) == -1){
+	if(ioctl(temp_socket, SIOCGIFHWADDR, &ifr) == -1){
 		perror("ioctl SIOCGIFHWADDR");
 		exit(EXIT_FAILURE);
 	}
@@ -568,6 +573,11 @@ void load_ifconfig(){
 	}
 	free(gw_str);
 	pclose(gw_file);
+
+	if(close(temp_socket) == -1){
+		perror("temp_socket close\n");
+		exit(EXIT_FAILURE);
+	}
 }
 #pragma endregion STARTUP_FUNCTIONS
 
@@ -1462,8 +1472,9 @@ void mytimer(int ignored){
 }
 
 int main(){
-	raw_socket_setup();
 	load_ifconfig();
+
+	raw_socket_setup();
 
 	// Signal handlers association
 	struct sigaction action_io, action_timer;
