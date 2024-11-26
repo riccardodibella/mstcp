@@ -433,7 +433,6 @@ void myperror(char* message) {
 }
 
 void acquire_handler_lock(){
-	return; // TODO toglimi
 	if(global_handler_lock != 1){
 		ERROR("acquire_handler_lock global_handler_lock %d != 1", global_handler_lock);
 	}
@@ -441,7 +440,6 @@ void acquire_handler_lock(){
 }
 
 void release_handler_lock(){
-	return; // TODO toglimi
 	if(global_handler_lock != 0){
 		ERROR("release_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
@@ -627,7 +625,6 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 		perror("resolve_mac sento failed");
 		exit(EXIT_FAILURE);
 	}
-	//DEBUG("release mac");
 	release_handler_lock();
 
 	sigset_t tmpmask=global_signal_mask;
@@ -647,7 +644,6 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 			// found in cache
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
-			//DEBUG("acquire mac found");
 			acquire_handler_lock();
 			
 			return 0;
@@ -658,7 +654,6 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	}
 	sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 	
-	//DEBUG("acquire mac not found");
 	acquire_handler_lock();
 	
 	ERROR("resolve_mac not resolved");
@@ -1296,7 +1291,6 @@ void myio(int ignored){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
-	//DEBUG("acquire_handler_lock myio");
 	acquire_handler_lock();
 
 	struct pollfd fds[1];
@@ -1310,6 +1304,7 @@ void myio(int ignored){
 
 	if(!(fds[0].revents & POLLIN)){
 		// There is nothing to read
+		release_handler_lock();
 		return;
 	}
 
@@ -1418,7 +1413,6 @@ void myio(int ignored){
 		}
 	}//packet reception while end
 
-	//DEBUG("release_handler_lock myio");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
@@ -1430,7 +1424,6 @@ void mytimer(int ignored){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
-	//DEBUG("acquire_handler_lock mytimer");
 	acquire_handler_lock();
 
 	tick++;
@@ -1471,7 +1464,6 @@ void mytimer(int ignored){
 		}
 	}
 
-	//DEBUG("release_handler_lock mytimer");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
