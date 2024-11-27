@@ -8,13 +8,6 @@ un buffer, solo per inizializzare il campo txfree dei TCB.
 questi valori?
 
 
-Problemi di MYTCP:
-- Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
-- Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
-- Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
-- Confermo che viene accettata solo una connessione alla volta
-- In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"
-
 Risposte:
 - Se devo mandare un ACK senza payload, lo associo allo stream 0?
     => NO, non inserire proprio l'opzione MS, in questo modo non si consuma un segment sequence number, che va bene
@@ -37,3 +30,10 @@ stream), oppure lascio così com'è e non creo nessun TX buffer per tcp normale?
     anche in TCP normale
 - Mi serve qualcosa di diverso da STREAM_STATE_CLOSED per gestire il broken pipe per backlog piena?
     => Credo basti STREAM_STATE_CLOSED
+
+Problemi di MYTCP:
+- Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
+- Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
+- Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
+- Confermo che viene accettata solo una connessione alla volta
+- In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"

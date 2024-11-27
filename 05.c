@@ -28,6 +28,11 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define MS_ENABLED false
+#define CLIENT 0
+#define SERVER 1
+#ifndef MAIN_MODE // Compile with -DMAIN_MODE=CLIENT or -DMAIN_MODE=SERVER
+#define MAIN_MODE CLIENT
+#endif
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
@@ -403,20 +408,56 @@ void print_tcp_segment(struct tcp_segment* tcp){
 
 	printf("-------------------\n");
 }
-
+void print_mac(uint8_t* mac){
+	for(int i=0; i<6; i++){
+		printf("%.2X%s", mac[i],i!=5?":":"\n");
+	}
+}
+void print_ip(uint8_t* ip){
+	for(int i=0; i<4; i++){
+		printf("%d%s", ip[i],i!=3?".":"\n");
+	}
+}
 void print_ip_datagram(struct ip_datagram* ip){
 	printf("----IP DATAGRAM----\n");
 	printf("VER_IHL: 0x%.2x\n", ip->ver_ihl);
+	printf("Source IP: ");
+	print_ip((uint8_t*)&(ip->srcaddr));
+	printf("Destination IP: ");
+	print_ip((uint8_t*)&(ip->dstaddr));
 	printf("L4 protocol: %d\n", ip->proto);
 	if(ip->proto == TCP_PROTO){
 		print_tcp_segment((struct tcp_segment*) ip->payload + (((ip->ver_ihl & 0x0F) * 4) - 20));
 	}
 	printf("-------------------\n");
 }
-void print_mac(uint8_t* mac){
-	for(int i=0; i<6; i++){
-		printf("%.2X%s", mac[i],i!=5?":":"\n");
-	}
+void print_arp_packet(struct arp_packet* arp){
+	/*
+	struct arp_packet {
+		unsigned short int htype;
+		unsigned short int ptype;
+		unsigned char hlen;
+		unsigned char plen;
+		unsigned short op;
+		unsigned char srcmac[6];
+		unsigned char srcip[4];
+		unsigned char dstmac[6];
+		unsigned char dstip[4];
+	};
+	*/
+	printf("----ARP  PACKET----\n");
+	printf("HTYPE: %d PTYPE: 0x%.4x\n", htons(arp->htype), htons(arp->ptype));
+	printf("HLEN: %d PLEN: %d\n", arp->hlen, arp->plen);
+	printf("OP: %d\n", arp->op);
+	printf("Source MAC:");
+	print_mac(arp->srcmac);
+	printf("Destination MAC:");
+	print_mac(arp->dstmac);
+	printf("Source IP:");
+	print_ip(arp->srcip);
+	printf("Destination IP:");
+	print_ip(arp->dstip);
+	printf("-------------------\n");
 }
 void print_l2_packet(uint8_t* packet){
 	printf("---- L2 PACKET ----\n");
@@ -424,7 +465,13 @@ void print_l2_packet(uint8_t* packet){
 	print_mac(packet + 8);
 	printf("DST MAC: ");
 	print_mac(packet);
-	print_ip_datagram((struct ip_datagram*) (packet+14));
+	struct ethernet_frame* eth = (struct ethernet_frame*) packet;
+	printf("L3 Protocol: 0x%.4x\n", htons(eth->type));
+	if(htons(eth->type) == 0x0800){
+		print_ip_datagram((struct ip_datagram*) (packet+14));
+	} else if(htons(eth->type) == 0x0806){
+		print_arp_packet((struct arp_packet*) (packet+14));
+	}
 	printf("-------------------\n");
 }
 
@@ -446,50 +493,6 @@ void release_handler_lock(){
 	global_handler_lock++;
 }
 
-struct tcb_list_node* create_tcb_list_node(struct tcpctrlblk* tcb){
-	struct tcb_list_node* to_return = malloc(sizeof(struct tcb_list_node));
-	memset(to_return, 0, sizeof(struct tcb_list_node));
-	to_return->tcb = tcb;
-}
-
-int tcb_list_length(struct tcb_list_node* head_ptr){
-	if(head_ptr == NULL){
-		ERROR("tcb_list_node_length head_ptr NULL");
-	}
-	int to_return = 0;
-	struct tcb_list_node* cursor = head_ptr;
-	while(cursor != NULL){
-		cursor = cursor->next;
-		to_return++;
-	}
-	return to_return;
-}
-
-void tcb_list_insert_at(struct tcb_list_node* head_ptr, struct tcb_list_node* new_node, int index){
-	if(head_ptr == NULL || new_node == NULL){
-		ERROR("tcb_list_insert_at ptr NULL");
-	}
-	if(new_node->next != NULL){
-		// This may be intended, but it is more likely that there is a bug
-		ERROR("tcb_list_insert_at new_node next != NULL");
-	}
-	int list_length = tcb_list_length(head_ptr);
-	if(index < 0 || index >= list_length){
-		ERROR("tcb_list_insert_at invalid index %d", index);
-	}
-
-	struct tcb_list_node* cursor = head_ptr;
-	for(int i=0; i<index; i++){
-		cursor = cursor->next;
-	}
-	new_node->next = cursor->next;
-	cursor->next = new_node;
-}
-
-void tcb_list_append(struct tcb_list_node* head_ptr, struct tcb_list_node* new_node){
-	// This could be done much more efficiently, but it is easier to find bugs, it can be optimized later
-	tcb_list_insert_at(head_ptr, new_node, tcb_list_length(head_ptr));
-}
 
 
 
@@ -648,7 +651,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 			
 			return 0;
 		}
-		if ((clock()-start) > CLOCKS_PER_SEC/100){
+		if((clock()-start) > CLOCKS_PER_SEC/100){
 			break;
 		}
 	}
@@ -700,7 +703,6 @@ void forge_ethernet(struct ethernet_frame* eth, unsigned char * dest, unsigned s
 };
 
 void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, unsigned char proto){
-	static int losscounter;
 	int i,t,len ;
 	struct sockaddr_ll sll;
 	unsigned char destmac[6];
@@ -716,7 +718,6 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 		t = resolve_mac(*(unsigned int *)targetip, destmac); // if yes
 	else
 		t = resolve_mac(*(unsigned int *)gateway, destmac); // if not
-
 	if(t==-1){
 		ERROR("send_ip resolve_mac failed");
 	}
@@ -959,6 +960,41 @@ int mysocket(int family, int type, int proto){
 	}
 }
 
+// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
+int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
+	if(tcp == NULL){
+		ERROR("search_tcp_option tcp NULL");
+	}
+	int to_return = -1;
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	int i;
+	for(i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+
+		if(tcp->payload[i] == kind){
+			to_return = i;
+			break;
+		}
+		
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	if(i>optlen){
+		/* 
+		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
+		the implementation at both sides of the connection this could allow to catch some bugs. We do not
+		always check if the field is well formed, this check is useful only if the option is not found
+		*/
+		ERROR("search_tcp_option misaligned end of options (invalid last length)");
+	}
+	return to_return;
+}
+
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
 	if(s < 3 || s >= MAX_FD){
@@ -1187,6 +1223,146 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				}
 			}
 			break;
+		case TCB_ST_LISTEN:
+			if(event == FSM_EVENT_PKT_RCV){
+				if(!(tcp->flags & SYN)){
+					break;
+				}
+				DEBUG("Received SYN!");
+
+				bool ms_received = false;
+				bool sack_perm_received = false;
+				bool timestamps_received = false;
+				uint32_t received_remote_timestamp;
+				// uint32_t tick_diff_timestamp; Not used (calculated again in rtt_estimate called from myio after the FSM returns)
+				uint8_t win_scale_factor_received = 0;
+				uint16_t mss_received = TCP_MSS;
+
+				int optlen = ((tcp->d_offs_res)>>4)*4-20;
+				for(int i=0; i<optlen; i++){
+					if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+						break;
+					}
+					if(tcp->payload[i] == OPT_KIND_NO_OP){
+						continue;
+					}
+					if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
+						timestamps_received = true;
+
+						received_remote_timestamp = ntohl(*(uint32_t*) (tcp->payload+i+2));
+						// tick_diff_timestamp = tick - ntohl(*(uint32_t*) (tcp->payload+i+6));
+					}
+					if(tcp->payload[i] == OPT_KIND_SACK_PERM){
+						sack_perm_received = true;
+					}
+					if(tcp->payload[i] == OPT_KIND_MSS){
+						mss_received = tcp->payload[i+2] << 8 | tcp->payload[i+3];
+					}
+					if(tcp->payload[i] == OPT_KIND_WIN_SCALE){
+						win_scale_factor_received = tcp->payload[i+2];
+					}
+					if(tcp->payload[i] == OPT_KIND_MS_TCP){
+						ms_received = true;
+					}
+					int length = tcp->payload[i+1];
+					i += length - 1; // with the i++ we go to the start of the next option
+					if(i>=optlen){
+						ERROR("FSM TCB_ST_LISTEN FSM_EVENT_PKT_RCV misaligned end of options (invalid last length)");
+					}
+				}
+
+				if(!timestamps_received){
+					ERROR("Timestamps not enabled with the SYN");
+				}
+				if(!sack_perm_received){
+					ERROR("SACK not enabled with the SYN");
+				}
+
+				tcb->in_window_scale_factor = win_scale_factor_received;
+				tcb->mss = MIN(mss_received, TCP_MSS);
+				tcb->ts_offset = tcb->ts_recent = received_remote_timestamp;
+
+				tcb->ms_option_enabled = ms_received && MS_ENABLED;
+
+				tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+				tcb->cgwin = INIT_CGWIN* TCP_MSS;
+				tcb->rtt_e = 0;
+				tcb->Drtt_e = 0;
+				tcb->cong_st = CONGCTRL_ST_SLOW_START;
+
+				tcb->r_port = tcp->s_port;
+				tcb->r_addr = memcmp((uint8_t*) &ip->srcaddr, myip, 4) ? ip->srcaddr : inet_addr("127.0.0.1");
+				
+
+				tcb->seq_offs=rand();
+				tcb->ack_offs=htonl(tcp->seq)+1;
+				tcb->cumulativeack=0;
+
+				tcb->timeout = INIT_TIMEOUT;
+				tcb->txfirst = tcb->txlast = NULL;
+
+				uint8_t* opt_ptr = NULL;
+				int opt_len;
+				if(tcb->ms_option_enabled){
+					opt_len = 23;
+					opt_ptr = malloc(opt_len);
+
+					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+					opt_ptr[1] = 4; // MSS Length
+					opt_ptr[2] = TCP_MSS >> 8;
+					opt_ptr[3] = TCP_MSS & 0xFF;
+					opt_ptr[0] = OPT_KIND_MS_TCP; // MSS Kind
+					opt_ptr[1] = 4; // MSS Length
+					opt_ptr[2] = 0;
+					opt_ptr[3] = 0;
+					opt_ptr[8] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+					opt_ptr[9] = 10; // Timestamps Length
+					opt_ptr[10] = 0;
+					opt_ptr[11] = 0;
+					opt_ptr[12] = 0;
+					opt_ptr[13] = 0;
+					opt_ptr[14] = 0;
+					opt_ptr[15] = 0;
+					opt_ptr[16] = 0;
+					opt_ptr[17] = 0; 
+					opt_ptr[18] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+					opt_ptr[19] = 2; // SACK permitted Length
+					opt_ptr[20] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+					opt_ptr[21] = 3; // Window Scale Length
+					opt_ptr[22] = DEFAULT_WINDOW_SCALE;
+				}else{
+					opt_len = 19;
+					opt_ptr = malloc(opt_len);
+
+					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+					opt_ptr[1] = 4; // MSS Length
+					opt_ptr[2] = TCP_MSS >> 8;
+					opt_ptr[3] = TCP_MSS & 0xFF;
+					opt_ptr[4] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+					opt_ptr[5] = 10; // Timestamps Length
+					opt_ptr[6] = 0;
+					opt_ptr[7] = 0;
+					opt_ptr[8] = 0;
+					opt_ptr[9] = 0;
+					opt_ptr[10] = 0;
+					opt_ptr[11] = 0;
+					opt_ptr[12] = 0;
+					opt_ptr[13] = 0; 
+					opt_ptr[14] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+					opt_ptr[15] = 2; // SACK permitted Length
+					opt_ptr[16] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+					opt_ptr[17] = 3; // Window Scale Length
+					opt_ptr[18] = DEFAULT_WINDOW_SCALE;
+				}
+
+				prepare_tcp(s, SYN|ACK, NULL, 0, opt_ptr, opt_len);
+				free(opt_ptr);
+    			tcb->st = TCB_ST_SYN_RECEIVED;
+			}
+			break;
+		case TCB_ST_SYN_RECEIVED:
+			DEBUG("FSM TCB_ST_SYN_RECEIVED (empty)");
+			break;
 		default:
 			ERROR("FSM unknown tcb->st %d", tcb->st);
 	}
@@ -1229,40 +1405,20 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	return -1;
 }
 
-// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
-int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
-	if(tcp == NULL){
-		ERROR("search_tcp_option tcp NULL");
+int mylisten(int s, int bl){
+	if(fdinfo[s].st!=FDINFO_ST_BOUND){
+		myerrno=EBADF; 
+		return -1;
 	}
-	bool to_return = -1;
-	int optlen = ((tcp->d_offs_res)>>4)*4-20;
-	int i;
-	for(i=0; i<optlen; i++){
-		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
-			break;
-		}
-		if(tcp->payload[i] == OPT_KIND_NO_OP){
-			continue;
-		}
-
-		if(tcp->payload[i] == kind){
-			to_return = i;
-			break;
-		}
-		
-		int length = tcp->payload[i+1];
-		i += length - 1; // with the i++ we go to the start of the next option
-	}
-	if(i>optlen){
-		/* 
-		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
-		the implementation at both sides of the connection this could allow to catch some bugs. We do not
-		always check if the field is well formed, this check is useful only if the option is not found
-		*/
-		ERROR("search_tcp_option misaligned end of options (invalid last length)");
-	}
-	return to_return;
-	
+	fdinfo[s].tcb = (struct tcpctrlblk *) malloc (sizeof(struct tcpctrlblk));
+	bzero(fdinfo[s].tcb,sizeof(struct tcpctrlblk));
+	fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+	fdinfo[s].tcb->st = TCB_ST_LISTEN;
+	fdinfo[s].tcb->is_active_side = false;
+	fdinfo[s].ready_streams = 0;
+	fdinfo[s].backlog_length = bl;
+	fdinfo[s].backlog_head.tcb = NULL;
+	fdinfo[s].backlog_head.next = NULL;
 }
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
@@ -1305,6 +1461,10 @@ void myio(int ignored){
 	if(!(fds[0].revents & POLLIN)){
 		// There is nothing to read
 		release_handler_lock();
+		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+			perror("sigprocmask"); 
+			exit(EXIT_FAILURE);
+		}
 		return;
 	}
 
@@ -1346,6 +1506,13 @@ void myio(int ignored){
 					(fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)
 					||
 					((fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st==TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port))
+				){
+					break;
+				}
+				if(
+					(fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) 
+					&& 
+					(ip->srcaddr == *(uint32_t*)myip) && (inet_addr("127.0.0.1") == fdinfo[i].tcb->r_addr)
 				){
 					break;
 				}
@@ -1502,31 +1669,62 @@ int main(){
 	
 	DEBUG("Startup OK");
 
-
-	// Client code to connect to a server
-	int s;
-	struct sockaddr_in addr, loc_addr;
-	s=mysocket(AF_INET,SOCK_STREAM,0);
-	if(s == -1){
-		myperror("mysocket");
-		exit(EXIT_FAILURE);
+	if(MAIN_MODE == CLIENT){
+		// Client code to connect to a server
+		int s = mysocket(AF_INET,SOCK_STREAM,0);
+		if(s == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("mysocket OK");
+		/*
+		struct sockaddr_in loc_addr;
+		loc_addr.sin_family = AF_INET;
+		loc_addr.sin_port = 0; // Automatic port 
+		loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
+		if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
+			myperror("mybind"); 
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("mybind OK");
+		*/
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(19500);
+		//addr.sin_addr.s_addr = *(uint32_t*)myip;
+		addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+		//addr.sin_addr.s_addr = inet_addr("93.184.215.14");
+		//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
+		if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
+			myperror("myconnect");
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("myconnect OK");
+	}else if(MAIN_MODE == SERVER){
+		int s=mysocket(AF_INET,SOCK_STREAM,0);
+		if(s == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("mysocket OK");
+		struct sockaddr_in loc_addr;
+		loc_addr.sin_family = AF_INET;
+		loc_addr.sin_port = htons(19500); // Automatic port
+		loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
+		if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
+			myperror("mybind"); 
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("mybind OK");
+		if ( mylisten(s,5) == -1 ) { 
+			myperror("mylisten"); 
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("mylisten OK");
+		while(true){
+		}
+	}else{
+		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
 	}
-	DEBUG("mysocket OK");
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(80);
-	addr.sin_addr.s_addr = inet_addr("93.184.215.14");
-	//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
-	loc_addr.sin_family = AF_INET;
-	loc_addr.sin_port = 0; // Automatic port 
-	loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
-	if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
-		myperror("mybind"); 
-		exit(EXIT_FAILURE);
-	}
-	DEBUG("mybind OK");
-	if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
-		myperror("myconnect"); 
-		exit(EXIT_FAILURE);
-	}
-	DEBUG("myconnect OK");
+	
 }
