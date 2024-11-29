@@ -1361,7 +1361,22 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			break;
 		case TCB_ST_SYN_RECEIVED:
+			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
+				// The SYN has been retransmitted (ignored)
+				break;
+			}
+			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & ACK)){
+				ERROR("Passive open connection established!");
+				break;
+			}
 			DEBUG("FSM TCB_ST_SYN_RECEIVED (empty)");
+			break;
+		case TCB_ST_ESTABLISHED:
+			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
+				// The SYN+ACK has been retransmitted (ignored)
+				break;
+			}
+			DEBUG("FSM TCB_ST_ESTABLISHED (empty)");
 			break;
 		default:
 			ERROR("FSM unknown tcb->st %d", tcb->st);
@@ -1431,6 +1446,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		ERROR("rtt_estimate segment without Timestamps option");
 	}
 	uint32_t rtt = tick - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
+	DEBUG("before rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 	if(tcb->rtt_e == 0) {
 		tcb->rtt_e = rtt; 
 		tcb->Drtt_e = rtt/2; 
@@ -1440,6 +1456,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt)>>3;
 	}
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
+	DEBUG("after rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 }
 
 void myio(int ignored){
@@ -1538,6 +1555,7 @@ void myio(int ignored){
 				At this point I know that the connection is established, Timestamps is always supported, and I can modify my RTT estimate using the received segment.
 				For the Active Open side, this estimate includes also the RTT for the first SYN / SYN+ACK exchange
 				*/
+				// TODO spostare la chiamata, o farla solo in determinate condizioni https://www.rfc-editor.org/rfc/rfc7323#section-4
 				rtt_estimate(tcb, tcp);
 			}
 
@@ -1700,6 +1718,8 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("myconnect OK");
+		while(true){
+		}
 	}else if(MAIN_MODE == SERVER){
 		int s=mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){

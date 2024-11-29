@@ -6,6 +6,7 @@ c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effe
 un buffer, solo per inizializzare il campo txfree dei TCB.
 - Se non sbaglio, al momento il retransmission timer può andare da 300ms a 2000 tick (10s). Da dove arrivano
 questi valori?
+- Bisogna cambiare il modo di aggiornare l'RTT per 
 
 
 Risposte:
@@ -30,6 +31,10 @@ stream), oppure lascio così com'è e non creo nessun TX buffer per tcp normale?
     anche in TCP normale
 - Mi serve qualcosa di diverso da STREAM_STATE_CLOSED per gestire il broken pipe per backlog piena?
     => Credo basti STREAM_STATE_CLOSED
+
+
+Fonti:
+https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
 
 Problemi di MYTCP:
 - Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
