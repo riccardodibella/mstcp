@@ -6,7 +6,21 @@ c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effe
 un buffer, solo per inizializzare il campo txfree dei TCB.
 - Se non sbaglio, al momento il retransmission timer può andare da 300ms a 2000 tick (10s). Da dove arrivano
 questi valori?
-- Bisogna cambiare il modo di aggiornare l'RTT per 
+- Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
+che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
+- A cosa serve l'ACK che viene inviato quando viene fatto myaccept?
+
+
+{
+    Devo capire cosa fare con i TCB dei passive open... Al momento è facile: quando faccio accept libero il posto
+    nella backlog e ho una copia di quel TCB linkata solo in fdinfo per quel socket. Posso tenere la stessa cosa
+    anche adesso nelle connessioni non-MS. Per le connessioni MS, non posso togliere il TCB dalla backlog
+    fino a quando non ho riempito tutti e 32 gli stream (ma per consistenza non lo toglierei proprio mai dalla
+    backlog finchè la connessione non è chiusa). Quando faccio accept(), linko in fdinfo[s] lo stesso TCB.
+    Quando faccio la chiusura di uno stream, so che non devo chiudere la connessione a meno che quando mi arriva
+    l'ACK della mia chiusura dello stream non siano stati chiusi gli stream, in quel caso posso chiuderla.
+    Quando chiudo la connessione cancello anche la entry dalla backlog.
+}
 
 
 Risposte:
@@ -41,4 +55,5 @@ Problemi di MYTCP:
 - Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
 - Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
 - Confermo che viene accettata solo una connessione alla volta
+- In myaccept, viene dato errore se lo stato del TCB è SYN_RECEVIED, anche se c'è il toggle tra i due stati
 - In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"

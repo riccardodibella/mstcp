@@ -82,10 +82,11 @@
 #define TCB_ST_TIME_WAIT 20 // waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connecti
 
 #define STREAM_STATE_UNUSED 0
-#define STREAM_STATE_OPENED 1
-#define STREAM_STATE_LSS_SENT 2
-#define STREAM_STATE_LSS_RCV 3
-#define STREAM_STATE_CLOSED 4
+#define STREAM_STATE_READY 1 // only for passive open before accept
+#define STREAM_STATE_OPENED 2
+#define STREAM_STATE_LSS_SENT 3
+#define STREAM_STATE_LSS_RCV 4
+#define STREAM_STATE_CLOSED 5
 
 #define FIN 0x001
 #define SYN 0x002
@@ -335,6 +336,7 @@ uint8_t PAYLOAD_OPTIONS_TEMPLATE[] = {
 
 /* FUNCTION DEFINITIONS */
 
+// In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
 	printf("ERROR: ");
 	va_list args;
@@ -1212,6 +1214,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->txfree[0] = TODO_BUFFER_SIZE;
 					tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
 					tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					tcb->adwin[0] = TODO_BUFFER_SIZE;
 
 					/*
 					We include all the usual payload options in this ACK
@@ -1361,15 +1364,65 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			break;
 		case TCB_ST_SYN_RECEIVED:
-			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
-				// The SYN has been retransmitted (ignored)
-				break;
+			if(event == FSM_EVENT_PKT_RCV && !(tcp->flags & SYN) && (tcp->flags & ACK)){
+				// It is an ACK (and it is not a SYN, that may be RETXed)
+				if(htonl(tcp->ack) == tcb->seq_offs + 1){
+					// Passive open connection establishment
+					free(tcb->txfirst->segment);
+					free(tcb->txfirst);
+					tcb->txfirst = tcb->txlast = NULL;
+					tcb->seq_offs++;
+					tcb->ack_offs=htonl(tcp->seq);
+					tcb->st = TCB_ST_ESTABLISHED;
+					
+					if(fdinfo[s].backlog_length == fdinfo[s].ready_streams){
+						// The incoming connection (MS or not) cannot be accepted
+						prepare_tcp(s,RST,NULL,0,NULL,0);
+					}
+					fdinfo[s].ready_streams++;
+
+					/* Duplication of the current TCB and insertion in the backlog */
+
+					struct tcb_list_node* cursor = &(fdinfo[s].backlog_head);
+					while(cursor->next != NULL){
+						cursor = cursor->next;
+					} // now cursor is the last node in the backlog
+					cursor->next = (struct tcb_list_node*) malloc(sizeof(struct tcb_list_node));
+					cursor = cursor->next;
+					cursor->next = NULL;
+					cursor->tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+					memcpy(cursor->tcb, tcb, sizeof(struct tcpctrlblk));
+
+
+					/* Initialization of the field-specific fields and buffers */
+
+					cursor->tcb->stream_state[0] = STREAM_STATE_READY;
+					tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					tcb->adwin[0] = TODO_BUFFER_SIZE;
+					tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
+					tcb->txfree[0] = TODO_BUFFER_SIZE;
+					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
+						cursor->tcb->stream_state[i] = STREAM_STATE_UNUSED;
+						cursor->tcb->stream_tx_buffer[i] = NULL;
+						cursor->tcb->stream_rx_buffer[i] = NULL;
+						tcb->adwin[i] = TODO_BUFFER_SIZE; // RX buffer size
+						if(tcb->out_window_scale_factor != 0){
+							ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
+						}
+						cursor->tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
+						cursor->tcb->rx_win_start[i] = 0;
+						cursor->tcb->txfree[i] = 0;
+						cursor->tcb->next_ssn[i] = 0;
+					}
+
+
+					// Listening TCB re-initialization (same as mylisten)
+					bzero(tcb,sizeof(struct tcpctrlblk));
+					tcb->st = TCB_ST_LISTEN;
+					fdinfo[s].tcb->is_active_side = false;
+				}
 			}
-			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & ACK)){
-				ERROR("Passive open connection established!");
-				break;
-			}
-			DEBUG("FSM TCB_ST_SYN_RECEIVED (empty)");
 			break;
 		case TCB_ST_ESTABLISHED:
 			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
@@ -1434,6 +1487,73 @@ int mylisten(int s, int bl){
 	fdinfo[s].backlog_length = bl;
 	fdinfo[s].backlog_head.tcb = NULL;
 	fdinfo[s].backlog_head.next = NULL;
+}
+
+int myaccept(int s, struct sockaddr* addr, int * len){
+	if (addr->sa_family != AF_INET){
+		ERROR("myaccept addr->sa_family != AF_INET");
+		myerrno=EINVAL; 
+		return -1;
+	}
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL){
+		ERROR("myaccept fdinfo[s] without TCB");
+	}
+	if (fdinfo[s].tcb->st!=TCB_ST_LISTEN && fdinfo[s].tcb->st!=TCB_ST_SYN_RECEIVED) {
+		ERROR("myaccept invalid fdinfo[s].tcb->st %d", fdinfo[s].tcb->st);
+		myerrno=EBADF; 
+		return -1;
+	}
+	struct sockaddr_in * a = (struct sockaddr_in *) addr;
+  	*len = sizeof(struct sockaddr_in);
+	do{
+		if(fdinfo[s].ready_streams == 0){
+			/*
+			"Within a do or a while statement, the next iteration starts by reevaluating the expression of the do or while statement."
+			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
+			*/
+			continue;
+		}
+		// At this point we are sure that there is something that can be returned
+		int free_fd; // mytcp: j
+		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for free fd
+		if(free_fd == MAX_FD){
+			myerrno=ENFILE; 
+			return -1;
+		}
+		struct tcb_list_node* prev = &fdinfo[s].backlog_head; // "precursor" 
+		struct tcb_list_node* cursor = fdinfo[s].backlog_head.next;
+		while(cursor != NULL){
+			struct tcpctrlblk* tcb = cursor->tcb;
+			if(tcb == NULL){
+				ERROR("myaccept cursor unexpected NULL tcb");
+			}
+			if(tcb->st != TCB_ST_ESTABLISHED){
+				continue;
+			}
+			for(int i=0; i<TOT_SID; i++){
+				if(tcb->stream_state[i] == STREAM_STATE_READY){
+					bzero(&fdinfo[free_fd], sizeof(struct socket_info));
+					fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
+					fdinfo[free_fd].sid = i;
+					fdinfo[free_fd].l_port = fdinfo[s].l_port;
+					fdinfo[free_fd].l_addr = fdinfo[s].l_addr;
+					fdinfo[free_fd].tcb = tcb;
+					if(!tcb->ms_option_enabled){
+						// remove the entry from the backlog
+						prev->next = cursor->next;
+						free(cursor);
+					}
+					fdinfo[s].ready_streams--;
+					prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));	// TODO why send this ACK?
+					return free_fd;
+				}
+			}
+			prev = cursor;
+			cursor = cursor->next;
+		}
+		ERROR("fdinfo[%d].ready_streams %d != 0 but no ready stream was found", s, fdinfo[s].ready_streams);
+	}while(pause());
+	ERROR("myaccept something went very wrong, you should never reach after the do while"); // pause always returns -1
 }
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
@@ -1721,8 +1841,8 @@ int main(){
 		while(true){
 		}
 	}else if(MAIN_MODE == SERVER){
-		int s=mysocket(AF_INET,SOCK_STREAM,0);
-		if(s == -1){
+		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
+		if(listening_socket == -1){
 			myperror("mysocket");
 			exit(EXIT_FAILURE);
 		}
@@ -1731,17 +1851,26 @@ int main(){
 		loc_addr.sin_family = AF_INET;
 		loc_addr.sin_port = htons(19500); // Automatic port
 		loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
-		if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
+		if( -1 == mybind(listening_socket,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
 			myperror("mybind"); 
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mybind OK");
-		if ( mylisten(s,5) == -1 ) { 
+		if ( mylisten(listening_socket,5) == -1 ) { 
 			myperror("mylisten"); 
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mylisten OK");
 		while(true){
+			struct sockaddr_in remote_addr;
+			remote_addr.sin_family=AF_INET;
+			int len = sizeof(struct sockaddr_in);
+			int s = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
+			if(s<0){
+				myperror("myaccept");
+				exit(EXIT_FAILURE);
+			}
+			DEBUG("myaccept OK fd %d", s);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);

@@ -1,8 +1,9 @@
 #define STREAM_STATE_UNUSED 0
-#define STREAM_STATE_OPENED 1
-#define STREAM_STATE_LSS_SENT 2
-#define STREAM_STATE_LSS_RCV 3
-#define STREAM_STATE_CLOSED 4
+#define STREAM_STATE_READY 1 // only for passive open before accept
+#define STREAM_STATE_OPENED 2
+#define STREAM_STATE_LSS_SENT 3
+#define STREAM_STATE_LSS_RCV 4
+#define STREAM_STATE_CLOSED 5
 
 /* Modified TCB with streams (05.c) */
 struct tcpctrlblk{
