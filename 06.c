@@ -27,7 +27,7 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define MS_ENABLED false
+#define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
 #ifndef MAIN_MODE // Compile with -DMAIN_MODE=CLIENT or -DMAIN_MODE=SERVER
@@ -41,6 +41,7 @@
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 #define TODO_BUFFER_SIZE 64000
+#define STREAM_OPEN_TIMEOUT 2 // in ticks
 
 #define MIN_PORT 19000
 #define MAX_PORT 19999
@@ -67,7 +68,8 @@
 #define FSM_EVENT_APP_PASSIVE_OPEN 2
 #define FSM_EVENT_PKT_RCV 3
 #define FSM_EVENT_APP_CLOSE 4
-#define FSM_EVENT_TIMEOUT 5
+#define FSM_EVENT_TIMEOUT 5 // Channel timeout (connection closing)
+#define FSM_EVENT_STREAM_TIMEOUT 6 // Stream timeout (no data has been sent upon stream opening, so a dummy byte is sent on that stream to open it)
 
 #define TCB_ST_CLOSED 10 // initial state
 #define TCB_ST_LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
@@ -197,6 +199,7 @@ struct tcpctrlblk{
 	unsigned int rx_win_start[TOT_SID];
 	unsigned int txfree[TOT_SID];
 	uint16_t next_ssn[TOT_SID];
+	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 
 
     int st; // Channel property
@@ -1043,7 +1046,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->fsm_timer = 0;
 			tcb->ms_option_requested = false;
 			tcb->ms_option_enabled = false;
-			tcb->is_active_side = false;
+			tcb->is_active_side = true;
 			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 			tcb->in_window_scale_factor = 0;
 			tcb->ts_recent = 0;
@@ -1081,6 +1084,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->rx_win_start[i] = 0;
 				tcb->txfree[i] = 0;
 				tcb->next_ssn[i] = 0;
+				tcb->stream_fsm_timer[i] = 0;
 			}
 
 
@@ -1111,7 +1115,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			opt_ptr[17] = 3; // Window Scale Length
 			opt_ptr[18] = DEFAULT_WINDOW_SCALE;
 
-			tcb->ms_option_requested = false;
 			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
@@ -1119,7 +1122,176 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			
 			return 0;
 		}else{
-			ERROR("TODO FSM active open Multi-Stream");
+			if(fdinfo[s].st == FDINFO_ST_UNBOUND){
+				// Search if there is an already opened MS connection to the same destination with available streams
+				ERROR("TODO search");
+				for(int other_s = 0; other_s < MAX_FD; other_s++){
+					if(fdinfo[other_s].st != FDINFO_ST_TCB_CREATED){ // this also handles the case other_s == s
+						continue;
+					}
+					struct tcpctrlblk* tcb = fdinfo[other_s].tcb;
+					if(!tcb->is_active_side){
+						continue;
+					}
+					if(tcb->st != TCB_ST_ESTABLISHED){
+						/* 
+						NOTE: we do wait for a SYN_SENT connection to be established to see if it will have MS-TCP enabled and add streams to it. We
+						consider only already established connections to for opening new streams. This can be a problem if several non-blocking connects 
+						are called back to back to a server that supports MS-TCP: in this case, if MS-TCP is enabled at the client, many new connections 
+						will be created and MS-TCP will be useless, creating only a small overhead without any benefits. The scenario of multiple connect
+						calls back to back is not unrealistic, since this is probably what is done in modern browsers that have 6 TCP connections opened
+						at the same time towards a server. However, this is not a problem if the browser opens only one connection at the beginning, and
+						only after the first page has been fetched the other 5 connections are created to retreive the other resources. It may be a good
+						idea to verify this assumption on modern browser behaviour with Wireshark. 
+						*/
+						continue;
+					}
+					if(tcb->r_port != active_open_remote_addr->sin_port || tcb->r_addr != active_open_remote_addr->sin_addr.s_addr){
+						continue;
+					}
+					if(!tcb->ms_option_enabled){
+						/*
+						NOTE: if MS-TCP has not been enabled (but it has been requested) on a connection towards the same server, we could deduce that
+						MS is not supported or enabled at that server, and consequently avoid requesting the MS option for our new connection. However,
+						it does not seem very useful to impose a guarantee that MS-TCP support cannot vary in time at a server, or that the configuration
+						should be uniform between multiple servers that accept connections at a certain address and port. Since MS-TCP does not add a
+						large overhead on the SYN, and it does not delay the opening of other connections (because of "tcb->st != TCB_ST_ESTABLISHED"),
+						there is no reason to make such assumptions at the client.
+						*/
+						continue;
+					}
+					
+					// At this point the connection is a good candidate: search for a free stream
+					for(int stream = 0; stream < TOT_SID; stream++){
+						if(tcb->stream_state[stream] == STREAM_STATE_UNUSED){
+							// Free stream found
+							fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+							fdinfo[s].sid = stream;
+							fdinfo[s].l_addr = fdinfo[other_s].l_addr;
+							fdinfo[s].l_port = fdinfo[other_s].l_port;
+							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
+							fdinfo[s].tcb->radwin[stream] = TODO_BUFFER_SIZE; // ???? There is no initial window here
+							fdinfo[s].tcb->txfree[stream] = TODO_BUFFER_SIZE;
+							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
+							fdinfo[s].tcb->stream_rx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
+							fdinfo[s].tcb->adwin[stream] = TODO_BUFFER_SIZE;
+							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
+							return 0;
+						}
+					}
+				}
+
+				// No such connection exists: bind to a new port and open a new connection
+				struct sockaddr_in local;
+				local.sin_port=htons(0);
+				local.sin_addr.s_addr = htonl(0);
+				local.sin_family = AF_INET;
+				if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
+					myperror("implicit binding failed\n"); 
+					return -1;
+				}
+			}
+
+			if(fdinfo[s].st != FDINFO_ST_BOUND){
+				myerrno = EBADF; 
+				return -1;
+			}
+
+			// Open a new connection, requesting MS option
+			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			bzero(tcb, sizeof(struct tcpctrlblk));
+			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+			tcb->st = TCB_ST_CLOSED;
+
+			tcb->seq_offs=rand();
+			tcb->ack_offs=0;
+			tcb->stream_end=0xFFFFFFFF;
+			tcb->mss = TCP_MSS;
+			tcb->sequence=0;
+			tcb->cumulativeack = 0;
+			tcb->timeout = INIT_TIMEOUT;
+			tcb->fsm_timer = 0;
+			tcb->ms_option_requested = true; // modified wrt non-ms
+			tcb->ms_option_enabled = false;
+			tcb->is_active_side = true;
+			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
+			tcb->in_window_scale_factor = 0;
+			tcb->ts_recent = 0;
+			tcb->ts_offset = 0;
+
+			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
+			tcb->cgwin = INIT_CGWIN* TCP_MSS;
+			tcb->rtt_e = 0;
+			tcb->Drtt_e = 0;
+			tcb->cong_st = CONGCTRL_ST_SLOW_START;
+
+			tcb->r_port = active_open_remote_addr->sin_port;
+			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
+
+			// Initialization of stream-specific fields
+			for(int i=0; i<TOT_SID; i++){
+				/*
+					bool stream_state[TOT_SID];
+					unsigned short adwin[TOT_SID];
+					unsigned short radwin[TOT_SID];
+					unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
+					unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
+					unsigned int rx_win_start[TOT_SID];
+					unsigned int txfree[TOT_SID];
+					uint16_t next_ssn[TOT_SID];
+				*/
+				tcb->stream_state[i] = STREAM_STATE_UNUSED;
+				tcb->stream_tx_buffer[i] = NULL;
+				tcb->stream_rx_buffer[i] = NULL;
+				tcb->adwin[i] = TODO_BUFFER_SIZE; // RX Buffer Size
+				if(tcb->out_window_scale_factor != 0){
+					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
+				}
+				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->rx_win_start[i] = 0;
+				tcb->txfree[i] = 0;
+				tcb->next_ssn[i] = 0;
+				tcb->stream_fsm_timer[i] = 0;
+			}
+
+
+			// send SYN with MS option
+			uint8_t* opt_ptr = NULL;
+			int opt_len;
+
+			opt_len = 23;
+			opt_ptr = malloc(opt_len);
+
+			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
+			opt_ptr[1] = 4; // MSS Length
+			opt_ptr[2] = TCP_MSS >> 8;
+			opt_ptr[3] = TCP_MSS & 0xFF;
+			opt_ptr[4] = OPT_KIND_MS_TCP; // MS-TCP Kind
+			opt_ptr[5] = 4; // MS-TCP Length
+			opt_ptr[6] = 0;
+			opt_ptr[7] = 0;
+			opt_ptr[8] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
+			opt_ptr[9] = 10; // Timestamps Length
+			opt_ptr[10] = 0;
+			opt_ptr[11] = 0;
+			opt_ptr[12] = 0;
+			opt_ptr[13] = 0;
+			opt_ptr[14] = 0;
+			opt_ptr[15] = 0;
+			opt_ptr[16] = 0;
+			opt_ptr[17] = 0; 
+			opt_ptr[18] = OPT_KIND_SACK_PERM; // SACK permitted Kind
+			opt_ptr[19] = 2; // SACK permitted Length
+			opt_ptr[20] = OPT_KIND_WIN_SCALE; // Window Scale Kind
+			opt_ptr[21] = 3; // Window Scale Length
+			opt_ptr[22] = DEFAULT_WINDOW_SCALE;
+
+			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
+			free(opt_ptr);
+
+			tcb->st = TCB_ST_SYN_SENT;
+			
+			return 0;
 		}
 	}
 
@@ -1314,10 +1486,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					opt_ptr[1] = 4; // MSS Length
 					opt_ptr[2] = TCP_MSS >> 8;
 					opt_ptr[3] = TCP_MSS & 0xFF;
-					opt_ptr[0] = OPT_KIND_MS_TCP; // MSS Kind
-					opt_ptr[1] = 4; // MSS Length
-					opt_ptr[2] = 0;
-					opt_ptr[3] = 0;
+					opt_ptr[4] = OPT_KIND_MS_TCP; // MSS Kind
+					opt_ptr[5] = 4; // MSS Length
+					opt_ptr[6] = 0;
+					opt_ptr[7] = 0;
 					opt_ptr[8] = OPT_KIND_TIMESTAMPS; // Timestamps Kind
 					opt_ptr[9] = 10; // Timestamps Length
 					opt_ptr[10] = 0;
@@ -1397,16 +1569,18 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					/* Initialization of the field-specific fields and buffers */
 
 					cursor->tcb->stream_state[0] = STREAM_STATE_READY;
-					tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
-					tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
-					tcb->adwin[0] = TODO_BUFFER_SIZE;
-					tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
-					tcb->txfree[0] = TODO_BUFFER_SIZE;
+					cursor->tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					cursor->tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					cursor->tcb->adwin[0] = TODO_BUFFER_SIZE;
+					cursor->tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
+					cursor->tcb->txfree[0] = TODO_BUFFER_SIZE;
+					cursor->tcb->next_ssn[0] = 0;
+					cursor->tcb->stream_fsm_timer[0] = 0;
 					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
 						cursor->tcb->stream_state[i] = STREAM_STATE_UNUSED;
 						cursor->tcb->stream_tx_buffer[i] = NULL;
 						cursor->tcb->stream_rx_buffer[i] = NULL;
-						tcb->adwin[i] = TODO_BUFFER_SIZE; // RX buffer size
+						cursor->tcb->adwin[i] = TODO_BUFFER_SIZE; // RX buffer size
 						if(tcb->out_window_scale_factor != 0){
 							ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
 						}
@@ -1414,6 +1588,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						cursor->tcb->rx_win_start[i] = 0;
 						cursor->tcb->txfree[i] = 0;
 						cursor->tcb->next_ssn[i] = 0;
+						cursor->tcb->stream_fsm_timer[i] = 0;
 					}
 
 
@@ -1427,6 +1602,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 		case TCB_ST_ESTABLISHED:
 			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
 				// The SYN+ACK has been retransmitted (ignored)
+				break;
+			}
+			if(event == FSM_EVENT_STREAM_TIMEOUT){
+				ERROR("TODO open stream with dummy payload segment");
 				break;
 			}
 			DEBUG("FSM TCB_ST_ESTABLISHED (empty)");
@@ -1458,19 +1637,28 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		return res;
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	DEBUG("waiting for ack in myconnect...");
-	while(sleep(10)){
-		if(tcb->st == TCB_ST_ESTABLISHED ){
-			return 0;
+	if(fdinfo[s].sid == 0){
+		DEBUG("waiting for ack in myconnect...");
+		while(sleep(10)){
+			// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
+			if(tcb->st == TCB_ST_ESTABLISHED){
+				return 0;
+			}
+			if(tcb->st == TCB_ST_CLOSED){ 
+				myerrno = ECONNREFUSED; 
+				return -1;
+			}
 		}
-		if(tcb->st == TCB_ST_CLOSED){ 
-			myerrno = ECONNREFUSED; 
-			return -1;
-		}
+		// If the connection is not established within the timeout
+		myerrno=ETIMEDOUT; 
+		return -1;
+	}else{
+		/* 
+		This connect call is opening a new stream in an existing connection. A segment that opens this new stream
+		will be sent with the first chunk of data, or after STREAM_OPEN_TIMEOUT ticks if no data needs to be sent.
+		*/
+		return 0; // Do nothing and return
 	}
-	// If the connection is not established within the timeout
-	myerrno=ETIMEDOUT; 
-	return -1;
 }
 
 int mylisten(int s, int bl){
@@ -1742,6 +1930,10 @@ void mytimer(int ignored){
 		struct tcpctrlblk* tcb = fdinfo[i].tcb;
 		if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
 			fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
+			continue;
+		}
+		if(fdinfo[i].sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fdinfo[i].sid] != 0) && (tcb->stream_fsm_timer[fdinfo[i].sid] <= tick)){
+			fsm(i, FSM_EVENT_STREAM_TIMEOUT, NULL, NULL);
 			continue;
 		}
 		struct txcontrolbuf* txcb = tcb->txfirst;

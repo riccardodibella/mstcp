@@ -9,6 +9,41 @@ questi valori?
 - Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
 - A cosa serve l'ACK che viene inviato quando viene fatto myaccept?
+- Nel paper è scritto, per l'apertura dei nuovi stream, di aspettare un timeout, e se non vengono inviati dati
+entro quel timeout aprire lo stream con un pacchetto con il flag dummy payload. Faccio comunque ritornare connect() 
+subito, senza aspettare di avere lo stream aperto, giusto? Sennò non posso inviare dati se sono fermo dentro connect.
+- Sempre riguardo al timer dell'apertura degli stream, ho aggiunto un campo stream_fsm_timer ad ogni stream,
+che viene usato per salvarmi a che valore di "tick" devo inviare il pacchetto con flag dummy payload se non è
+ancora stato inviato nessun dato. Probabilmente può essere accorpato in qualche modo con il timer di canale usato
+per la chiusura della connessione, ma finchè non faccio quella parte è più comodo tenerli separati. Ha senso?
+- Non ho ancora iniziato a fare la parte di ricezione, ma vorrei capire se è giusto come penso di impostarla:
+    - nel paper viene messo solo un buffer di trasmissione (consumato dallo scheduler), non un buffer di ricezione
+    in cui inserire i dati quando arrivano. A seconda di se si voglia aggiungere questo buffer di ricezione o meno
+    ci sono due casi possibili:
+    - se si vuole aggiungere il buffer di ricezione: 
+        - c'è un buffer di ricezione diverso per ogni stream
+        - dato che il flusso dei seq number è associato alla connessione intera, non posso usare quello per inserire
+        "a colpo sicuro" i dati nel buffer di ricezione
+        - se arriva un segmento con un SSN immediatamente successivo all'ultimo ricevuto, lo aggiungo all'inizio dello
+        spazio libero nel buffer dello stream
+        - se un segmento ha il flag dummy payload, non lo aggiungo mai al buffer
+        - in questo caso, la advertised window è uguale allo spazio libero nel buffer per lo stream
+    - se non si vuole mettere il buffer in ricezione:
+        - c'è una linked list per il canale, che contiene i pacchetti ricevuti out-of-order, in cui rimangono fino a
+        che il buco nel sequence number non viene riempito da un altro segmento
+        - c'è una linked list per ogni stream, con i segmenti per quello stream il cui payload deve ancora essere
+        consumato completamente
+        - quando arriva un nuovo segmento, oltre a inserirlo nella linked list di canale, se il suo SSN è immediatamente
+        successivo all'ultimo ricevuto per quello stream, lo inserisco alla fine della linked list di stream, con NULL
+        come nodo successivo
+        - dopo avere inserito un nodo (per la sua ricezione o per un segmento precedente che ha riempito il buco degli SSN)
+        nella linked list di stream, percorro la linked list di canale per cercare il primo segmento per lo stesso stream;
+        se il SSN è immediatamente successivo a quello appena inserito inserisco anche quel segmento, e ripeto la procedura
+        fino a che il primo segmento non è immediatamente successivo o arrivo alla fine della channel rx linked list senza
+        trovare altri segmenti sullo stream
+        - ogni nodo della linked list di stream (che contengono il payload dei segmenti) ha un campo che mi dice quanti byte
+        di payload ho già consumato con read(), quando questo valore arriva alla lunghezza del payload del segmento lo tolgo
+        dalla lista, e tolgo dalla lista anche i segmenti all'inizio che hanno il flag dummy payload
 
 
 {
