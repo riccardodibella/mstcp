@@ -4,18 +4,8 @@ analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normal
 Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
 c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effettivamente per la dimensione di
 un buffer, solo per inizializzare il campo txfree dei TCB.
-- Se non sbaglio, al momento il retransmission timer può andare da 300ms a 2000 tick (10s). Da dove arrivano
-questi valori?
 - Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
-- A cosa serve l'ACK che viene inviato quando viene fatto myaccept?
-- Nel paper è scritto, per l'apertura dei nuovi stream, di aspettare un timeout, e se non vengono inviati dati
-entro quel timeout aprire lo stream con un pacchetto con il flag dummy payload. Faccio comunque ritornare connect() 
-subito, senza aspettare di avere lo stream aperto, giusto? Sennò non posso inviare dati se sono fermo dentro connect.
-- Sempre riguardo al timer dell'apertura degli stream, ho aggiunto un campo stream_fsm_timer ad ogni stream,
-che viene usato per salvarmi a che valore di "tick" devo inviare il pacchetto con flag dummy payload se non è
-ancora stato inviato nessun dato. Probabilmente può essere accorpato in qualche modo con il timer di canale usato
-per la chiusura della connessione, ma finchè non faccio quella parte è più comodo tenerli separati. Ha senso?
 - Non ho ancora iniziato a fare la parte di ricezione, ma vorrei capire se è giusto come penso di impostarla:
     - nel paper viene messo solo un buffer di trasmissione (consumato dallo scheduler), non un buffer di ricezione
     in cui inserire i dati quando arrivano. A seconda di se si voglia aggiungere questo buffer di ricezione o meno
@@ -46,16 +36,6 @@ per la chiusura della connessione, ma finchè non faccio quella parte è più co
         dalla lista, e tolgo dalla lista anche i segmenti all'inizio che hanno il flag dummy payload
 
 
-{
-    Devo capire cosa fare con i TCB dei passive open... Al momento è facile: quando faccio accept libero il posto
-    nella backlog e ho una copia di quel TCB linkata solo in fdinfo per quel socket. Posso tenere la stessa cosa
-    anche adesso nelle connessioni non-MS. Per le connessioni MS, non posso togliere il TCB dalla backlog
-    fino a quando non ho riempito tutti e 32 gli stream (ma per consistenza non lo toglierei proprio mai dalla
-    backlog finchè la connessione non è chiusa). Quando faccio accept(), linko in fdinfo[s] lo stesso TCB.
-    Quando faccio la chiusura di uno stream, so che non devo chiudere la connessione a meno che quando mi arriva
-    l'ACK della mia chiusura dello stream non siano stati chiusi gli stream, in quel caso posso chiuderla.
-    Quando chiudo la connessione cancello anche la entry dalla backlog.
-}
 
 
 Risposte:
@@ -80,6 +60,35 @@ stream), oppure lascio così com'è e non creo nessun TX buffer per tcp normale?
     anche in TCP normale
 - Mi serve qualcosa di diverso da STREAM_STATE_CLOSED per gestire il broken pipe per backlog piena?
     => Credo basti STREAM_STATE_CLOSED
+- Nel paper è scritto, per l'apertura dei nuovi stream, di aspettare un timeout, e se non vengono inviati dati
+entro quel timeout aprire lo stream con un pacchetto con il flag dummy payload. Faccio comunque ritornare connect() 
+subito, senza aspettare di avere lo stream aperto, giusto? Sennò non posso inviare dati se sono fermo dentro connect.
+    => Giusto, myconnect() ritorna subito
+- Se non sbaglio, al momento il retransmission timer può andare da 300ms a 2000 tick (10s). Da dove arrivano
+questi valori?
+    => Lo spirito è quello di altri valori che fanno la stessa cosa presenti negli RFC, questi sono più adatti
+    all'Internet di oggi, ma non so comunque da dove vengano di preciso
+- Sempre riguardo al timer dell'apertura degli stream, ho aggiunto un campo stream_fsm_timer ad ogni stream,
+che viene usato per salvarmi a che valore di "tick" devo inviare il pacchetto con flag dummy payload se non è
+ancora stato inviato nessun dato. Probabilmente può essere accorpato in qualche modo con il timer di canale usato
+per la chiusura della connessione, ma finchè non faccio quella parte è più comodo tenerli separati. Ha senso?
+    => Sì va bene
+- A cosa serve l'ACK che viene inviato quando viene fatto myaccept?
+    => Forse a niente, ma non dà fastidio, può rimanere lì
+- Devo capire cosa fare con i TCB dei passive open... Al momento è facile: quando faccio accept libero il posto
+nella backlog e ho una copia di quel TCB linkata solo in fdinfo per quel socket. Posso tenere la stessa cosa
+anche adesso nelle connessioni non-MS. Per le connessioni MS, non posso togliere il TCB dalla backlog
+fino a quando non ho riempito tutti e 32 gli stream (ma per consistenza non lo toglierei proprio mai dalla
+backlog finchè la connessione non è chiusa). Quando faccio accept(), linko in fdinfo[s] lo stesso TCB.
+Quando faccio la chiusura di uno stream, so che non devo chiudere la connessione a meno che quando mi arriva
+l'ACK della mia chiusura dello stream non siano stati chiusi gli stream, in quel caso posso chiuderla.
+Quando chiudo la connessione cancello anche la entry dalla backlog.
+    => Abbiamo cambiato la struttura della backlog: adesso ha una dimensione fissa, e contiene solo le connessioni
+    nuove di cui dobbiamo fare ancora accept, non gli stream. Per questo problema specifico dell'ownership dei TCB
+    farei così: quando chiudo uno stream e basta (se c'è almeno un altro stream in stato OPEN), so che qualcun altro
+    chiuderà la connessione, e posso disinteressarmi di quello che succederà al canale da quel punto in poi. Invece, 
+    se sono l'ultimo stream che è OPEN, mando il mio segmento per chiudere il mio stream e inizio la chiusura del
+    canale. Questa procedura per la chiusura andrà capita meglio più avanti
 
 
 Fonti:

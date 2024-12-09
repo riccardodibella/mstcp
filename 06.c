@@ -223,6 +223,7 @@ struct tcpctrlblk{
 	unsigned int mss; // Channel property
 	unsigned int stream_end; // Channel property (bad name)
 	unsigned int fsm_timer; // Channel property
+	unsigned short init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
 	bool is_active_side; // Channel property
     /* 
@@ -1170,8 +1171,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].l_addr = fdinfo[other_s].l_addr;
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
 							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
-							fdinfo[s].tcb->radwin[stream] = TODO_BUFFER_SIZE; // ???? There is no initial window here
-							fdinfo[s].tcb->txfree[stream] = TODO_BUFFER_SIZE;
+							fdinfo[s].tcb->radwin[stream] = fdinfo[s].tcb->init_radwin;
+							fdinfo[s].tcb->txfree[stream] = fdinfo[s].tcb->init_radwin;
 							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
 							fdinfo[s].tcb->stream_rx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
 							fdinfo[s].tcb->adwin[stream] = TODO_BUFFER_SIZE;
@@ -1382,7 +1383,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					fdinfo[s].sid = 0; // The first opened stream is always stream 0
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
-					tcb->radwin[0] = htons(tcp->window);
+					tcb->init_radwin = tcb->radwin[0] = htons(tcp->window);
 					tcb->txfree[0] = TODO_BUFFER_SIZE;
 					tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
 					tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
