@@ -260,9 +260,16 @@ struct tcpctrlblk{
 	//#endif
 };
 
+/*
 struct tcb_list_node {
 	struct tcpctrlblk* tcb;
 	struct tcb_list_node* next;
+};
+*/
+struct stream_backlog_node{
+	struct tcpctrlblk* tcb;
+	int sid;
+	struct stream_backlog_node* next;
 };
 
 struct socket_info {
@@ -272,9 +279,11 @@ struct socket_info {
 	unsigned short l_port;
 	unsigned int l_addr;
 
-	struct tcb_list_node backlog_head; // Backlog listen queue (TCP or Channel Control Blocks)
-	int ready_streams; // Number of ready streams that can be consumed by accept(). If ready_streams == backlog_length new connections or streams have to be refused
-	int backlog_length; // Maximum number of streams that can be ready before starting to reset new connections/streams (mytcp: bl)
+	struct stream_backlog_node stream_backlog_head; 
+	struct tcpctrlblk* channel_backlog; // Backlog listen queue (mytcp: tcblist)
+	int ready_streams; // Number of streams ready to be consumed by accept()
+	int ready_channels; // Number of TCBs currently in the backlog
+	int backlog_length; // Maximum number of TCP connections that can be pending before starting to reset new connections (mytcp: bl)
 };
 
 
@@ -756,7 +765,7 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
-		ERROR("prepare_tcp invalid port l %u s %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
+		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
 
 	txcb->txtime = -MAXTIMEOUT ; 
@@ -1125,7 +1134,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 		}else{
 			if(fdinfo[s].st == FDINFO_ST_UNBOUND){
 				// Search if there is an already opened MS connection to the same destination with available streams
-				ERROR("TODO search");
 				for(int other_s = 0; other_s < MAX_FD; other_s++){
 					if(fdinfo[other_s].st != FDINFO_ST_TCB_CREATED){ // this also handles the case other_s == s
 						continue;
@@ -1548,48 +1556,46 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->ack_offs=htonl(tcp->seq);
 					tcb->st = TCB_ST_ESTABLISHED;
 					
-					if(fdinfo[s].backlog_length == fdinfo[s].ready_streams){
+					if(fdinfo[s].backlog_length == fdinfo[s].ready_channels){
 						// The incoming connection (MS or not) cannot be accepted
 						prepare_tcp(s,RST,NULL,0,NULL,0);
+						ERROR("TODO reset TCB");
 					}
-					fdinfo[s].ready_streams++;
+					fdinfo[s].ready_channels++;
+					fdinfo[s].ready_streams++; // Stream 0 is counted but is not inserted in the stream backlog
+
 
 					/* Duplication of the current TCB and insertion in the backlog */
 
-					struct tcb_list_node* cursor = &(fdinfo[s].backlog_head);
-					while(cursor->next != NULL){
-						cursor = cursor->next;
-					} // now cursor is the last node in the backlog
-					cursor->next = (struct tcb_list_node*) malloc(sizeof(struct tcb_list_node));
-					cursor = cursor->next;
-					cursor->next = NULL;
-					cursor->tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
-					memcpy(cursor->tcb, tcb, sizeof(struct tcpctrlblk));
+					int cursor_index;
+					for(cursor_index = 0;cursor_index < fdinfo[s].backlog_length && fdinfo[s].channel_backlog[cursor_index].st != 0; cursor_index++); // Empty entries are bzero-ed, so they will have state 0
+					struct tcpctrlblk* backlog_tcb = fdinfo[s].channel_backlog + cursor_index; // free tcb in the backlog
+					memcpy(backlog_tcb, tcb, sizeof(struct tcpctrlblk));
 
 
 					/* Initialization of the field-specific fields and buffers */
 
-					cursor->tcb->stream_state[0] = STREAM_STATE_READY;
-					cursor->tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
-					cursor->tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
-					cursor->tcb->adwin[0] = TODO_BUFFER_SIZE;
-					cursor->tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
-					cursor->tcb->txfree[0] = TODO_BUFFER_SIZE;
-					cursor->tcb->next_ssn[0] = 0;
-					cursor->tcb->stream_fsm_timer[0] = 0;
+					backlog_tcb->stream_state[0] = STREAM_STATE_READY;
+					backlog_tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					backlog_tcb->stream_rx_buffer[0] = malloc(TODO_BUFFER_SIZE);
+					backlog_tcb->adwin[0] = TODO_BUFFER_SIZE;
+					backlog_tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
+					backlog_tcb->txfree[0] = TODO_BUFFER_SIZE;
+					backlog_tcb->next_ssn[0] = 0;
+					backlog_tcb->stream_fsm_timer[0] = 0;
 					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
-						cursor->tcb->stream_state[i] = STREAM_STATE_UNUSED;
-						cursor->tcb->stream_tx_buffer[i] = NULL;
-						cursor->tcb->stream_rx_buffer[i] = NULL;
-						cursor->tcb->adwin[i] = TODO_BUFFER_SIZE; // RX buffer size
+						backlog_tcb->stream_state[i] = STREAM_STATE_UNUSED;
+						backlog_tcb->stream_tx_buffer[i] = NULL;
+						backlog_tcb->stream_rx_buffer[i] = NULL;
+						backlog_tcb->adwin[i] = TODO_BUFFER_SIZE; // RX buffer size
 						if(tcb->out_window_scale_factor != 0){
 							ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
 						}
-						cursor->tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
-						cursor->tcb->rx_win_start[i] = 0;
-						cursor->tcb->txfree[i] = 0;
-						cursor->tcb->next_ssn[i] = 0;
-						cursor->tcb->stream_fsm_timer[i] = 0;
+						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
+						backlog_tcb->rx_win_start[i] = 0;
+						backlog_tcb->txfree[i] = 0;
+						backlog_tcb->next_ssn[i] = 0;
+						backlog_tcb->stream_fsm_timer[i] = 0;
 					}
 
 
@@ -1672,10 +1678,14 @@ int mylisten(int s, int bl){
 	fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 	fdinfo[s].tcb->st = TCB_ST_LISTEN;
 	fdinfo[s].tcb->is_active_side = false;
+	fdinfo[s].channel_backlog = (struct tcpctrlblk*) malloc(bl * sizeof(struct tcpctrlblk));
+	bzero(fdinfo[s].channel_backlog, bl * sizeof(struct tcpctrlblk));
 	fdinfo[s].ready_streams = 0;
+	fdinfo[s].ready_channels = 0;
 	fdinfo[s].backlog_length = bl;
-	fdinfo[s].backlog_head.tcb = NULL;
-	fdinfo[s].backlog_head.next = NULL;
+	fdinfo[s].stream_backlog_head.tcb = NULL;
+	fdinfo[s].stream_backlog_head.sid = -1;
+	fdinfo[s].stream_backlog_head.next = NULL;
 }
 
 int myaccept(int s, struct sockaddr* addr, int * len){
@@ -1709,38 +1719,57 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			myerrno=ENFILE; 
 			return -1;
 		}
-		struct tcb_list_node* prev = &fdinfo[s].backlog_head; // "precursor" 
-		struct tcb_list_node* cursor = fdinfo[s].backlog_head.next;
-		while(cursor != NULL){
-			struct tcpctrlblk* tcb = cursor->tcb;
-			if(tcb == NULL){
-				ERROR("myaccept cursor unexpected NULL tcb");
+		if(fdinfo[s].ready_channels > 0){
+			int cursor_index;
+			/* The condition st != TCB_ST_ESTABLISHED will be valid also if the passive open connection establishment behaviour 
+			is changed, and not only the listening socket is used to open one connection at a time */
+			for(cursor_index = 0; cursor_index < fdinfo[s].backlog_length && fdinfo[s].channel_backlog[cursor_index].st != TCB_ST_ESTABLISHED; cursor_index++);
+			if(cursor_index == fdinfo[s].backlog_length){
+				ERROR("myaccept ready_channels > 0 but no TCB found in the backlog");
 			}
-			if(tcb->st != TCB_ST_ESTABLISHED){
-				continue;
-			}
-			for(int i=0; i<TOT_SID; i++){
-				if(tcb->stream_state[i] == STREAM_STATE_READY){
-					bzero(&fdinfo[free_fd], sizeof(struct socket_info));
-					fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
-					fdinfo[free_fd].sid = i;
-					fdinfo[free_fd].l_port = fdinfo[s].l_port;
-					fdinfo[free_fd].l_addr = fdinfo[s].l_addr;
-					fdinfo[free_fd].tcb = tcb;
-					if(!tcb->ms_option_enabled){
-						// remove the entry from the backlog
-						prev->next = cursor->next;
-						free(cursor);
-					}
-					fdinfo[s].ready_streams--;
-					prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));	// TODO why send this ACK?
-					return free_fd;
-				}
-			}
-			prev = cursor;
-			cursor = cursor->next;
+			DEBUG("%u %u", htons(fdinfo[s].tcb->r_port), htons(fdinfo[s].channel_backlog[cursor_index].r_port));
+			struct tcpctrlblk* tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			memcpy(tcb, fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
+			bzero(fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
+
+			tcb->stream_state[0] = STREAM_STATE_OPENED;
+
+			fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
+			fdinfo[free_fd].tcb = tcb;
+			fdinfo[free_fd].sid = 0;
+			fdinfo[free_fd].l_port = fdinfo[s].l_port;
+			fdinfo[free_fd].l_addr = fdinfo[s].l_addr;
+
+			// There is no entry for stream 0 in the backlog
+			fdinfo[s].ready_streams--;
+			fdinfo[s].ready_channels--;
+
+			prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+			return free_fd;
 		}
-		ERROR("fdinfo[%d].ready_streams %d != 0 but no ready stream was found", s, fdinfo[s].ready_streams);
+
+		// There are no ready channels: consume an entry of the stream backlog
+		struct stream_backlog_node* first = fdinfo[s].stream_backlog_head.next;
+		if(first == NULL){
+			ERROR("myaccept ready_streams %d > 0 but first is NULL", fdinfo[s].ready_channels);
+		}
+		if(first->tcb == NULL){
+			ERROR("myaccept first tcb NULL");
+		}
+
+		fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
+		fdinfo[free_fd].tcb = first->tcb;
+		fdinfo[free_fd].sid = first->sid;
+		fdinfo[free_fd].tcb->stream_state[fdinfo[free_fd].sid] = STREAM_STATE_OPENED;
+		fdinfo[free_fd].l_port = fdinfo[s].l_port;
+		fdinfo[free_fd].l_addr = fdinfo[s].l_addr;
+
+		// Remove the entry from the stream backlog
+		fdinfo[s].ready_streams--;
+		fdinfo[s].stream_backlog_head.next = first->next;
+
+		prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+		return free_fd;
 	}while(pause());
 	ERROR("myaccept something went very wrong, you should never reach after the do while"); // pause always returns -1
 }
@@ -2031,8 +2060,7 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("myconnect OK");
-		while(true){
-		}
+		while(true){}
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
