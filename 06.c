@@ -37,7 +37,7 @@
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 #define MAX_ARP 200 // number of lines in the ARP cache
-#define MAX_FD 8 // File descriptors go from 3 (included) up to this value (excluded)
+#define MAX_FD 16 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 #define TODO_BUFFER_SIZE 64000
@@ -351,7 +351,7 @@ uint8_t PAYLOAD_OPTIONS_TEMPLATE[] = {
 
 // In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
-	printf("ERROR: ");
+	printf("ERROR %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
 	vprintf(c, args);
@@ -1044,6 +1044,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
 			bzero(tcb, sizeof(struct tcpctrlblk));
 			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+			fdinfo[s].sid = 0;
 			tcb->st = TCB_ST_CLOSED;
 
 			tcb->seq_offs=rand();
@@ -1175,6 +1176,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(tcb->stream_state[stream] == STREAM_STATE_UNUSED){
 							// Free stream found
 							fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+							fdinfo[s].tcb = tcb;
 							fdinfo[s].sid = stream;
 							fdinfo[s].l_addr = fdinfo[other_s].l_addr;
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
@@ -1210,6 +1212,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
 			bzero(tcb, sizeof(struct tcpctrlblk));
 			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
+			fdinfo[s].sid = 0;
 			tcb->st = TCB_ST_CLOSED;
 
 			tcb->seq_offs=rand();
@@ -2060,6 +2063,18 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("myconnect OK");
+		for(int i=0; i<10; i++){
+			int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
+			if(s_loop == -1){
+				myperror("mysocket");
+				exit(EXIT_FAILURE);
+			}
+			DEBUG("loop myconnect %d (fd %d)", i, s_loop);
+			if (-1 == myconnect(s_loop,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
+				myperror("myconnect");
+				exit(EXIT_FAILURE);
+			}
+		}
 		while(true){}
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
