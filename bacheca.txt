@@ -1,4 +1,12 @@
 Domande:
+- Sicuramente è una domanda abbastanza stupida, ma chiedo conferma... Quando arriva un pacchetto per un TCB che è
+nella backlog (già established), ignoro i pacchetti che gli arrivano, giusto?
+- Nel TCB c'è un campo txfree (con un valore per ogni stream), questo indica lo spazio nella advertised window per
+quello stream che non è ancora stato riempito con pacchetti già in volo di cui si aspetta l'ACK, giusto? Perchè in
+mytcp è iniziaizzato con un valore fisso (TXBUFSIZE), non capisco perchè.
+- Per aggiungere un nuovo stream alla coda degli stream pronti, nel TCB che avevo associato ad un nuovo socket con
+accept() mi servirebbe il fd del listening socket, in cui trovo la backlog degli stream. Al momento lo ho aggiunto,
+lascio così o cerco il fd giusto scrorrendoli tutti confrontando local address local port e stato (LISTEN o SYN_RECEIVED)?
 - Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
 analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
 Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
@@ -99,5 +107,5 @@ Problemi di MYTCP:
 - Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
 - Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
 - Confermo che viene accettata solo una connessione alla volta
-- In myaccept, viene dato errore se lo stato del TCB è SYN_RECEVIED, anche se c'è il toggle tra i due stati
+- In myaccept, viene dato errore se lo stato del TCB è SYN_RECEIVED, anche se c'è il toggle tra i due stati
 - In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"

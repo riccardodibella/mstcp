@@ -226,6 +226,7 @@ struct tcpctrlblk{
 	unsigned short init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
 	bool is_active_side; // Channel property
+	int listening_fd; // If it is a passive TCB, this is the fd of the listening socket where streams have to be inserted
     /* 
     True if the MS option is inserted in the SYN. 
     This information is used in the fsm for the SYN+ACK reception to know if the MS option has to be considered or not
@@ -329,7 +330,7 @@ uint8_t l2_rx_buf[L2_RX_BUF_SIZE]; // mytcp: l2buf
 struct socket_info fdinfo[MAX_FD]; // locations 0, 1 and 2 are left empty
 
 uint8_t PAYLOAD_OPTIONS_TEMPLATE_MS[] = {
-	OPT_KIND_MS_TCP,
+	OPT_KIND_MS_TCP, // If you change the position of the MS_TCP option, change also the update code (eg in fsm -> FSM_EVENT_STREAM_TIMEOUT)
 	4,
 	0,0,
 	OPT_KIND_TIMESTAMPS,
@@ -372,6 +373,7 @@ void DEBUG(char* c, ...){
 void print_tcp_segment(struct tcp_segment* tcp){
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
+	printf("SEQ %u ACK %u\n", htonl(tcp->seq), htonl(tcp->ack));
 	printf("FLAGS: ");
 	/*
 	#define FIN 0x001
@@ -508,6 +510,21 @@ void release_handler_lock(){
 	global_handler_lock++;
 }
 
+/* 
+	nanosleep is restarted upon signal reception, 
+	until the specified time elapses 
+*/
+void persistent_nanosleep(int sec, int nsec){
+	struct timespec req = {sec, nsec}, rem;
+	while(nanosleep(&req, &rem)){
+		if(errno == EINTR){
+			req = rem;
+		}else{
+			perror("nanosleep persistent_nanosleep");
+			exit(EXIT_FAILURE);
+		}
+	}
+}
 
 
 
@@ -745,8 +762,8 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
-	DEBUG("Outgoing send_ip packet:");
-	print_l2_packet(packet);
+	//DEBUG("Outgoing send_ip packet:");
+	//print_l2_packet(packet);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		perror("send_ip sendto failed"); 
@@ -1058,6 +1075,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ms_option_requested = false;
 			tcb->ms_option_enabled = false;
 			tcb->is_active_side = true;
+			tcb->listening_fd = -1;
 			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 			tcb->in_window_scale_factor = 0;
 			tcb->ts_recent = 0;
@@ -1226,6 +1244,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ms_option_requested = true; // modified wrt non-ms
 			tcb->ms_option_enabled = false;
 			tcb->is_active_side = true;
+			tcb->listening_fd = -1;
 			tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 			tcb->in_window_scale_factor = 0;
 			tcb->ts_recent = 0;
@@ -1600,12 +1619,14 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->next_ssn[i] = 0;
 						backlog_tcb->stream_fsm_timer[i] = 0;
 					}
+					backlog_tcb->listening_fd = s;
 
 
 					// Listening TCB re-initialization (same as mylisten)
 					bzero(tcb,sizeof(struct tcpctrlblk));
 					tcb->st = TCB_ST_LISTEN;
 					fdinfo[s].tcb->is_active_side = false;
+					fdinfo[s].tcb->listening_fd = s;
 				}
 			}
 			break;
@@ -1615,10 +1636,59 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				break;
 			}
 			if(event == FSM_EVENT_STREAM_TIMEOUT){
-				ERROR("TODO open stream with dummy payload segment");
+				int sid = fdinfo[s].sid;
+				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+				uint8_t* opt = malloc(optlen);
+				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+				
+				// Stream update
+				opt[2] = sid<<2;
+				opt[3] = 0; // SSN=0 for the opening segment
+
+				fdinfo[s].tcb->next_ssn[sid]++;
+
+				uint8_t* dummy_payload = malloc(1); // value doesn't matter
+
+				prepare_tcp(s, ACK | DMP, dummy_payload, 1, opt, optlen);
+
+				free(dummy_payload);
+				free(opt);
 				break;
 			}
-			DEBUG("FSM TCB_ST_ESTABLISHED (empty)");
+			if(event == FSM_EVENT_PKT_RCV){
+				int sid = 0;
+				int ssn = 0;
+				if(tcb->ms_option_enabled){
+					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+					if(ms_index >= 0){
+						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
+						if(ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){
+							tcb->stream_state[sid] = STREAM_STATE_READY;
+
+							tcb->radwin[sid] = htons(tcp->window);
+							tcb->txfree[sid] = TODO_BUFFER_SIZE;
+							tcb->stream_tx_buffer[sid] = malloc(TODO_BUFFER_SIZE);
+							tcb->stream_rx_buffer[sid] = malloc(TODO_BUFFER_SIZE);
+							tcb->adwin[sid] = TODO_BUFFER_SIZE;
+
+							// Insertion in the listening socket backlog
+							struct stream_backlog_node* cursor = &fdinfo[tcb->listening_fd].stream_backlog_head;
+							while(cursor->next != NULL){
+								cursor = cursor->next;
+							}
+							cursor->next = (struct stream_backlog_node*) malloc(sizeof(struct stream_backlog_node));
+							cursor->next->sid = sid;
+							cursor->next->tcb = tcb;
+							cursor->next->next = NULL;
+							fdinfo[tcb->listening_fd].ready_streams++;
+
+							DEBUG("Ready stream %d", sid);
+							DEBUG("Number of ready streams for fd %d: %d",tcb->listening_fd, fdinfo[tcb->listening_fd].ready_streams);
+						}
+					}
+				}
+			}
 			break;
 		default:
 			ERROR("FSM unknown tcb->st %d", tcb->st);
@@ -1681,6 +1751,7 @@ int mylisten(int s, int bl){
 	fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 	fdinfo[s].tcb->st = TCB_ST_LISTEN;
 	fdinfo[s].tcb->is_active_side = false;
+	fdinfo[s].tcb->listening_fd = s;
 	fdinfo[s].channel_backlog = (struct tcpctrlblk*) malloc(bl * sizeof(struct tcpctrlblk));
 	bzero(fdinfo[s].channel_backlog, bl * sizeof(struct tcpctrlblk));
 	fdinfo[s].ready_streams = 0;
@@ -1787,7 +1858,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		ERROR("rtt_estimate segment without Timestamps option");
 	}
 	uint32_t rtt = tick - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
-	DEBUG("before rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
+	//DEBUG("before rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 	if(tcb->rtt_e == 0) {
 		tcb->rtt_e = rtt; 
 		tcb->Drtt_e = rtt/2; 
@@ -1797,7 +1868,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt)>>3;
 	}
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
-	DEBUG("after rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
+	//DEBUG("after rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 }
 
 void myio(int ignored){
@@ -1860,11 +1931,7 @@ void myio(int ignored){
 
 			int i;
 			for(i=0;i<MAX_FD;i++){
-				if(
-					(fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)
-					||
-					((fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st==TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port))
-				){
+				if((fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)){
 					break;
 				}
 				if(
@@ -1876,12 +1943,19 @@ void myio(int ignored){
 				}
 			}
 			if(i == MAX_FD){
+				for(i=0;i<MAX_FD;i++){
+					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port) ){
+						break;
+					}
+				}
+			}
+			if(i == MAX_FD){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
 
-			DEBUG("Incoming TCP segment:");
-			print_tcp_segment(tcp);
+			//DEBUG("Incoming TCP segment:");
+			//print_tcp_segment(tcp);
 
 			struct tcpctrlblk * tcb = fdinfo[i].tcb;
 
@@ -1924,6 +1998,16 @@ void myio(int ignored){
 						free(temp);
 						if(tcb->txfirst	== NULL) tcb->txlast = NULL;
 					}//While
+				}
+			}
+
+			int sid = 0;
+			int ssn = 0;
+			if(tcb->ms_option_enabled){
+				int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+				if(ms_index >= 0){
+					sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+					ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
 				}
 			}
 
@@ -2063,6 +2147,7 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("myconnect OK");
+		persistent_nanosleep(2,0);
 		for(int i=0; i<10; i++){
 			int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
 			if(s_loop == -1){
@@ -2106,7 +2191,7 @@ int main(){
 				myperror("myaccept");
 				exit(EXIT_FAILURE);
 			}
-			DEBUG("myaccept OK fd %d", s);
+			DEBUG("myaccept OK fd %d stream %d", s, fdinfo[s].sid);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
