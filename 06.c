@@ -174,12 +174,26 @@ struct tcp_segment {
 	unsigned char payload[TCP_MSS];
 };
 
+/*
 struct txcontrolbuf{
 	struct tcp_segment * segment;
 	int totlen;
 	int payloadlen;
 	long long int txtime;
 	struct txcontrolbuf * next;
+	int retry;
+};
+*/
+struct txcontrolbuf{ // mytcp: txcontrolbuf
+	struct txcontrolbuf* next;
+	uint32_t seq; // channel sequence
+	int sid;
+	int ssn;
+	int payloadlen;
+	int totlen; // Includes IP header, TCP header, options and padding
+	struct tcp_segment* segment;
+
+	int64_t txtime;
 	int retry;
 };
 
@@ -189,7 +203,7 @@ struct arpcacheline {
 };
 
 
-/* Modified TCB with streams (05.c) */
+
 struct tcpctrlblk{
 	bool stream_state[TOT_SID];
 	unsigned short adwin[TOT_SID];
@@ -197,7 +211,7 @@ struct tcpctrlblk{
 	unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
 	unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
 	unsigned int rx_win_start[TOT_SID];
-	unsigned int txfree[TOT_SID];
+	unsigned int txfree[TOT_SID]; // Free space in the tx buffer
 	uint16_t next_ssn[TOT_SID];
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 
@@ -527,6 +541,41 @@ void persistent_nanosleep(int sec, int nsec){
 }
 
 
+// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
+int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
+	if(tcp == NULL){
+		ERROR("search_tcp_option tcp NULL");
+	}
+	int to_return = -1;
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	int i;
+	for(i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+
+		if(tcp->payload[i] == kind){
+			to_return = i;
+			break;
+		}
+		
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	if(i>optlen){
+		/* 
+		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
+		the implementation at both sides of the connection this could allow to catch some bugs. We do not
+		always check if the field is well formed, this check is useful only if the option is not found
+		*/
+		ERROR("search_tcp_option misaligned end of options (invalid last length)");
+	}
+	return to_return;
+}
+
 
 #pragma region STARTUP_FUNCTIONS
 void raw_socket_setup(){
@@ -818,6 +867,17 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	}
 	tcb->sequence += payloadlen;
 
+	/* Calculation of new txcb fields */
+	txcb->seq = ntohl(tcp->seq);
+	int multi_stream_opt_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(multi_stream_opt_index<0){
+		txcb->sid = -1;
+		txcb->ssn = -1;
+	}else{
+		txcb->sid = (tcp->payload[multi_stream_opt_index+2]>>2) & 0x1F;
+		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) || tcp->payload[multi_stream_opt_index+3];
+	}
+
 	/*
 	DEFERRED FIELDS
 	tcp->ack;
@@ -992,40 +1052,6 @@ int mysocket(int family, int type, int proto){
 	}
 }
 
-// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
-int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
-	if(tcp == NULL){
-		ERROR("search_tcp_option tcp NULL");
-	}
-	int to_return = -1;
-	int optlen = ((tcp->d_offs_res)>>4)*4-20;
-	int i;
-	for(i=0; i<optlen; i++){
-		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
-			break;
-		}
-		if(tcp->payload[i] == OPT_KIND_NO_OP){
-			continue;
-		}
-
-		if(tcp->payload[i] == kind){
-			to_return = i;
-			break;
-		}
-		
-		int length = tcp->payload[i+1];
-		i += length - 1; // with the i++ we go to the start of the next option
-	}
-	if(i>optlen){
-		/* 
-		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
-		the implementation at both sides of the connection this could allow to catch some bugs. We do not
-		always check if the field is well formed, this check is useful only if the option is not found
-		*/
-		ERROR("search_tcp_option misaligned end of options (invalid last length)");
-	}
-	return to_return;
-}
 
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
@@ -1200,7 +1226,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
 							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
 							fdinfo[s].tcb->radwin[stream] = fdinfo[s].tcb->init_radwin;
-							fdinfo[s].tcb->txfree[stream] = fdinfo[s].tcb->init_radwin;
+							fdinfo[s].tcb->txfree[stream] = TODO_BUFFER_SIZE;
 							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
 							fdinfo[s].tcb->stream_rx_buffer[stream] = malloc(TODO_BUFFER_SIZE);
 							fdinfo[s].tcb->adwin[stream] = TODO_BUFFER_SIZE;
@@ -1979,7 +2005,7 @@ void myio(int ignored){
 				continue;
 			}
 
-			if(tcb->txfirst !=NULL ){
+			if(tcb->txfirst !=NULL){
 				// Removal from TX queue for the cumulative ACK
 
 				int shifter = htonl(tcb->txfirst->segment->seq);
@@ -1988,7 +2014,13 @@ void myio(int ignored){
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
-						fdinfo[i].tcb->txfree[fdinfo[i].sid]+=temp->payloadlen;
+						
+						/* 
+						14/01/2025 Ho tolto la modifica di txfree da questo punto perchè lo spazio nel buffer di trasmissione viene liberato quando i dati
+						vengono consumati per creare i segmenti da trasmettere (secondo quanto deciso dallo scheduler, per MS-TCP), quindi una volta che sono
+						nella coda di trasmissione non occupano più spazio nel TX buffer e quindi non devono avere nessun impatto su txfree
+						// fdinfo[i].tcb->txfree[fdinfo[i].sid]+=temp->payloadlen;
+						*/
 
 						// RTT calculation removed
 
@@ -1998,6 +2030,45 @@ void myio(int ignored){
 						free(temp);
 						if(tcb->txfirst	== NULL) tcb->txlast = NULL;
 					}//While
+				}
+			}
+
+			if(tcb->txfirst != NULL){
+				// Removal from TX queue for SACK option
+
+				int shifter = tcb->txfirst->seq;
+
+				int sack_opt_index = search_tcp_option(tcp, OPT_KIND_SACK);
+				if(sack_opt_index > 0){
+					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
+					for(int entry = 0; entry < sack_entries_count; entry++){
+						int block_left_edge_seq = ntohl(*(uint32_t*) tcp->payload + sack_opt_index + 2 + entry*8);
+						int block_right_edge_seq = ntohl(*(uint32_t*) tcp->payload + sack_opt_index + 2 + entry*8 + 4);
+
+						struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
+						while(cursor != NULL){
+							int cursor_shifted_seq = cursor->seq - shifter;
+							int left_shifted_seq = block_left_edge_seq - shifter;
+							int right_shifted_seq = block_right_edge_seq - shifter;
+
+							if(left_shifted_seq < cursor_shifted_seq && cursor_shifted_seq < right_shifted_seq){
+								// Remove the node from the tx queue
+								if(prev == NULL){
+									free(cursor->segment);
+									free(cursor);
+									tcb->txfirst = tcb->txlast = NULL;
+									break;
+								}else{
+									prev->next = cursor->next;
+									free(cursor->segment);
+									free(cursor);
+									cursor = prev;
+								}
+							}
+							prev = cursor;
+							cursor = cursor->next;
+						}
+					}
 				}
 			}
 

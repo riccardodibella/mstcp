@@ -1,12 +1,8 @@
 Domande:
-- Sicuramente è una domanda abbastanza stupida, ma chiedo conferma... Quando arriva un pacchetto per un TCB che è
-nella backlog (già established), ignoro i pacchetti che gli arrivano, giusto?
 - Nel TCB c'è un campo txfree (con un valore per ogni stream), questo indica lo spazio nella advertised window per
 quello stream che non è ancora stato riempito con pacchetti già in volo di cui si aspetta l'ACK, giusto? Perchè in
 mytcp è iniziaizzato con un valore fisso (TXBUFSIZE), non capisco perchè.
-- Per aggiungere un nuovo stream alla coda degli stream pronti, nel TCB che avevo associato ad un nuovo socket con
-accept() mi servirebbe il fd del listening socket, in cui trovo la backlog degli stream. Al momento lo ho aggiunto,
-lascio così o cerco il fd giusto scrorrendoli tutti confrontando local address local port e stato (LISTEN o SYN_RECEIVED)?
+
 - Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
 analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
 Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
@@ -97,7 +93,21 @@ Quando chiudo la connessione cancello anche la entry dalla backlog.
     chiuderà la connessione, e posso disinteressarmi di quello che succederà al canale da quel punto in poi. Invece, 
     se sono l'ultimo stream che è OPEN, mando il mio segmento per chiudere il mio stream e inizio la chiusura del
     canale. Questa procedura per la chiusura andrà capita meglio più avanti
-
+- Sicuramente è una domanda abbastanza stupida, ma chiedo conferma... Quando arriva un pacchetto per un TCB che è
+nella backlog (già established), ignoro i pacchetti che gli arrivano, giusto?
+    => Esatto, per il momento va bene così
+- Per aggiungere un nuovo stream alla coda degli stream pronti, nel TCB che avevo associato ad un nuovo socket con
+accept() mi servirebbe il fd del listening socket, in cui trovo la backlog degli stream. Al momento lo ho aggiunto,
+lascio così o cerco il fd giusto scrorrendoli tutti confrontando local address local port e stato (LISTEN o SYN_RECEIVED)?
+    => Va bene così, a rigore bisgnerebbe anche porsi il problema di fare il RST degi stream ready quando viene fatto
+    il cose di un listening socket
+- Nel campo "sequence" del txcontrolbuf, si scrive la sequenza includendo il sequence offset casuale, giusto?
+    => Si va bene così, se funziona tutto è ok
+- Finchè faccio queste prove, considero anche per le connessioni TCP normali che il SACK di un segmento non può essere 
+"annullato" (così evito di avere il codice di gestione diverso) oppure li gestisco già diversamente? Sennò dovrei
+togliere i pacchetti dalla TX queue per MS-TCP, e invece mettere un flag che mi dice di non ritrasmettere ma lasciarli
+comunque lì per i TCP normali.
+    => Va bene così per il momento
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
