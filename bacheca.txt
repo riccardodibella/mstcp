@@ -2,6 +2,10 @@ Domande:
 - Nel TCB c'è un campo txfree (con un valore per ogni stream), questo indica lo spazio nella advertised window per
 quello stream che non è ancora stato riempito con pacchetti già in volo di cui si aspetta l'ACK, giusto? Perchè in
 mytcp è iniziaizzato con un valore fisso (TXBUFSIZE), non capisco perchè.
+- Non mi ricordo se lo avevo già chiesto, ma se MS-TCP è abilitato, ha senso usare il flag dummy payload anche per
+segmenti che non hanno l'opzione MS-TCP? O dato che senza l'opzione MS-TCP non ho bisogno di consumare un nuovo SSN
+per poterci fare l'ACK e quindi non mi serve mai il flag DMP? E' solo per capire dove mettere il controllo per quel
+flag, se farlo anche per segmenti di una connessione con MS-TCP abilitato ma senza l'opzione MS-TCP all'interno
 
 - Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
 analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
@@ -108,6 +112,12 @@ lascio così o cerco il fd giusto scrorrendoli tutti confrontando local address 
 togliere i pacchetti dalla TX queue per MS-TCP, e invece mettere un flag che mi dice di non ritrasmettere ma lasciarli
 comunque lì per i TCP normali.
     => Va bene così per il momento
+- E' giusto che, per sapere quando devo inserire i dati di un segmento che mi arriva su uno stream all'interno del 
+RX buffer per quello stream, io debba aggiungere al TCB per ogni stream qual'è il prossimo SSN che devo inserire nel
+buffer per quello stream? E devo anche salvare in quale posizione inserirlo, perchè non posso più usare il numero di
+sequenza del segmento e l'offset iniziale per determinare la posizione nel buffer in cui scrivere il nuovo dato
+    => Aggiungere solo il numero del prossimo segmento da aggiungere alla linked list di stream, dato che non esiste un
+    buffer circolare in cui sono inseriti i numeri dei payload non serve l'indice della prossima posizione in cui scrivere
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
