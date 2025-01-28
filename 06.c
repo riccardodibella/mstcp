@@ -204,7 +204,7 @@ struct txcontrolbuf{ // mytcp: txcontrolbuf
 
 struct channel_rx_queue_node{
 	struct channel_rx_queue_node* next;
-	uint32_t seq;
+	uint32_t channel_offset; // sequence number - tcb->ack_offs
 	int total_segment_length;
 	int payload_length;
 	struct tcp_segment* segment;
@@ -996,6 +996,82 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 }
 
 
+struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offset, struct ip_datagram* ip, struct tcp_segment* tcp, struct channel_rx_queue_node* next){
+	// IP datagram is needed for segment and payload lengths
+	// Instead of channel_offset we could pass the tcb as a parameter and calculate the channel_offset again here
+	/*
+	struct channel_rx_queue_node{
+		struct channel_rx_queue_node* next;
+		uint32_t channel_offset; // sequence number - tcb->ack_offs
+		int total_segment_length;
+		int payload_length;
+		struct tcp_segment* segment;
+	};
+	*/
+	if(ip == NULL || tcp == NULL){
+		ERROR("create_channel_rx_queue_node unexpected NULL parameter");
+	}
+	struct channel_rx_queue_node* to_return = malloc(sizeof(struct channel_rx_queue_node));
+	to_return->next = next;
+	to_return->channel_offset = channel_offset;
+	to_return->total_segment_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4;
+	to_return->payload_length = to_return->total_segment_length - (tcp->d_offs_res>>4)*4;
+	if(to_return->payload_length <= 0 || to_return->total_segment_length <= 0){
+		/* 
+		The case == 0 is used to ensure that we are not inserting a segment with no payload (like a DupACK) in the queue. This should be avoided
+		in the caller function, and we should never get here.
+		The case < 0 is used to try to catch errors related to invalid pointers passed to this function. 
+		*/
+		ERROR("create_channel_rx_queue_node invalid length payload %d segment %d", to_return->payload_length, to_return->total_segment_length);
+	}
+	to_return->segment = malloc(to_return->total_segment_length);
+	memcpy(to_return->segment, tcp, to_return->total_segment_length);
+	return to_return;
+}
+
+/* The segment is unlinked from the channel node and linked to the new stream node */
+struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue_node* ch_node){
+	/*
+	struct stream_rx_queue_node{
+		struct stream_rx_queue_node* next;
+		int sid;
+		uint16_t ssn;
+		int total_segment_length;
+		int payload_length;
+		bool dummy_payload; // DMP flag
+		int consumed_bytes;
+		struct tcp_segment* segment;
+	};
+	*/
+	if(ch_node == NULL){
+		ERROR("create_stream_rx_queue_node param NULL");
+	}
+	if(ch_node->segment == NULL){
+		ERROR("create_stream_rx_queue_node segment NULL");
+	}
+	int ms_index = search_tcp_option(ch_node->segment, OPT_KIND_MS_TCP);
+	if(ms_index < 0){
+		ERROR("create_stream_rx_queue_node no ms option");
+	}
+	int sid = (ch_node->segment->payload[ms_index+2]>>2) & 0x1F;
+	int ssn = ((ch_node->segment->payload[ms_index+2]&0x3) << 8) || ch_node->segment->payload[ms_index+3];
+	// Last stream segment bit currently ignored
+
+	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) malloc(sizeof(struct stream_rx_queue_node));
+
+	to_return->next = NULL; // Always inserted at the end of the stream queue
+	to_return->sid = sid;
+	to_return->ssn = ssn;
+	to_return->total_segment_length = ch_node->total_segment_length;
+	to_return->payload_length = ch_node->payload_length;
+	to_return->dummy_payload = (ch_node->segment->d_offs_res & 0x01);
+	to_return->consumed_bytes = 0;
+	to_return->segment = ch_node->segment;
+
+	ch_node->segment = NULL;
+
+	return to_return;
+}
 
 
 
@@ -1462,6 +1538,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					*/
 					tcb->ms_option_enabled = tcb->ms_option_requested && ms_received; 
 
+					if(tcb->ms_option_enabled){
+						tcb->next_rx_ssn[0] = 1; // SSN 0 received in the SYN+ACK
+					}
+
 
 					fdinfo[s].sid = 0; // The first opened stream is always stream 0
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
@@ -1593,6 +1673,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					opt_ptr[20] = OPT_KIND_WIN_SCALE; // Window Scale Kind
 					opt_ptr[21] = 3; // Window Scale Length
 					opt_ptr[22] = DEFAULT_WINDOW_SCALE;
+
+					tcb->next_rx_ssn[0] = 1; // SSN 0 was received in the SYN
 				}else{
 					opt_len = 19;
 					opt_ptr = malloc(opt_len);
@@ -1729,6 +1811,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_tx_buffer[sid] = malloc(TODO_BUFFER_SIZE);
 							tcb->stream_rx_queue[sid] = NULL;
 							tcb->adwin[sid] = TODO_BUFFER_SIZE;
+							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
 
 							// Insertion in the listening socket backlog
 							struct stream_backlog_node* cursor = &fdinfo[tcb->listening_fd].stream_backlog_head;
@@ -2124,14 +2207,124 @@ void myio(int ignored){
 
 				DEBUG("TODO currently not checking if the segment is within the max RX window size");
 
-				ERROR("TODO Continuare da qui");
+				struct channel_rx_queue_node* newrx = NULL;
+				if(tcb->unack == NULL){
+					// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
+					tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
+				}else{
+					// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
+					struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
+					while(cursor != NULL && cursor->channel_offset > channel_offset){
+						prev = cursor;
+						cursor = cursor->next;
+					}
+					// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
+					if(cursor->channel_offset != channel_offset){
+						// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
+						newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
+						if(prev == NULL){
+							// Insertion at the beginning of the queue
+							tcb->unack = newrx;
+						}else{
+							// Insertion in the middle (or at the end) of the queue
+							prev->next = newrx;
+						}
+					}
+				}
 
-				DEBUG("TODO  myio TCP insertion in RX channel queue");
+				// if newrx == NULL the packet was a duplicate of an out-of-order packet
+				if(newrx != NULL){
+					// new node inserted in the channel queue
+					if(!tcb->ms_option_enabled){
+						ERROR("TODO insert in RX stream buffer non-MS");
+					}
+					if((tcb->ms_option_requested || tcb->ms_option_enabled) && sid == 0 && ssn == 0){
+						// I don't really know how this might happen, but this for sure shouldn't happen so a check shouldn't hurt
+						// Note that the situation sid==0&&ssn==0 might happen if ms is not enabled or if the packet is only an ACK without payload
+						ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
+					}
+					struct channel_rx_queue_node* cursor = newrx;
+					while(cursor != NULL && tcb->next_rx_ssn[sid] == ssn){
+						// cursor contains an in-order segment for the stream
+						
+						// This unlinks the segments in cursor and links it to the new stream queue node
+						struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
 
-				DEBUG("TODO  myio TCP insertion in RX stream buffer");
+						if(tcb->stream_rx_queue[sid] == NULL){
+							tcb->stream_rx_queue[sid] = newrx_stream;
+						}else{
+							// Traverse the stream RX queue until you get to the end
+							// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
+							struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
+							while(last->next != NULL){
+								last = last->next;
+							}
+							last->next = newrx_stream;
+						}
+
+						tcb->next_rx_ssn[sid]++;
+						// advance to the next segment of this stream in the channel RX queue
+						cursor = cursor->next;
+						while(cursor != NULL){
+							if(cursor->segment != NULL){
+								int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+								if(cursor_ms_index>=0){
+									int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
+									int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) || cursor->segment->payload[cursor_ms_index+3];
+									if(cursor_ssn == ssn){
+										break;
+									}
+								}
+							}
+							cursor = cursor->next;
+						}
+						// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
+					}
+
+					// Removal of in-order segments at the beginning of the channel RX queue
+					while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
+						if(tcb->unack->segment != NULL){
+							ERROR("in-order segment not consumed from channel queue");
+						}
+						tcb->cumulativeack += tcb->unack->payload_length;
+						struct channel_rx_queue_node* next = tcb->unack->next;
+						free(tcb->unack);
+						tcb->unack = next;
+					}
+				}
 			}
 
-			DEBUG("TODO myio TCP ACK generation");
+			// TODO do we have to generate an ACK even if the received segment had payload size = 0?
+			if(!tcb->ms_option_enabled){
+				if(tcb->txfirst==NULL){
+					// Generate an ACK without MS Option
+					prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}
+			}else{
+				if(ms_option_included){
+					// Allocate a new SSN and send an ACK on the stream with the DMP flag
+					DEBUG("TODO fix the way ACKs are generated for MS segments");
+
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = sid<<2;
+					opt[3] = tcb->next_ssn[sid];
+
+					tcb->next_ssn[sid]++;
+
+					uint8_t* dummy_payload = malloc(1); // value doesn't matter
+
+					prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
+					free(dummy_payload);
+					free(opt);
+				}else{
+					// Generic ACK
+					prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}
+			}
 
 			// ts_recent update ( https://datatracker.ietf.org/doc/html/rfc7323#section-4.3 )
 			uint32_t ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
