@@ -27,6 +27,7 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
+#define NUM_CLIENTS 10
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -406,6 +407,41 @@ void DEBUG(char* c, ...){
 	printf("\n");
 }
 
+// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
+int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
+	if(tcp == NULL){
+		ERROR("search_tcp_option tcp NULL");
+	}
+	int to_return = -1;
+	int optlen = ((tcp->d_offs_res)>>4)*4-20;
+	int i;
+	for(i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+
+		if(tcp->payload[i] == kind){
+			to_return = i;
+			break;
+		}
+		
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+	if(i>optlen){
+		/* 
+		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
+		the implementation at both sides of the connection this could allow to catch some bugs. We do not
+		always check if the field is well formed, this check is useful only if the option is not found
+		*/
+		ERROR("search_tcp_option misaligned end of options (invalid last length)");
+	}
+	return to_return;
+}
+
 void print_tcp_segment(struct tcp_segment* tcp){
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
@@ -458,6 +494,10 @@ void print_tcp_segment(struct tcp_segment* tcp){
 			printf("\n");
 		}
 	}
+	int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(ms_index>=0){
+		printf("LSS %d SID %d SSN %d\n", tcp->payload[ms_index+2]>>7, (tcp->payload[ms_index+2]>>2) & 0x1F, (( tcp->payload[ms_index+2] & 0x3) << 8 ) | (tcp->payload[ms_index+3]));
+	}
 
 	printf("-------------------\n");
 }
@@ -479,6 +519,8 @@ void print_ip_datagram(struct ip_datagram* ip){
 	printf("Destination IP: ");
 	print_ip((uint8_t*)&(ip->dstaddr));
 	printf("L4 protocol: %d\n", ip->proto);
+	printf("Total IP packet length: %d\n", htons(ip->totlen));
+	printf("Total L4 packet length: %d\n", htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 	if(ip->proto == TCP_PROTO){
 		print_tcp_segment((struct tcp_segment*) ip->payload + (((ip->ver_ihl & 0x0F) * 4) - 20));
 	}
@@ -562,41 +604,6 @@ void persistent_nanosleep(int sec, int nsec){
 	}
 }
 
-
-// -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
-int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
-	if(tcp == NULL){
-		ERROR("search_tcp_option tcp NULL");
-	}
-	int to_return = -1;
-	int optlen = ((tcp->d_offs_res)>>4)*4-20;
-	int i;
-	for(i=0; i<optlen; i++){
-		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
-			break;
-		}
-		if(tcp->payload[i] == OPT_KIND_NO_OP){
-			continue;
-		}
-
-		if(tcp->payload[i] == kind){
-			to_return = i;
-			break;
-		}
-		
-		int length = tcp->payload[i+1];
-		i += length - 1; // with the i++ we go to the start of the next option
-	}
-	if(i>optlen){
-		/* 
-		This is probably not a problem of the local node (and it could be ignored), but if we are writing 
-		the implementation at both sides of the connection this could allow to catch some bugs. We do not
-		always check if the field is well formed, this check is useful only if the option is not found
-		*/
-		ERROR("search_tcp_option misaligned end of options (invalid last length)");
-	}
-	return to_return;
-}
 
 
 #pragma region STARTUP_FUNCTIONS
@@ -833,8 +840,8 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
-	//DEBUG("Outgoing send_ip packet:");
-	//print_l2_packet(packet);
+	DEBUG("Outgoing send_ip packet:");
+	print_l2_packet(packet);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		perror("send_ip sendto failed"); 
@@ -898,6 +905,9 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	}else{
 		txcb->sid = (tcp->payload[multi_stream_opt_index+2]>>2) & 0x1F;
 		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) || tcp->payload[multi_stream_opt_index+3];
+		
+		// Deactivate the FSM timer for this stream (we are sending a segment, so we don't need to wait for the timeout to open the new stream)
+		tcb->stream_fsm_timer[txcb->sid] = 0;
 	}
 
 	/*
@@ -975,7 +985,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
 		}
 		if(tcp->payload[i] == OPT_KIND_SACK){
-			DEBUG("TODO SACK update");
+			// DEBUG("TODO SACK update");
 		}
 		int length = tcp->payload[i+1];
 		i += length - 1; // with the i++ we go to the start of the next option
@@ -1026,6 +1036,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	}
 	to_return->segment = malloc(to_return->total_segment_length);
 	memcpy(to_return->segment, tcp, to_return->total_segment_length);
+	DEBUG("RX -> Channel offset %d", channel_offset);
 	return to_return;
 }
 
@@ -1069,6 +1080,8 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 	to_return->segment = ch_node->segment;
 
 	ch_node->segment = NULL;
+
+	DEBUG("Channel -> Stream SID %d SSN %d (offset %d)", sid, ssn, ch_node->channel_offset);
 
 	return to_return;
 }
@@ -1450,7 +1463,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			free(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
-			
+
 			return 0;
 		}
 	}
@@ -1540,6 +1553,11 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 					if(tcb->ms_option_enabled){
 						tcb->next_rx_ssn[0] = 1; // SSN 0 received in the SYN+ACK
+						/*
+						Incremented here (instead of in the ACTIVE_OPEN event fsm) to avoid having SSN=1 for disabled MS-TCP in stream 0. Probably this is 
+						not important, and it can be moved there if it simplifies something.
+						*/
+						tcb->next_ssn[0] = 1;
 					}
 
 
@@ -1734,7 +1752,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					memcpy(backlog_tcb, tcb, sizeof(struct tcpctrlblk));
 
 
-					/* Initialization of the field-specific fields and buffers */
+					/* Initialization of the stream-specific fields and buffers */
 
 					backlog_tcb->stream_state[0] = STREAM_STATE_READY;
 					backlog_tcb->stream_tx_buffer[0] = malloc(TODO_BUFFER_SIZE);
@@ -1742,8 +1760,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					backlog_tcb->adwin[0] = TODO_BUFFER_SIZE;
 					backlog_tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
 					backlog_tcb->txfree[0] = TODO_BUFFER_SIZE;
-					backlog_tcb->next_ssn[0] = 0;
-					backlog_tcb->next_rx_ssn[0] = 0;  // TODO should this be initialized to 0 or 1?
+					backlog_tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
+					backlog_tcb->next_rx_ssn[0] = 1; // SSN 0 already received (SYN+ACK)
 					backlog_tcb->stream_fsm_timer[0] = 0;
 					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
 						backlog_tcb->stream_state[i] = STREAM_STATE_UNUSED;
@@ -1755,8 +1773,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						}
 						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
 						backlog_tcb->txfree[i] = 0;
-						backlog_tcb->next_ssn[i] = 0;
-						backlog_tcb->next_rx_ssn[0] = 0;
+						backlog_tcb->next_ssn[i] = 1;
+						backlog_tcb->next_rx_ssn[0] = 1;
 						backlog_tcb->stream_fsm_timer[i] = 0;
 					}
 					backlog_tcb->listening_fd = s;
@@ -1777,6 +1795,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			if(event == FSM_EVENT_STREAM_TIMEOUT){
 				int sid = fdinfo[s].sid;
+				if(fdinfo[s].tcb->next_ssn[sid] != 0){
+					ERROR("FSM_EVENT_STREAM_TIMEOUT stream %d already opened", sid);
+				}
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 				uint8_t* opt = malloc(optlen);
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
@@ -1989,6 +2010,67 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	ERROR("myaccept something went very wrong, you should never reach after the do while"); // pause always returns -1
 }
 
+int mywrite(int s, uint8_t * buffer, int maxlen){
+	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
+	// Direct segmentation mywrite
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
+		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
+	}
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
+		myerrno = EINVAL;
+		return -1;
+	}
+	if(maxlen < 0){
+		ERROR("mywrite invalid maxlen %d");
+	}
+	if(maxlen == 0){
+		return 0;
+	}
+
+	// do-while skipped for direct segmentation
+	int start_byte_number = 0;
+	while(start_byte_number < maxlen){
+		DEBUG("start_byte_number %d", start_byte_number);
+		int remaining_length = maxlen - start_byte_number;
+		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH);
+		
+		if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+			perror("sigprocmask"); 
+			exit(EXIT_FAILURE);
+		}
+		acquire_handler_lock();
+
+		if(!fdinfo[s].tcb->ms_option_enabled){
+			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+		}else{
+			int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+			uint8_t* opt = malloc(optlen);
+			memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+			
+			// Stream update
+			opt[2] = fdinfo[s].sid<<2 | (((fdinfo[s].tcb->next_ssn[fdinfo[s].sid])>>8) & 0x03);
+			opt[3] = (fdinfo[s].tcb->next_ssn[fdinfo[s].sid]) & 0xFF;
+			DEBUG("Packet inserted in TX queue (sid %d ssn %d)", fdinfo[s].sid, fdinfo[s].tcb->next_ssn[fdinfo[s].sid]);
+
+			fdinfo[s].tcb->next_ssn[fdinfo[s].sid]++;
+			DEBUG("new next_ssn for stream %d: %d", fdinfo[s].sid, fdinfo[s].tcb->next_ssn[fdinfo[s].sid]);
+			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, opt, optlen);
+			free(opt);
+		}
+
+		release_handler_lock();
+		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+			perror("sigprocmask"); 
+			exit(EXIT_FAILURE);
+		}
+		start_byte_number += payload_length;
+	}
+	if(start_byte_number != maxlen){
+		ERROR("invalid start_byte_number at end of mywrite with direct segmentation");
+	}
+	return start_byte_number;
+}
+
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 	if(tcb == NULL || tcp == NULL){
@@ -2187,142 +2269,150 @@ void myio(int ignored){
 				}
 			}
 
-			int sid = 0;
-			int ssn = 0;
-			bool dummy_payload = false;
-			bool ms_option_included = false;
-			if(tcb->ms_option_enabled){
-				int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
-				if(ms_index >= 0){
-					sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
-					ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
-					ms_option_included = true;
-					dummy_payload = tcp->d_offs_res & (DMP >> 8);
-				}
-			}
-
-			uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
-			if(channel_offset >= tcb->cumulativeack){
-				// This segment is not a duplicate of something already cumulative-acked
-
-				DEBUG("TODO currently not checking if the segment is within the max RX window size");
-
-				struct channel_rx_queue_node* newrx = NULL;
-				if(tcb->unack == NULL){
-					// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
-					tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
-				}else{
-					// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
-					struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
-					while(cursor != NULL && cursor->channel_offset > channel_offset){
-						prev = cursor;
-						cursor = cursor->next;
-					}
-					// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
-					if(cursor->channel_offset != channel_offset){
-						// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
-						newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
-						if(prev == NULL){
-							// Insertion at the beginning of the queue
-							tcb->unack = newrx;
-						}else{
-							// Insertion in the middle (or at the end) of the queue
-							prev->next = newrx;
-						}
+			int payload_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4 - (tcp->d_offs_res>>4)*4;
+			if(payload_length > 0){
+				int sid = 0;
+				int ssn = 0;
+				bool dummy_payload = false;
+				bool ms_option_included = false;
+				if(tcb->ms_option_enabled){
+					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+					if(ms_index >= 0){
+						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
+						ms_option_included = true;
+						dummy_payload = tcp->d_offs_res & (DMP >> 8);
 					}
 				}
 
-				// if newrx == NULL the packet was a duplicate of an out-of-order packet
-				if(newrx != NULL){
-					// new node inserted in the channel queue
-					if(!tcb->ms_option_enabled){
-						ERROR("TODO insert in RX stream buffer non-MS");
-					}
-					if((tcb->ms_option_requested || tcb->ms_option_enabled) && sid == 0 && ssn == 0){
-						// I don't really know how this might happen, but this for sure shouldn't happen so a check shouldn't hurt
-						// Note that the situation sid==0&&ssn==0 might happen if ms is not enabled or if the packet is only an ACK without payload
-						ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
-					}
-					struct channel_rx_queue_node* cursor = newrx;
-					while(cursor != NULL && tcb->next_rx_ssn[sid] == ssn){
-						// cursor contains an in-order segment for the stream
-						
-						// This unlinks the segments in cursor and links it to the new stream queue node
-						struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
+				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
+				if(channel_offset >= tcb->cumulativeack){
+					// This segment is not a duplicate of something already cumulative-acked
 
-						if(tcb->stream_rx_queue[sid] == NULL){
-							tcb->stream_rx_queue[sid] = newrx_stream;
-						}else{
-							// Traverse the stream RX queue until you get to the end
-							// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
-							struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
-							while(last->next != NULL){
-								last = last->next;
-							}
-							last->next = newrx_stream;
-						}
+					//DEBUG("TODO currently not checking if the segment is within the max RX window size");
 
-						tcb->next_rx_ssn[sid]++;
-						// advance to the next segment of this stream in the channel RX queue
-						cursor = cursor->next;
-						while(cursor != NULL){
-							if(cursor->segment != NULL){
-								int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
-								if(cursor_ms_index>=0){
-									int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
-									int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) || cursor->segment->payload[cursor_ms_index+3];
-									if(cursor_ssn == ssn){
-										break;
-									}
-								}
-							}
+					struct channel_rx_queue_node* newrx = NULL;
+					if(tcb->unack == NULL){
+						// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
+						tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
+					}else{
+						// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
+						struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
+						while(cursor != NULL && cursor->channel_offset > channel_offset){
+							prev = cursor;
 							cursor = cursor->next;
 						}
-						// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
-					}
-
-					// Removal of in-order segments at the beginning of the channel RX queue
-					while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
-						if(tcb->unack->segment != NULL){
-							ERROR("in-order segment not consumed from channel queue");
+						// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
+						if(cursor->channel_offset != channel_offset){
+							// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
+							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
+							if(prev == NULL){
+								// Insertion at the beginning of the queue
+								tcb->unack = newrx;
+							}else{
+								// Insertion in the middle (or at the end) of the queue
+								prev->next = newrx;
+							}
 						}
-						tcb->cumulativeack += tcb->unack->payload_length;
-						struct channel_rx_queue_node* next = tcb->unack->next;
-						free(tcb->unack);
-						tcb->unack = next;
+					}
+					// if newrx == NULL the packet was a duplicate of an out-of-order packet
+					if(newrx != NULL){
+						// new node has been inserted in the channel queue
+						if(!tcb->ms_option_enabled){
+							ERROR("TODO insert in RX stream buffer non-MS");
+						}
+						if((tcb->ms_option_requested || tcb->ms_option_enabled) && sid == 0 && ssn == 0){
+							// I don't really know how this might happen, but this for sure shouldn't happen so a check shouldn't hurt
+							// Note that the situation sid==0&&ssn==0 might happen if ms is not enabled or if the packet is only an ACK without payload
+							print_l2_packet(l2_rx_buf);
+							ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
+						}
+						struct channel_rx_queue_node* cursor = newrx;
+						while(cursor != NULL && tcb->next_rx_ssn[sid] == ssn){
+							// cursor contains an in-order segment for the stream
+							
+							// This unlinks the segments in cursor and links it to the new stream queue node
+							struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
+
+							if(tcb->stream_rx_queue[sid] == NULL){
+								tcb->stream_rx_queue[sid] = newrx_stream;
+							}else{
+								// Traverse the stream RX queue until you get to the end
+								// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
+								struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
+								while(last->next != NULL){
+									last = last->next;
+								}
+								last->next = newrx_stream;
+							}
+
+							tcb->next_rx_ssn[sid]++;
+							// advance to the next segment of this stream in the channel RX queue
+							cursor = cursor->next;
+							while(cursor != NULL){
+								if(cursor->segment != NULL){
+									int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+									if(cursor_ms_index>=0){
+										int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
+										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) || cursor->segment->payload[cursor_ms_index+3];
+										if(cursor_ssn == ssn){
+											break;
+										}
+									}
+								}
+								cursor = cursor->next;
+							}
+							// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
+						}
+
+						// Removal of in-order segments at the beginning of the channel RX queue
+						while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
+							if(tcb->unack->segment != NULL){
+								DEBUG("Last received packet before error:");
+								print_l2_packet(l2_rx_buf);
+								DEBUG("unack channel_offset: %d", tcb->unack->channel_offset);
+								DEBUG("unack payload length %d", tcb->unack->payload_length);
+								ERROR("in-order segment not consumed from channel queue");
+							}
+							tcb->cumulativeack += tcb->unack->payload_length;
+							struct channel_rx_queue_node* next = tcb->unack->next;
+							free(tcb->unack);
+							tcb->unack = next;
+						}
 					}
 				}
-			}
 
-			// TODO do we have to generate an ACK even if the received segment had payload size = 0?
-			if(!tcb->ms_option_enabled){
-				if(tcb->txfirst==NULL){
-					// Generate an ACK without MS Option
-					prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-				}
-			}else{
-				if(ms_option_included){
-					// Allocate a new SSN and send an ACK on the stream with the DMP flag
-					DEBUG("TODO fix the way ACKs are generated for MS segments");
-
-					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
-					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-					
-					// Stream update
-					opt[2] = sid<<2;
-					opt[3] = tcb->next_ssn[sid];
-
-					tcb->next_ssn[sid]++;
-
-					uint8_t* dummy_payload = malloc(1); // value doesn't matter
-
-					prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
-					free(dummy_payload);
-					free(opt);
+				// TODO do we have to generate an ACK even if the received segment had payload size = 0?
+				if(!tcb->ms_option_enabled){
+					if(tcb->txfirst==NULL){
+						// Generate an ACK without MS Option
+						prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					}
 				}else{
-					// Generic ACK
-					prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					if(ms_option_included){
+						// Allocate a new SSN and send an ACK on the stream with the DMP flag
+						//DEBUG("TODO fix the way ACKs are generated for MS segments");
+
+						int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+						uint8_t* opt = malloc(optlen);
+						memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+						
+						// Stream update
+						opt[2] = sid<<2;
+						opt[3] = tcb->next_ssn[sid];
+						DEBUG("Generating ACK sid %d ssn %d", sid, tcb->next_ssn[sid]);
+						tcb->next_ssn[sid]++;
+						DEBUG("new SSN for sid %d: %d", sid, tcb->next_ssn[sid]);
+
+						uint8_t* dummy_payload = malloc(1); // value doesn't matter
+
+						prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
+						free(dummy_payload);
+						free(opt);
+					}else{
+						// Generic ACK
+						prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					}
 				}
 			}
 
@@ -2363,6 +2453,9 @@ void mytimer(int ignored){
 			continue;
 		}
 		if(fdinfo[i].sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fdinfo[i].sid] != 0) && (tcb->stream_fsm_timer[fdinfo[i].sid] <= tick)){
+			/* Note: If for any reason the stream timeout is used for something different from the opening of streams without anything to transmit, you need to modify
+			in prepare_tcp where the stream_fsm_timer is set to 0 if any segment is transmitted on the stream
+			*/
 			fsm(i, FSM_EVENT_STREAM_TIMEOUT, NULL, NULL);
 			continue;
 		}
@@ -2430,6 +2523,7 @@ int main(){
 	DEBUG("Startup OK");
 
 	if(MAIN_MODE == CLIENT){
+		int client_sockets[NUM_CLIENTS];
 		// Client code to connect to a server
 		int s = mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){
@@ -2437,6 +2531,7 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mysocket OK");
+		client_sockets[0] = s;
 		/*
 		struct sockaddr_in loc_addr;
 		loc_addr.sin_family = AF_INET;
@@ -2461,7 +2556,7 @@ int main(){
 		}
 		DEBUG("myconnect OK");
 		persistent_nanosleep(2,0);
-		for(int i=0; i<10; i++){
+		for(int i=1; i<NUM_CLIENTS; i++){
 			int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
 			if(s_loop == -1){
 				myperror("mysocket");
@@ -2471,6 +2566,17 @@ int main(){
 			if (-1 == myconnect(s_loop,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
 				myperror("myconnect");
 				exit(EXIT_FAILURE);
+			}
+			client_sockets[i] = s_loop;
+		}
+
+		// Write some data in all of the client sockets
+		for(int i=0; i<NUM_CLIENTS; i++){
+			uint8_t* data = "PROVAPROVA123";
+			int data_length = strlen(data);
+			int res = mywrite(client_sockets[i], data, data_length);
+			if(res != data_length){
+				ERROR("mywrite invalid return value (for direct segmentation) %d != %d", res, data_length);
 			}
 		}
 		while(true){}
