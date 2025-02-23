@@ -27,7 +27,7 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 10
+#define NUM_CLIENTS 1
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -227,7 +227,7 @@ struct stream_rx_queue_node{
 
 
 struct tcpctrlblk{
-	bool stream_state[TOT_SID];
+	int stream_state[TOT_SID];
 	unsigned short adwin[TOT_SID];
 	unsigned short radwin[TOT_SID];
 	unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
@@ -1940,6 +1940,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	}
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
+	DEBUG("Before myaccept loop");
 	do{
 		if(fdinfo[s].ready_streams == 0){
 			/*
@@ -1968,7 +1969,10 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			memcpy(tcb, fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 			bzero(fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 
+			DEBUG("%d",tcb->stream_state[0]);
 			tcb->stream_state[0] = STREAM_STATE_OPENED;
+			DEBUG("%d",tcb->stream_state[0]);
+			DEBUG("myaccept fd %d sid %d stream state %d ", s, 0, tcb->stream_state[0]);
 
 			fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
 			fdinfo[free_fd].tcb = tcb;
@@ -2069,6 +2073,64 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		ERROR("invalid start_byte_number at end of mywrite with direct segmentation");
 	}
 	return start_byte_number;
+}
+
+int myread(int s, unsigned char *buffer, int maxlen){
+	if((fdinfo[s].st != FDINFO_ST_TCB_CREATED) || (fdinfo[s].tcb->st < TCB_ST_ESTABLISHED )){ 
+		ERROR("Invalid socket myread");
+		myerrno = EINVAL; 
+		return -1; 
+	}
+	if (maxlen==0){
+		return 0;
+	}
+	if(!fdinfo[s].tcb->ms_option_enabled){
+		ERROR("ms option not enabled myread");
+	}
+	int sid = fdinfo[s].sid;
+	if(sid == SID_UNASSIGNED){
+		ERROR("sid unassigned myread");
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
+		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
+	}
+	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
+		/* 
+		NOTA: Questo non gestisce bene il caso in cui è presente solo un segmento nella coda, e è un segmento con LSS attivo
+		e DMP=1, che può essere inviato alla fine di uno stream, e in questo caso bisognerebbe uscire da questo ciclo invece
+		di andare avanti. Va corretto quando si guarda la chiusura delle connessioni
+		*/
+		pause();
+	}
+	// At this point there is something to consume
+	int read_consumed_bytes = 0;
+	while(tcb->stream_rx_queue[sid] != NULL && read_consumed_bytes < maxlen){
+		bool lss = false; // TODO
+		if(lss && read_consumed_bytes != 0  && (tcb->stream_rx_queue[sid]->dummy_payload || (tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length))){
+			// Do not consume this segment at this time: it will be consumed at the next call of myread, that will return 0
+			break;
+		}
+		if(tcb->stream_rx_queue[sid]->dummy_payload){
+			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
+			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+
+			// free dmp_node and its segment
+			free(dmp_node->segment);
+			free(dmp_node);
+
+			continue;
+		}
+		int missing_read_bytes = maxlen - read_consumed_bytes;
+		int remaining_segment_bytes = tcb->stream_rx_queue[sid]->payload_length - tcb->stream_rx_queue[sid]->consumed_bytes;
+
+		int current_segment_read_bytes = MIN(missing_read_bytes, remaining_segment_bytes);
+		memcpy(buffer + read_consumed_bytes, tcb->stream_rx_queue[sid]->segment->payload + (tcb->stream_rx_queue[sid]->segment->d_offs_res>>4)*4, current_segment_read_bytes);
+
+		read_consumed_bytes += current_segment_read_bytes;
+		tcb->stream_rx_queue[sid]->consumed_bytes += current_segment_read_bytes;
+	}
+	return read_consumed_bytes;
 }
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
@@ -2372,6 +2434,8 @@ void myio(int ignored){
 								print_l2_packet(l2_rx_buf);
 								DEBUG("unack channel_offset: %d", tcb->unack->channel_offset);
 								DEBUG("unack payload length %d", tcb->unack->payload_length);
+								DEBUG("newrx channel_offset: %d", newrx->channel_offset);
+								DEBUG("newrx payload length %d", newrx->payload_length);
 								ERROR("in-order segment not consumed from channel queue");
 							}
 							tcb->cumulativeack += tcb->unack->payload_length;
@@ -2602,6 +2666,7 @@ int main(){
 		}
 		DEBUG("mylisten OK");
 		while(true){
+			DEBUG("while true");
 			struct sockaddr_in remote_addr;
 			remote_addr.sin_family=AF_INET;
 			int len = sizeof(struct sockaddr_in);
@@ -2611,6 +2676,12 @@ int main(){
 				exit(EXIT_FAILURE);
 			}
 			DEBUG("myaccept OK fd %d stream %d", s, fdinfo[s].sid);
+			char myread_buf[100];
+			memset(myread_buf, 0, sizeof(myread_buf));
+			int n = myread(s, myread_buf, sizeof(myread_buf));
+			ERROR("Myread OK");
+			DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
+			DEBUG("myread result |%s|", myread_buf);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
