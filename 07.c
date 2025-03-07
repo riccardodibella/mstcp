@@ -840,8 +840,8 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
-	DEBUG("Outgoing send_ip packet:");
-	print_l2_packet(packet);
+	// DEBUG("Outgoing send_ip packet:");
+	// print_l2_packet(packet);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		perror("send_ip sendto failed"); 
@@ -904,7 +904,8 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 		txcb->ssn = -1;
 	}else{
 		txcb->sid = (tcp->payload[multi_stream_opt_index+2]>>2) & 0x1F;
-		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) || tcp->payload[multi_stream_opt_index+3];
+		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) | tcp->payload[multi_stream_opt_index+3];
+		DEBUG("txcb sid %d ssn %d", txcb->sid, txcb->ssn);
 		
 		// Deactivate the FSM timer for this stream (we are sending a segment, so we don't need to wait for the timeout to open the new stream)
 		tcb->stream_fsm_timer[txcb->sid] = 0;
@@ -1065,7 +1066,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 		ERROR("create_stream_rx_queue_node no ms option");
 	}
 	int sid = (ch_node->segment->payload[ms_index+2]>>2) & 0x1F;
-	int ssn = ((ch_node->segment->payload[ms_index+2]&0x3) << 8) || ch_node->segment->payload[ms_index+3];
+	int ssn = ((ch_node->segment->payload[ms_index+2]&0x3) << 8) | ch_node->segment->payload[ms_index+3];
 	// Last stream segment bit currently ignored
 
 	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) malloc(sizeof(struct stream_rx_queue_node));
@@ -1823,7 +1824,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
 					if(ms_index >= 0){
 						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
-						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
+						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) | tcp->payload[ms_index+3];
 						if(ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
@@ -2155,7 +2156,25 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
 	//DEBUG("after rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 }
+void print_rx_queue(struct tcpctrlblk* tcb){
+	struct channel_rx_queue_node *cursor = tcb->unack;
+	printf("Channel RX queue: unack = ");
+	while(cursor != NULL){
+		int sid = -1, ssn = -1;
+		bool ms_option_included = false;
+		if(tcb->ms_option_enabled){
+			int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+			if(ms_index >= 0){
+				sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
+				ssn = ((cursor->segment->payload[ms_index+2]&0x3) << 8) | cursor->segment->payload[ms_index+3];
+			}
+		}
 
+		printf("{%u, %d [%s] (%d|%d)}->", cursor->channel_offset, cursor->payload_length, cursor->segment!=NULL?"X":" ", sid, ssn);
+		cursor = cursor->next;
+	}
+	printf("NULL\n");
+}
 void myio(int ignored){
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
@@ -2341,7 +2360,7 @@ void myio(int ignored){
 					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
 					if(ms_index >= 0){
 						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
-						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) || tcp->payload[ms_index+3];
+						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) | tcp->payload[ms_index+3];
 						ms_option_included = true;
 						dummy_payload = tcp->d_offs_res & (DMP >> 8);
 					}
@@ -2377,6 +2396,8 @@ void myio(int ignored){
 							}
 						}
 					}
+					DEBUG("newrx added to rx queue");
+					print_rx_queue(tcb);
 					// if newrx == NULL the packet was a duplicate of an out-of-order packet
 					if(newrx != NULL){
 						// new node has been inserted in the channel queue
@@ -2390,6 +2411,7 @@ void myio(int ignored){
 							ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
 						}
 						struct channel_rx_queue_node* cursor = newrx;
+						DEBUG("tcb->next_rx_ssn[sid %d] %d == ssn %d", sid, tcb->next_rx_ssn[sid], ssn);
 						while(cursor != NULL && tcb->next_rx_ssn[sid] == ssn){
 							// cursor contains an in-order segment for the stream
 							
@@ -2416,7 +2438,7 @@ void myio(int ignored){
 									int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
 									if(cursor_ms_index>=0){
 										int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
-										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) || cursor->segment->payload[cursor_ms_index+3];
+										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) | cursor->segment->payload[cursor_ms_index+3];
 										if(cursor_ssn == ssn){
 											break;
 										}
@@ -2442,6 +2464,9 @@ void myio(int ignored){
 							struct channel_rx_queue_node* next = tcb->unack->next;
 							free(tcb->unack);
 							tcb->unack = next;
+
+							DEBUG("something removed from rx queue");
+							print_rx_queue(tcb);
 						}
 					}
 				}
