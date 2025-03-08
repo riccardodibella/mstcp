@@ -1965,14 +1965,14 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			if(cursor_index == fdinfo[s].backlog_length){
 				ERROR("myaccept ready_channels > 0 but no TCB found in the backlog");
 			}
-			DEBUG("%u %u", htons(fdinfo[s].tcb->r_port), htons(fdinfo[s].channel_backlog[cursor_index].r_port));
+			//DEBUG("%u %u", htons(fdinfo[s].tcb->r_port), htons(fdinfo[s].channel_backlog[cursor_index].r_port));
 			struct tcpctrlblk* tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
 			memcpy(tcb, fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 			bzero(fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 
-			DEBUG("%d",tcb->stream_state[0]);
+			//DEBUG("%d",tcb->stream_state[0]);
 			tcb->stream_state[0] = STREAM_STATE_OPENED;
-			DEBUG("%d",tcb->stream_state[0]);
+			//DEBUG("%d",tcb->stream_state[0]);
 			DEBUG("myaccept fd %d sid %d stream state %d ", s, 0, tcb->stream_state[0]);
 
 			fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
@@ -2096,12 +2096,23 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
+	DEBUG("myread waiting stream %d", sid);
 	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
 		/* 
 		NOTA: Questo non gestisce bene il caso in cui è presente solo un segmento nella coda, e è un segmento con LSS attivo
 		e DMP=1, che può essere inviato alla fine di uno stream, e in questo caso bisognerebbe uscire da questo ciclo invece
 		di andare avanti. Va corretto quando si guarda la chiusura delle connessioni
 		*/
+		if(tcb->stream_rx_queue[sid] != NULL){
+			// condition "tcb->stream_rx_queue[sid]->dummy_payload" is true
+
+			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
+			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+			DEBUG("Removed DMP node from stream %d rx queue", sid);
+			free(dmp_node->segment);
+			free(dmp_node);
+			continue;
+		}
 		pause();
 	}
 	// At this point there is something to consume
@@ -2126,10 +2137,19 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		int remaining_segment_bytes = tcb->stream_rx_queue[sid]->payload_length - tcb->stream_rx_queue[sid]->consumed_bytes;
 
 		int current_segment_read_bytes = MIN(missing_read_bytes, remaining_segment_bytes);
-		memcpy(buffer + read_consumed_bytes, tcb->stream_rx_queue[sid]->segment->payload + (tcb->stream_rx_queue[sid]->segment->d_offs_res>>4)*4, current_segment_read_bytes);
+		memcpy(buffer + read_consumed_bytes, tcb->stream_rx_queue[sid]->segment->payload + ((tcb->stream_rx_queue[sid]->segment->d_offs_res>>4)*4-20), current_segment_read_bytes);
 
 		read_consumed_bytes += current_segment_read_bytes;
 		tcb->stream_rx_queue[sid]->consumed_bytes += current_segment_read_bytes;
+		if(!lss && tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length){
+			// Segment fully consumed: remove it from the stream rx queue
+			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
+			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+
+			// free dmp_node and its segment
+			free(dmp_node->segment);
+			free(dmp_node);
+		}
 	}
 	return read_consumed_bytes;
 }
@@ -2158,7 +2178,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 }
 void print_rx_queue(struct tcpctrlblk* tcb){
 	struct channel_rx_queue_node *cursor = tcb->unack;
-	printf("Channel RX queue: unack = ");
+	printf("Channel RX queue: unack=");
 	while(cursor != NULL){
 		int sid = -1, ssn = -1;
 		bool ms_option_included = false;
@@ -2704,9 +2724,9 @@ int main(){
 			char myread_buf[100];
 			memset(myread_buf, 0, sizeof(myread_buf));
 			int n = myread(s, myread_buf, sizeof(myread_buf));
-			ERROR("Myread OK");
 			DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
 			DEBUG("myread result |%s|", myread_buf);
+			ERROR("Myread OK");
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
