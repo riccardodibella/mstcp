@@ -27,7 +27,7 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 1
+#define NUM_CLIENTS 10
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -1774,7 +1774,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						}
 						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
 						backlog_tcb->txfree[i] = 0;
-						backlog_tcb->next_ssn[i] = 1;
+						backlog_tcb->next_ssn[i] = 0;
 						backlog_tcb->next_rx_ssn[0] = 1;
 						backlog_tcb->stream_fsm_timer[i] = 0;
 					}
@@ -2016,7 +2016,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 }
 
 int mywrite(int s, uint8_t * buffer, int maxlen){
-	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
+	// DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
 	// Direct segmentation mywrite
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
 		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
@@ -2035,7 +2035,7 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 	// do-while skipped for direct segmentation
 	int start_byte_number = 0;
 	while(start_byte_number < maxlen){
-		DEBUG("start_byte_number %d", start_byte_number);
+		// DEBUG("start_byte_number %d", start_byte_number);
 		int remaining_length = maxlen - start_byte_number;
 		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH);
 		
@@ -2681,7 +2681,8 @@ int main(){
 
 		// Write some data in all of the client sockets
 		for(int i=0; i<NUM_CLIENTS; i++){
-			uint8_t* data = "PROVAPROVA123";
+			uint8_t data[100];
+			sprintf(data, "Client %d message", i);
 			int data_length = strlen(data);
 			int res = mywrite(client_sockets[i], data, data_length);
 			if(res != data_length){
@@ -2725,8 +2726,7 @@ int main(){
 			memset(myread_buf, 0, sizeof(myread_buf));
 			int n = myread(s, myread_buf, sizeof(myread_buf));
 			DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
-			DEBUG("myread result |%s|", myread_buf);
-			ERROR("Myread OK");
+			DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
