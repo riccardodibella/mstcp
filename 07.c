@@ -28,6 +28,7 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 10
+#define NUM_CLIENT_MESSAGES 10
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -2016,7 +2017,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 }
 
 int mywrite(int s, uint8_t * buffer, int maxlen){
-	// DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
+	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
 	// Direct segmentation mywrite
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
 		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
@@ -2678,15 +2679,16 @@ int main(){
 			}
 			client_sockets[i] = s_loop;
 		}
-
-		// Write some data in all of the client sockets
-		for(int i=0; i<NUM_CLIENTS; i++){
-			uint8_t data[100];
-			sprintf(data, "Client %d message", i);
-			int data_length = strlen(data);
-			int res = mywrite(client_sockets[i], data, data_length);
-			if(res != data_length){
-				ERROR("mywrite invalid return value (for direct segmentation) %d != %d", res, data_length);
+		for(int num_message = 0; num_message < NUM_CLIENT_MESSAGES; num_message++){
+			// Write some data in all of the client sockets
+			for(int i=0; i<NUM_CLIENTS; i++){
+				uint8_t data[100];
+				sprintf(data, "Client %d message %d", i, num_message);
+				int data_length = strlen(data);
+				int res = mywrite(client_sockets[i], data, data_length);
+				if(res != data_length){
+					ERROR("mywrite invalid return value (for direct segmentation) %d != %d", res, data_length);
+				}
 			}
 		}
 		while(true){}
@@ -2711,8 +2713,8 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mylisten OK");
-		while(true){
-			DEBUG("while true");
+		int client_sockets[NUM_CLIENTS];
+		for(int i=0; i<NUM_CLIENTS; i++){
 			struct sockaddr_in remote_addr;
 			remote_addr.sin_family=AF_INET;
 			int len = sizeof(struct sockaddr_in);
@@ -2721,12 +2723,18 @@ int main(){
 				myperror("myaccept");
 				exit(EXIT_FAILURE);
 			}
-			DEBUG("myaccept OK fd %d stream %d", s, fdinfo[s].sid);
-			char myread_buf[100];
-			memset(myread_buf, 0, sizeof(myread_buf));
-			int n = myread(s, myread_buf, sizeof(myread_buf));
-			DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
-			DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
+			client_sockets[i] = s;
+		}
+		while(true){
+			for(int i=0; i<NUM_CLIENTS; i++){
+				int s = client_sockets[i];
+				char myread_buf[1000];
+				memset(myread_buf, 0, sizeof(myread_buf));
+				DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
+				int n = myread(s, myread_buf, sizeof(myread_buf));
+				DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
+				DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
+			}
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
