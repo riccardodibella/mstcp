@@ -390,21 +390,6 @@ uint8_t print_buffer[1024];
 
 /* FUNCTION DEFINITIONS */
 
-int printf(const char *format, ...){
-	int cursor = 0;
-    va_list args;
-    va_start(args, format);
-    cursor += vsnprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, format, args);
-    va_end(args);
-	cursor = 0;
-	int len = strlen(print_buffer+cursor);
-	while(len > 0){
-		cursor += write(STDOUT_FILENO, print_buffer+cursor, strlen(print_buffer+cursor));
-		len = strlen(print_buffer+cursor);
-	}
-    return strlen(print_buffer+1);
-}
-
 // In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
 	printf("ERROR %.6u: ", (uint32_t) tick);
@@ -417,20 +402,12 @@ void ERROR(char* c, ...){
 }
 
 void DEBUG(char* c, ...){
-	int cursor = 0;
-	cursor += snprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, "DEBUG %.6u: ", (uint32_t) tick);
+	printf("DEBUG %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
-	cursor += vsnprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, c, args);
+	vprintf(c, args);
 	va_end(args);
-	cursor += snprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1,"\n");
-	print_buffer[sizeof(print_buffer)-1]=0;
-	cursor = 0;
-	int len = strlen(print_buffer+cursor);
-	while(len > 0){
-		cursor += write(STDOUT_FILENO, print_buffer+cursor, strlen(print_buffer+cursor));
-		len = strlen(print_buffer+cursor);
-	}
+	printf("\n");
 }
 
 // -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
@@ -2724,7 +2701,7 @@ int main(){
 			// Write some data in all of the client sockets
 			for(int i=0; i<NUM_CLIENTS; i++){
 				uint8_t data[100];
-				sprintf(data, "Client %d message %d", i, num_message);
+				sprintf(data, "Client %d message %d;", i, num_message);
 				int data_length = strlen(data);
 				int res = mywrite(client_sockets[i], data, data_length);
 				if(res != data_length){
@@ -2766,10 +2743,11 @@ int main(){
 			}
 			client_sockets[i] = s;
 		}
+		persistent_nanosleep(20, 0);
 		while(true){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
-				char myread_buf[10000];
+				char myread_buf[100000];
 				memset(myread_buf, 0, sizeof(myread_buf));
 				DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
 				int n = myread(s, myread_buf, sizeof(myread_buf));
