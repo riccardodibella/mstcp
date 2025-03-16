@@ -28,7 +28,7 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 10
-#define NUM_CLIENT_MESSAGES 10
+#define NUM_CLIENT_MESSAGES 1000
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -38,6 +38,7 @@
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
+//#define TIMER_USECS 1000000
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 16 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
@@ -385,8 +386,24 @@ uint8_t PAYLOAD_OPTIONS_TEMPLATE[] = {
 	2
 };
 
+uint8_t print_buffer[1024];
 
 /* FUNCTION DEFINITIONS */
+
+int printf(const char *format, ...){
+	int cursor = 0;
+    va_list args;
+    va_start(args, format);
+    cursor += vsnprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, format, args);
+    va_end(args);
+	cursor = 0;
+	int len = strlen(print_buffer+cursor);
+	while(len > 0){
+		cursor += write(STDOUT_FILENO, print_buffer+cursor, strlen(print_buffer+cursor));
+		len = strlen(print_buffer+cursor);
+	}
+    return strlen(print_buffer+1);
+}
 
 // In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
@@ -400,12 +417,20 @@ void ERROR(char* c, ...){
 }
 
 void DEBUG(char* c, ...){
-	printf("DEBUG %.6u: ", (uint32_t) tick);
+	int cursor = 0;
+	cursor += snprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, "DEBUG %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
-	vprintf(c, args);
+	cursor += vsnprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1, c, args);
 	va_end(args);
-	printf("\n");
+	cursor += snprintf(print_buffer+cursor, sizeof(print_buffer)-cursor-1,"\n");
+	print_buffer[sizeof(print_buffer)-1]=0;
+	cursor = 0;
+	int len = strlen(print_buffer+cursor);
+	while(len > 0){
+		cursor += write(STDOUT_FILENO, print_buffer+cursor, strlen(print_buffer+cursor));
+		len = strlen(print_buffer+cursor);
+	}
 }
 
 // -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
@@ -580,6 +605,7 @@ void acquire_handler_lock(){
 		ERROR("acquire_handler_lock global_handler_lock %d != 1", global_handler_lock);
 	}
 	global_handler_lock--;
+	//DEBUG("a");
 }
 
 void release_handler_lock(){
@@ -587,6 +613,7 @@ void release_handler_lock(){
 		ERROR("release_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
 	global_handler_lock++;
+	//DEBUG("r");
 }
 
 /* 
@@ -594,6 +621,7 @@ void release_handler_lock(){
 	until the specified time elapses 
 */
 void persistent_nanosleep(int sec, int nsec){
+	DEBUG("persistent_nanosleep %d %d start", sec, nsec);
 	struct timespec req = {sec, nsec}, rem;
 	while(nanosleep(&req, &rem)){
 		if(errno == EINTR){
@@ -603,6 +631,7 @@ void persistent_nanosleep(int sec, int nsec){
 			exit(EXIT_FAILURE);
 		}
 	}
+	DEBUG("persistent_nanosleep %d %d end", sec, nsec);
 }
 
 
@@ -2202,6 +2231,7 @@ void myio(int ignored){
 		exit(EXIT_FAILURE);
 	}
 	acquire_handler_lock();
+	//DEBUG("io");
 
 	struct pollfd fds[1];
 	fds[0].fd = unique_raw_socket_fd;
@@ -2214,11 +2244,13 @@ void myio(int ignored){
 
 	if(!(fds[0].revents & POLLIN)){
 		// There is nothing to read
+		//DEBUG("ntr");
 		release_handler_lock();
 		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 			perror("sigprocmask"); 
 			exit(EXIT_FAILURE);
 		}
+		// DEBUG("nntr");
 		return;
 	}
 
@@ -2535,12 +2567,13 @@ void myio(int ignored){
 			}
 		}
 	}//packet reception while end
-
+	//DEBUG("eio");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
+	//DEBUG("eeio");
 }
 void mytimer(int ignored){
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
@@ -2548,6 +2581,7 @@ void mytimer(int ignored){
 		exit(EXIT_FAILURE);
 	}
 	acquire_handler_lock();
+	//DEBUG("t");
 
 	tick++;
 	//DEBUG("mytimer tick %"PRIu64, tick);
@@ -2594,11 +2628,13 @@ void mytimer(int ignored){
 		}
 	}
 
+	// DEBUG("et");
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
+	//DEBUG("eet");
 }
 
 int main(){
@@ -2607,7 +2643,12 @@ int main(){
 	raw_socket_setup();
 
 	// Signal handlers association
+	// https://claude.ai/share/cead81ba-d6f2-4f36-89e2-3a2dca9515fe
 	struct sigaction action_io, action_timer;
+	memset(&action_io, 0, sizeof(action_io));
+	memset(&action_timer, 0, sizeof(action_timer));
+	action_io.sa_flags = SA_RESTART;
+	action_timer.sa_flags = SA_RESTART;
 	action_io.sa_handler = myio;
 	action_timer.sa_handler = mytimer;
 	sigaction(SIGIO, &action_io, NULL);
@@ -2621,10 +2662,10 @@ int main(){
 
 	// Create and start the periodic timer
 	struct itimerval myt;
-	myt.it_interval.tv_sec=0;				/* Interval for periodic timer */
-	myt.it_interval.tv_usec=TIMER_USECS;	/* Interval for periodic timer */
-	myt.it_value.tv_sec=0;    				/* Time until next expiration */
-	myt.it_value.tv_usec=TIMER_USECS;		/* Time until next expiration */
+	myt.it_interval.tv_sec=TIMER_USECS / 1000000;				/* Interval for periodic timer */
+	myt.it_interval.tv_usec=TIMER_USECS % 1000000;	/* Interval for periodic timer */
+	myt.it_value.tv_sec=TIMER_USECS / 1000000;    				/* Time until next expiration */
+	myt.it_value.tv_usec=TIMER_USECS % 1000000;		/* Time until next expiration */
 	if( -1 == setitimer(ITIMER_REAL, &myt, NULL)){
 		perror("setitimer"); 
 		return EXIT_FAILURE;
@@ -2728,7 +2769,7 @@ int main(){
 		while(true){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
-				char myread_buf[1000];
+				char myread_buf[10000];
 				memset(myread_buf, 0, sizeof(myread_buf));
 				DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
 				int n = myread(s, myread_buf, sizeof(myread_buf));
