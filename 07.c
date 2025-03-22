@@ -28,7 +28,7 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 10
-#define NUM_CLIENT_MESSAGES 1000
+#define NUM_CLIENT_MESSAGES 50
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -38,7 +38,6 @@
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
-//#define TIMER_USECS 1000000
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 16 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
@@ -2743,7 +2742,7 @@ int main(){
 			}
 			client_sockets[i] = s;
 		}
-		persistent_nanosleep(20, 0);
+		persistent_nanosleep(60, 0);
 		while(true){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
