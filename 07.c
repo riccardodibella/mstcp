@@ -597,7 +597,6 @@ void release_handler_lock(){
 	until the specified time elapses 
 */
 void persistent_nanosleep(int sec, int nsec){
-	DEBUG("persistent_nanosleep %d %d start", sec, nsec);
 	struct timespec req = {sec, nsec}, rem;
 	while(nanosleep(&req, &rem)){
 		if(errno == EINTR){
@@ -607,7 +606,6 @@ void persistent_nanosleep(int sec, int nsec){
 			exit(EXIT_FAILURE);
 		}
 	}
-	DEBUG("persistent_nanosleep %d %d end", sec, nsec);
 }
 
 
@@ -2507,7 +2505,7 @@ void myio(int ignored){
 						prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 					}
 				}else{
-					if(ms_option_included){
+					if(ms_option_included && !dummy_payload){
 						// Allocate a new SSN and send an ACK on the stream with the DMP flag
 						//DEBUG("TODO fix the way ACKs are generated for MS segments");
 
@@ -2527,9 +2525,6 @@ void myio(int ignored){
 						prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
 						free(dummy_payload);
 						free(opt);
-					}else{
-						// Generic ACK
-						prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 					}
 				}
 			}
