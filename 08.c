@@ -35,6 +35,8 @@
 #ifndef MAIN_MODE // Compile with -DMAIN_MODE=CLIENT or -DMAIN_MODE=SERVER
 #define MAIN_MODE CLIENT
 #endif
+#define MYREAD_MODE_BLOCKING 1
+#define MYREAD_MODE_NON_BLOCKING 2
 
 #ifdef LOCAL_SERVER
 #define SERVER_IP_STR "127.0.0.1"
@@ -337,6 +339,8 @@ struct socket_info {
 
 
 /* GLOBAL VARIABLES */
+
+int myread_mode = MYREAD_MODE_NON_BLOCKING;
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -2108,7 +2112,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
-	DEBUG("myread waiting stream %d", sid);
+	// DEBUG("myread waiting stream %d", sid);
 	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
 		/* 
 		NOTA: Questo non gestisce bene il caso in cui è presente solo un segmento nella coda, e è un segmento con LSS attivo
@@ -2125,7 +2129,17 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			free(dmp_node);
 			continue;
 		}
-		pause();
+		switch(myread_mode){
+			case MYREAD_MODE_BLOCKING:
+				pause();
+				break;
+			case MYREAD_MODE_NON_BLOCKING:
+				errno = EAGAIN;
+				return -1;
+				break;
+			default:
+				ERROR("myread invalid myread_mode %d", myread_mode);
+		}
 	}
 	// At this point there is something to consume
 	int read_consumed_bytes = 0;
@@ -2165,6 +2179,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}
 	return read_consumed_bytes;
 }
+
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
@@ -2462,11 +2477,13 @@ void myio(int ignored){
 						}
 						struct channel_rx_queue_node* cursor = newrx;
 						DEBUG("tcb->next_rx_ssn[sid %d] %d == ssn %d", sid, tcb->next_rx_ssn[sid], ssn);
-						while(cursor != NULL && tcb->next_rx_ssn[sid] == ssn){
+						int current_candidate_ssn = ssn; // Do avoid "polluting" the variable "ssn" used for newrx
+						while(cursor != NULL && tcb->next_rx_ssn[sid] == current_candidate_ssn){
 							// cursor contains an in-order segment for the stream
 							
 							// This unlinks the segments in cursor and links it to the new stream queue node
 							struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
+							DEBUG("Moving segment SID %d SSN %d from channel queue to stream queue", newrx_stream->sid, newrx_stream->ssn);
 
 							if(tcb->stream_rx_queue[sid] == NULL){
 								tcb->stream_rx_queue[sid] = newrx_stream;
@@ -2489,10 +2506,16 @@ void myio(int ignored){
 									if(cursor_ms_index>=0){
 										int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
 										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) | cursor->segment->payload[cursor_ms_index+3];
-										if(cursor_ssn == ssn){
+										if(cursor_sid == sid){
+											DEBUG("Next found for channel -> stream transfer");
+											current_candidate_ssn = cursor_ssn;
 											break;
+										}else{
+											DEBUG("Skipped SID %d SSN %d for channel -> stream transfer", cursor_sid, cursor_ssn);
 										}
 									}
+								}else{
+									DEBUG("Skipped empty node for channel -> stream transfer");
 								}
 								cursor = cursor->next;
 							}
@@ -2781,8 +2804,11 @@ int main(){
 				int s = client_sockets[i];
 				char myread_buf[100000];
 				memset(myread_buf, 0, sizeof(myread_buf));
-				DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
+				// DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
 				int n = myread(s, myread_buf, sizeof(myread_buf));
+				if(n == -1 && errno == EAGAIN){
+					continue;
+				}
 				DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
 				DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
 			}
