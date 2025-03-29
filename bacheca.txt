@@ -6,6 +6,21 @@ verificare che il flow control e la modifica della advertised window funzionino 
 lavorare sullo scheduler senza pensare al congestion control
 - Per il momento può andare bene se faccio tutto ignorando completamente possibili problemi di "Silly Window Syndrome"? Eventuali
 protezioni a riguardo si possono aggiungere dopo, giusto?
+- Dimensionamento del buffer (virtuale) di ricezione, cioè sostanzialmente della advertised window: secondo quanto avevamo detto,
+dobbiamo mettere un valore fisso "RXBUFSIZE", che corrisponde alla dimensione massima del payload non consumato nella RX queue di
+stream. Il valore deve essere fisso perchè sennò non si sa cosa impostare come valore iniziale per la creazione "unsolicited" dei
+nuovi stream successivi al primo. Successivamente non dovrebbe esserci problema ad "alzare" questo limite dopo che lo stream è
+stato creato, ma quello iniziale deve essere fisso. Una volta che il limite viene alzato non può più essere abbassato, perchè
+sennò quando si "rifiuta" un pacchetto che va oltre alla nuova advertised window ridotta non si può più fare l'ACK dei segmenti
+degli altri stream successivi a quello rifiutato. Ho capito giusto?
+- In TCP normale era facile capire se un segmento cadeva all'interno del RX buffer, perchè il sequence number corrispondeva a una
+posizione precisa (relativa all'inizio del buffer circolare). Adesso questa cosa non si può più fare: da un lato non ci interessa
+più posizionare i segmenti direttamente in un buffer perchè c'è una linked list, dall'altro però è più difficile (/impossibile)
+capire se un segmento cade dentro o fuori dalla advertised window. Per il momento sto ignorando il controllo di se i segmenti
+sono all'interno della advertised window, ma (molto più avanti) come si può fare?
+
+
+
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
