@@ -1,47 +1,15 @@
 Domande:
-- Nel TCB c'è un campo txfree (con un valore per ogni stream), questo indica lo spazio nella advertised window per
-quello stream che non è ancora stato riempito con pacchetti già in volo di cui si aspetta l'ACK, giusto? Perchè in
-mytcp è iniziaizzato con un valore fisso (TXBUFSIZE), non capisco perchè.
-- Non mi ricordo se lo avevo già chiesto, ma se MS-TCP è abilitato, ha senso usare il flag dummy payload anche per
-segmenti che non hanno l'opzione MS-TCP? O dato che senza l'opzione MS-TCP non ho bisogno di consumare un nuovo SSN
-per poterci fare l'ACK e quindi non mi serve mai il flag DMP? E' solo per capire dove mettere il controllo per quel
-flag, se farlo anche per segmenti di una connessione con MS-TCP abilitato ma senza l'opzione MS-TCP all'interno
+- Anche per quanto riguarda TCP normale (non solo multi-stream), gli ACK che non hanno nessun payload vanno ritrasmessi se il
+loro timer di ritrasmissione scade?
+- Ha senso inizialmente tenere una dimensione del "buffer" (virtuale, in realtà è una linked list) di ricezione molto bassa per
+verificare che il flow control e la modifica della advertised window funzionino correttamente? In questo modo posso iniziare a
+lavorare sullo scheduler senza pensare al congestion control
+- Per il momento può andare bene se faccio tutto ignorando completamente possibili problemi di "Silly Window Syndrome"? Eventuali
+protezioni a riguardo si possono aggiungere dopo, giusto?
 
-- Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
-analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
-Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
-c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effettivamente per la dimensione di
-un buffer, solo per inizializzare il campo txfree dei TCB.
-- Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
+- [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
-- Non ho ancora iniziato a fare la parte di ricezione, ma vorrei capire se è giusto come penso di impostarla:
-    - nel paper viene messo solo un buffer di trasmissione (consumato dallo scheduler), non un buffer di ricezione
-    in cui inserire i dati quando arrivano. A seconda di se si voglia aggiungere questo buffer di ricezione o meno
-    ci sono due casi possibili:
-    - se si vuole aggiungere il buffer di ricezione: 
-        - c'è un buffer di ricezione diverso per ogni stream
-        - dato che il flusso dei seq number è associato alla connessione intera, non posso usare quello per inserire
-        "a colpo sicuro" i dati nel buffer di ricezione
-        - se arriva un segmento con un SSN immediatamente successivo all'ultimo ricevuto, lo aggiungo all'inizio dello
-        spazio libero nel buffer dello stream
-        - se un segmento ha il flag dummy payload, non lo aggiungo mai al buffer
-        - in questo caso, la advertised window è uguale allo spazio libero nel buffer per lo stream
-    - se non si vuole mettere il buffer in ricezione:
-        - c'è una linked list per il canale, che contiene i pacchetti ricevuti out-of-order, in cui rimangono fino a
-        che il buco nel sequence number non viene riempito da un altro segmento
-        - c'è una linked list per ogni stream, con i segmenti per quello stream il cui payload deve ancora essere
-        consumato completamente
-        - quando arriva un nuovo segmento, oltre a inserirlo nella linked list di canale, se il suo SSN è immediatamente
-        successivo all'ultimo ricevuto per quello stream, lo inserisco alla fine della linked list di stream, con NULL
-        come nodo successivo
-        - dopo avere inserito un nodo (per la sua ricezione o per un segmento precedente che ha riempito il buco degli SSN)
-        nella linked list di stream, percorro la linked list di canale per cercare il primo segmento per lo stesso stream;
-        se il SSN è immediatamente successivo a quello appena inserito inserisco anche quel segmento, e ripeto la procedura
-        fino a che il primo segmento non è immediatamente successivo o arrivo alla fine della channel rx linked list senza
-        trovare altri segmenti sullo stream
-        - ogni nodo della linked list di stream (che contengono il payload dei segmenti) ha un campo che mi dice quanti byte
-        di payload ho già consumato con read(), quando questo valore arriva alla lunghezza del payload del segmento lo tolgo
-        dalla lista, e tolgo dalla lista anche i segmenti all'inizio che hanno il flag dummy payload
+
 
 
 
@@ -118,6 +86,52 @@ buffer per quello stream? E devo anche salvare in quale posizione inserirlo, per
 sequenza del segmento e l'offset iniziale per determinare la posizione nel buffer in cui scrivere il nuovo dato
     => Aggiungere solo il numero del prossimo segmento da aggiungere alla linked list di stream, dato che non esiste un
     buffer circolare in cui sono inseriti i numeri dei payload non serve l'indice della prossima posizione in cui scrivere
+- Nel TCB c'è un campo txfree (con un valore per ogni stream), questo indica lo spazio nella advertised window per
+quello stream che non è ancora stato riempito con pacchetti già in volo di cui si aspetta l'ACK, giusto? Perchè in
+mytcp è iniziaizzato con un valore fisso (TXBUFSIZE), non capisco perchè.
+    => 29/03 non mi ricordo se mi ha risposto o no, in teoria l'inizializzazione a TXBUFSIZE dovrebbe essere sbagliata
+- Non mi ricordo se lo avevo già chiesto, ma se MS-TCP è abilitato, ha senso usare il flag dummy payload anche per
+segmenti che non hanno l'opzione MS-TCP? O dato che senza l'opzione MS-TCP non ho bisogno di consumare un nuovo SSN
+per poterci fare l'ACK e quindi non mi serve mai il flag DMP? E' solo per capire dove mettere il controllo per quel
+flag, se farlo anche per segmenti di una connessione con MS-TCP abilitato ma senza l'opzione MS-TCP all'interno
+    => 29/03 non ricordo da dove uscisse questo dubbio, ma non ha senso usare DMP per pacchetti che non consumano SSN
+- Non ho ancora iniziato a fare la parte di ricezione, ma vorrei capire se è giusto come penso di impostarla:
+    - nel paper viene messo solo un buffer di trasmissione (consumato dallo scheduler), non un buffer di ricezione
+    in cui inserire i dati quando arrivano. A seconda di se si voglia aggiungere questo buffer di ricezione o meno
+    ci sono due casi possibili:
+    - se si vuole aggiungere il buffer di ricezione: 
+        - c'è un buffer di ricezione diverso per ogni stream
+        - dato che il flusso dei seq number è associato alla connessione intera, non posso usare quello per inserire
+        "a colpo sicuro" i dati nel buffer di ricezione
+        - se arriva un segmento con un SSN immediatamente successivo all'ultimo ricevuto, lo aggiungo all'inizio dello
+        spazio libero nel buffer dello stream
+        - se un segmento ha il flag dummy payload, non lo aggiungo mai al buffer
+        - in questo caso, la advertised window è uguale allo spazio libero nel buffer per lo stream
+    - se non si vuole mettere il buffer in ricezione:
+        - c'è una linked list per il canale, che contiene i pacchetti ricevuti out-of-order, in cui rimangono fino a
+        che il buco nel sequence number non viene riempito da un altro segmento
+        - c'è una linked list per ogni stream, con i segmenti per quello stream il cui payload deve ancora essere
+        consumato completamente
+        - quando arriva un nuovo segmento, oltre a inserirlo nella linked list di canale, se il suo SSN è immediatamente
+        successivo all'ultimo ricevuto per quello stream, lo inserisco alla fine della linked list di stream, con NULL
+        come nodo successivo
+        - dopo avere inserito un nodo (per la sua ricezione o per un segmento precedente che ha riempito il buco degli SSN)
+        nella linked list di stream, percorro la linked list di canale per cercare il primo segmento per lo stesso stream;
+        se il SSN è immediatamente successivo a quello appena inserito inserisco anche quel segmento, e ripeto la procedura
+        fino a che il primo segmento non è immediatamente successivo o arrivo alla fine della channel rx linked list senza
+        trovare altri segmenti sullo stream
+        - ogni nodo della linked list di stream (che contengono il payload dei segmenti) ha un campo che mi dice quanti byte
+        di payload ho già consumato con read(), quando questo valore arriva alla lunghezza del payload del segmento lo tolgo
+        dalla lista, e tolgo dalla lista anche i segmenti all'inizio che hanno il flag dummy payload
+    => Non esiste il "buffer" di ricezione, c'è una linked list di canale unica, e poi una linked list per ogni stream
+- Abbiamo detto che ha senso introdurre un buffer di trasmissione, da cui i dati vengono consumati da qualcosa di
+analogo allo scheduler del Multi-Stream (ma più semplice), anche per TCP normale. Come dimensiono questo buffer?
+Metto una dimensione fissa uguale per TX buffer e RX buffer per ogni stream o faccio qualcosa di diverso? Prima
+c'erano i due parametri TXBUFSIZE e RXBUFSIZE, ma il primo non veniva usato effettivamente per la dimensione di
+un buffer, solo per inizializzare il campo txfree dei TCB.
+    => 29/03 Per il momento TCP normale lo sto lasciando da parte quindi il problema non si pone
+
+
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
