@@ -27,8 +27,8 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 10
-#define NUM_CLIENT_MESSAGES 50
+#define NUM_CLIENTS 2
+#define NUM_CLIENT_MESSAGES 100
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -36,8 +36,13 @@
 #define MAIN_MODE CLIENT
 #endif
 
-#define INTERFACE_NAME "eth0" // load_ifconfig
+#ifdef LOCAL_SERVER
+#define SERVER_IP_STR "127.0.0.1"
+#else
 #define SERVER_IP_STR "172.104.237.69"
+#endif
+
+#define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 16 // File descriptors go from 3 (included) up to this value (excluded)
@@ -845,8 +850,10 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
-	// DEBUG("Outgoing send_ip packet:");
-	// print_l2_packet(packet);
+
+	DEBUG("Outgoing send_ip packet:");
+	print_l2_packet(packet);
+
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		perror("send_ip sendto failed"); 
@@ -2187,7 +2194,7 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 	while(cursor != NULL){
 		int sid = -1, ssn = -1;
 		bool ms_option_included = false;
-		if(tcb->ms_option_enabled){
+		if(tcb->ms_option_enabled && cursor->segment != NULL){
 			int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
 			if(ms_index >= 0){
 				sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
@@ -2285,6 +2292,8 @@ void myio(int ignored){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
+			DEBUG("Incoming myio tcp packet:");
+			print_l2_packet(l2_rx_buf);
 
 			//DEBUG("Incoming TCP segment:");
 			//print_tcp_segment(tcp);
@@ -2395,6 +2404,7 @@ void myio(int ignored){
 				}
 
 				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
+				DEBUG("channel_offset = %u (ntohl(seq) = %u ; ack_offs = %u)", channel_offset,  ntohl(tcp->seq), tcb->ack_offs);
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
@@ -2403,24 +2413,36 @@ void myio(int ignored){
 					struct channel_rx_queue_node* newrx = NULL;
 					if(tcb->unack == NULL){
 						// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
+						DEBUG("Insertion in at the beginning of empty unack queue");
 						tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
 					}else{
 						// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
 						struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
-						while(cursor != NULL && cursor->channel_offset > channel_offset){
+						while(cursor != NULL && cursor->channel_offset < channel_offset){
 							prev = cursor;
 							cursor = cursor->next;
 						}
-						// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
-						if(cursor->channel_offset != channel_offset){
-							// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
-							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
-							if(prev == NULL){
-								// Insertion at the beginning of the queue
-								tcb->unack = newrx;
+						if(cursor == NULL){
+							// We traversed the whole queue without finding any segment with a higher channel offset: insert the new one at the end of the queue
+							DEBUG("Insertion at the end of the queue");
+							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
+							prev->next = newrx;
+						}else{
+							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
+							if(cursor->channel_offset != channel_offset){
+								// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
+								newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
+								if(prev == NULL){
+									// Insertion at the beginning of the queue
+									DEBUG("Insertion at the beginning of the queue");
+									tcb->unack = newrx;
+								}else{
+									// Insertion in the middle (or at the end) of the queue
+									DEBUG("Insertion in the middle (or at the end) of the queue");
+									prev->next = newrx;
+								}
 							}else{
-								// Insertion in the middle (or at the end) of the queue
-								prev->next = newrx;
+								// Duplicate of an out-of-order packet (ignored)
 							}
 						}
 					}
@@ -2478,13 +2500,15 @@ void myio(int ignored){
 						}
 
 						// Removal of in-order segments at the beginning of the channel RX queue
+						DEBUG("Initial channel RX queue:");
+						print_rx_queue(tcb);
 						while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
 							if(tcb->unack->segment != NULL){
 								DEBUG("Last received packet before error:");
 								print_l2_packet(l2_rx_buf);
-								DEBUG("unack channel_offset: %d", tcb->unack->channel_offset);
+								DEBUG("unack channel_offset: %u", tcb->unack->channel_offset);
 								DEBUG("unack payload length %d", tcb->unack->payload_length);
-								DEBUG("newrx channel_offset: %d", newrx->channel_offset);
+								DEBUG("newrx channel_offset: %u", newrx->channel_offset);
 								DEBUG("newrx payload length %d", newrx->payload_length);
 								ERROR("in-order segment not consumed from channel queue");
 							}
@@ -2494,6 +2518,7 @@ void myio(int ignored){
 							tcb->unack = next;
 
 							DEBUG("something removed from rx queue");
+							DEBUG("Queue after removal:");
 							print_rx_queue(tcb);
 						}
 					}
@@ -2506,26 +2531,36 @@ void myio(int ignored){
 						prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 					}
 				}else{
-					if(ms_option_included && !dummy_payload){
-						// Allocate a new SSN and send an ACK on the stream with the DMP flag
-						//DEBUG("TODO fix the way ACKs are generated for MS segments");
+					if(ms_option_included){
+						if(!dummy_payload){
+							// Allocate a new SSN and send an ACK on the stream with the DMP flag
+							//DEBUG("TODO fix the way ACKs are generated for MS segments");
 
-						int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-						uint8_t* opt = malloc(optlen);
-						memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-						
-						// Stream update
-						opt[2] = sid<<2;
-						opt[3] = tcb->next_ssn[sid];
-						DEBUG("Generating ACK sid %d ssn %d", sid, tcb->next_ssn[sid]);
-						tcb->next_ssn[sid]++;
-						DEBUG("new SSN for sid %d: %d", sid, tcb->next_ssn[sid]);
+							int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+							uint8_t* opt = malloc(optlen);
+							memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+							
+							// Stream update
+							opt[2] = sid<<2;
+							opt[3] = tcb->next_ssn[sid];
+							DEBUG("Generating ACK sid %d ssn %d", sid, tcb->next_ssn[sid]);
+							tcb->next_ssn[sid]++;
+							DEBUG("new SSN for sid %d: %d", sid, tcb->next_ssn[sid]);
 
-						uint8_t* dummy_payload = malloc(1); // value doesn't matter
+							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-						prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
-						free(dummy_payload);
-						free(opt);
+							prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
+							free(dummy_payload);
+							free(opt);
+						}else{
+							DEBUG("Generating non-MS ACK for incoming DMP segment");
+							// Generic ACK
+							prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+						}
+					}else{
+						DEBUG("Unexpected packet with payload but no MSTCP option:");
+						print_l2_packet(l2_rx_buf);
+						ERROR("Should we generate an ACK for this packet?");
 					}
 				}
 			}
@@ -2593,6 +2628,7 @@ void mytimer(int ignored){
 			txcb->retry++;
 
 			update_tcp_header(i, txcb);
+			DEBUG("Segment RETX");
 			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
 
 			acc += txcb->totlen;
@@ -2739,7 +2775,7 @@ int main(){
 			}
 			client_sockets[i] = s;
 		}
-		persistent_nanosleep(60, 0);
+		// persistent_nanosleep(60, 0);
 		while(true){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
