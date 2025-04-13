@@ -7,15 +7,9 @@ sono all'interno della advertised window, ma (molto più avanti) come si può fa
 - Gestione del flag DMP per la advertised window: Al ricevitore non viene contato il fatto che usano spazio (quindi quando vengono
 ACKed il loro payload non viene contato come "spazio occupato"), però il trasmettitore lì conta comunque come spazio occupato (1 byte)
 all'interno della window che è in-flight. Ho capito giusto? Devo fare attenzione a qualcos'altro?
-- La advertised window (proprietà di stream) va calcolata basandosi sul cumulative ACK (proprietà di canale). Questo è un
-problema perchè la mia intenzione era quella di aggiornare la advertised window ogni volta che prendevo un segmento e lo spostavo dalla
-RX queue di canale alla RX queue di stream, e ogni volta che consumo qualcosa dalla RX queue di stream. Però non posso fare così (o almeno
-non solo), perchè il valore della advertised window cambia anche ogni volta che il cumulative ack "passa oltre" uno dei segmenti trasmessi
-per quello stream. Secondo me ci sono due alternative: o salvare un valore della advertised window da mettere direttamente nei segmenti di
-ogni stream, però vanno aggiornati i valori per tutti gli stream aperti ogni volta che cumulativeack avanza, oppure si potrebbe ricalcolare
-ogni volta facendo la differenza tra il valore "massimo" (RX_VIRTUAL_BUFFER_SIZE) e lo riempimento del buffer virtuale calcolato scorrendo
-tutta la coda di segmenti pronti da essere consumati, considerando solo quelli che hanno un sequence number più basso di cumulativeack (con
-riferimento all'offset iniziale). 
+- Probabilmente è una domanda stupida, ma a cosa serve precisamente il controllo fdinfo[s].tcb->st == TCB_ST_CLOSED in mywrite? Anche
+perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei controllare lo stato dello stream, non del TCB, giusto?
+- La advertised window ricevuta va aggiornata ogni volta che il cumulative ack avanza oltre un segmento di uno stream, giusto?
 
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
@@ -159,6 +153,18 @@ stato creato, ma quello iniziale deve essere fisso. Una volta che il limite vien
 sennò quando si "rifiuta" un pacchetto che va oltre alla nuova advertised window ridotta non si può più fare l'ACK dei segmenti
 degli altri stream successivi a quello rifiutato. Ho capito giusto?
     => Sì, con MS-TCP va disabilitata la possibilità di abbassare la advertised window per evitare questo genere di mal di testa
+- La advertised window (proprietà di stream) va calcolata basandosi sul cumulative ACK (proprietà di canale). Questo è un
+problema perchè la mia intenzione era quella di aggiornare la advertised window ogni volta che prendevo un segmento e lo spostavo dalla
+RX queue di canale alla RX queue di stream, e ogni volta che consumo qualcosa dalla RX queue di stream. Però non posso fare così (o almeno
+non solo), perchè il valore della advertised window cambia anche ogni volta che il cumulative ack "passa oltre" uno dei segmenti trasmessi
+per quello stream. Secondo me ci sono due alternative: o salvare un valore della advertised window da mettere direttamente nei segmenti di
+ogni stream, però vanno aggiornati i valori per tutti gli stream aperti ogni volta che cumulativeack avanza, oppure si potrebbe ricalcolare
+ogni volta facendo la differenza tra il valore "massimo" (RX_VIRTUAL_BUFFER_SIZE) e lo riempimento del buffer virtuale calcolato scorrendo
+tutta la coda di segmenti pronti da essere consumati, considerando solo quelli che hanno un sequence number più basso di cumulativeack (con
+riferimento all'offset iniziale). 
+    => Dovrebbe andare bene salvarla nel tcb e cambiarla ogni volta che serve
+
+
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento

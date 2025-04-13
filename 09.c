@@ -37,6 +37,8 @@
 #endif
 #define MYREAD_MODE_BLOCKING 1
 #define MYREAD_MODE_NON_BLOCKING 2
+#define MYWRITE_MODE_BLOCKING 1
+#define MYWRITE_MODE_NON_BLOCKING 2
 
 #ifdef LOCAL_SERVER
 #define SERVER_IP_STR "127.0.0.1"
@@ -345,6 +347,7 @@ struct socket_info {
 /* GLOBAL VARIABLES */
 
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
+int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -2051,8 +2054,8 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	ERROR("myaccept something went very wrong, you should never reach after the do while"); // pause always returns -1
 }
 
-int mywrite(int s, uint8_t * buffer, int maxlen){
-	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
+int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
+	DEBUG("mywrite_direct_segmentation s %d data |%s| maxlen %d", s, buffer, maxlen);
 	// Direct segmentation mywrite
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
 		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
@@ -2110,6 +2113,57 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		ERROR("invalid start_byte_number at end of mywrite with direct segmentation");
 	}
 	return start_byte_number;
+}
+
+int mywrite(int s, uint8_t * buffer, int maxlen){
+	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
+		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
+	}
+	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
+		myerrno = EINVAL;
+		return -1;
+	}
+	// TODO bisognerebbe aggiungere un controllo sullo stato dello stream (?)
+	if(maxlen < 0){
+		ERROR("mywrite invalid maxlen %d");
+	}
+	if(maxlen == 0){
+		return 0;
+	}
+	int sid = fdinfo[s].sid;
+	int actual_len;
+	if(mywrite_mode == MYWRITE_MODE_NON_BLOCKING){
+		if(fdinfo[s].tcb->txfree[sid] == 0){
+			errno = EAGAIN;
+			return -1;
+		}
+		actual_len = MIN(maxlen,fdinfo[s].tcb->txfree[sid]);
+	}else{
+		do{
+			actual_len = MIN(maxlen,fdinfo[s].tcb->txfree[sid]);
+			if ((actual_len !=0) || (fdinfo[s].tcb->st == TCB_ST_CLOSED)) break;
+		}while(pause());
+	}
+	
+
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+	for(int byte_num = 0; byte_num < actual_len; byte_num++){
+		fdinfo[s].tcb->stream_tx_buffer[fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
+		fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] = (fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] + 1) % TX_BUFFER_SIZE;
+		fdinfo[s].tcb->txfree[sid]--;
+	}
+	// TODO call the scheduler
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	return actual_len;
 }
 
 int myread(int s, unsigned char *buffer, int maxlen){
