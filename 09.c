@@ -355,7 +355,7 @@ unsigned char mask[4];
 unsigned char gateway[4];
 
 /* TXBUFSIZE and INIT_TIMEOUT may be modified at program startup */
-int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
+//int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
 // int INIT_TIMEOUT = 300*1000; // #define INIT_TIMEOUT (((g_argc<4) ?(300*1000):(atoi(g_argv[3])*1000))/TIMER_USECS)
 int INIT_TIMEOUT = MAXTIMEOUT;
 
@@ -1109,6 +1109,80 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 	return to_return;
 }
+
+
+
+
+void direct_segmentation_scheduler(int s){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("direct_segmentation_scheduler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("direct_segmentation_scheduler tcb NULL");
+	}
+	DEBUG("direct_segmentation_scheduler start");
+	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
+	uint8_t* temp_payload_buf = malloc(max_payload_length);
+	for(int sid = 0; sid < TOT_SID; sid++){
+		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
+			// We can transmit some more data on the stream
+			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
+			DEBUG("Stream %d: available_bytes = %d", sid, available_bytes);
+			while(available_bytes > 0){
+				int payload_length = MIN(available_bytes, max_payload_length);
+				for(int i=0; i<payload_length; i++){
+					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
+					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
+					tcb->txfree[sid]++;
+					available_bytes--;
+				}
+				if(!tcb->ms_option_enabled){
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}else{
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
+					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
+					DEBUG("Packet inserted in TX queue (sid %d ssn %d) - payload length %d", sid, tcb->next_ssn[sid], payload_length);
+		
+					tcb->next_ssn[sid]++;
+					DEBUG("new next_ssn for stream %d: %d", sid, tcb->next_ssn[sid]);
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
+					free(opt);
+				}
+			}
+		}
+	}
+	free(temp_payload_buf);
+	DEBUG("direct_segmentation_scheduler end");
+}
+
+// Abstract scheduler stub to call one of the different scheduler implementations
+void scheduler(int s){
+	/*
+	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	acquire_handler_lock();
+	*/
+
+	direct_segmentation_scheduler(s);
+
+	/*
+	release_handler_lock();
+	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+		perror("sigprocmask"); 
+		exit(EXIT_FAILURE);
+	}
+	*/
+}
+
+
 
 
 
@@ -2146,18 +2220,18 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		}while(pause());
 	}
 	
-
+	DEBUG("mywrite actual_len %d", actual_len);
 	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 
 		exit(EXIT_FAILURE);
 	}
 	acquire_handler_lock();
 	for(int byte_num = 0; byte_num < actual_len; byte_num++){
-		fdinfo[s].tcb->stream_tx_buffer[fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
+		fdinfo[s].tcb->stream_tx_buffer[sid][fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
 		fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] = (fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] + 1) % TX_BUFFER_SIZE;
 		fdinfo[s].tcb->txfree[sid]--;
 	}
-	// TODO call the scheduler
+	scheduler(s);
 	release_handler_lock();
 	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
 		perror("sigprocmask"); 

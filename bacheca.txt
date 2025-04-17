@@ -10,7 +10,10 @@ all'interno della window che è in-flight. Ho capito giusto? Devo fare attenzion
 - Probabilmente è una domanda stupida, ma a cosa serve precisamente il controllo fdinfo[s].tcb->st == TCB_ST_CLOSED in mywrite? Anche
 perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei controllare lo stato dello stream, non del TCB, giusto?
 - La advertised window ricevuta va aggiornata ogni volta che il cumulative ack avanza oltre un segmento di uno stream, giusto?
-
+- Dovrei avere sempre i segnali bloccati quando eseguo lo scheduler, giusto?
+- E' giusto che io pensi allo scheduler in principio come una funzione stateless, da chiamare ogni volta che c'è la possibilità di
+poter forse trasmettere qualcosa di nuovo, e lui valuta lo stato del TCB per capire cosa fare? Quindi le chiamate dovrebbero essere
+idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente (a parte sprecare tempo)
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
