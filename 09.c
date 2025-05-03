@@ -221,6 +221,7 @@ struct channel_rx_queue_node{
 	uint32_t channel_offset; // sequence number - tcb->ack_offs
 	int total_segment_length;
 	int payload_length;
+	int sid;
 	struct tcp_segment* segment;
 };
 struct stream_rx_queue_node{
@@ -1045,10 +1046,17 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	if(ip == NULL || tcp == NULL){
 		ERROR("create_channel_rx_queue_node unexpected NULL parameter");
 	}
+	int sid = 0;
+	int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(ms_index >= 0){
+		sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+	}
+
 	struct channel_rx_queue_node* to_return = malloc(sizeof(struct channel_rx_queue_node));
 	to_return->next = next;
 	to_return->channel_offset = channel_offset;
 	to_return->total_segment_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4;
+	to_return->sid = sid;
 	to_return->payload_length = to_return->total_segment_length - (tcp->d_offs_res>>4)*4;
 	if(to_return->payload_length <= 0 || to_return->total_segment_length <= 0){
 		/* 
@@ -2272,6 +2280,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+			tcb->adwin[sid] += dmp_node->payload_length;
 			DEBUG("Removed DMP node from stream %d rx queue", sid);
 			free(dmp_node->segment);
 			free(dmp_node);
@@ -2300,7 +2309,8 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		if(tcb->stream_rx_queue[sid]->dummy_payload){
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
-
+			tcb->adwin[sid] += dmp_node->payload_length;
+			DEBUG("Removed DMP node from stream %d rx queue", sid);
 			// free dmp_node and its segment
 			free(dmp_node->segment);
 			free(dmp_node);
@@ -2314,6 +2324,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		memcpy(buffer + read_consumed_bytes, tcb->stream_rx_queue[sid]->segment->payload + ((tcb->stream_rx_queue[sid]->segment->d_offs_res>>4)*4-20), current_segment_read_bytes);
 
 		read_consumed_bytes += current_segment_read_bytes;
+		tcb->adwin[sid] += current_segment_read_bytes;
 		tcb->stream_rx_queue[sid]->consumed_bytes += current_segment_read_bytes;
 		if(!lss && tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length){
 			// Segment fully consumed: remove it from the stream rx queue
@@ -2590,6 +2601,9 @@ void myio(int ignored){
 							DEBUG("Insertion at the end of the queue");
 							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
 							prev->next = newrx;
+
+							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
+							tcb->radwin[sid] = htons(tcp->window);
 						}else{
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
@@ -2684,6 +2698,10 @@ void myio(int ignored){
 								ERROR("in-order segment not consumed from channel queue");
 							}
 							tcb->cumulativeack += tcb->unack->payload_length;
+							if(tcb->unack->channel_offset != channel_offset){
+								// We don't advance radwin if we go past the segment that we just received
+								tcb->radwin[tcb->unack->sid] -= tcb->unack->payload_length;
+							}
 							struct channel_rx_queue_node* next = tcb->unack->next;
 							free(tcb->unack);
 							tcb->unack = next;
@@ -2695,7 +2713,6 @@ void myio(int ignored){
 					}
 				}
 
-				// TODO do we have to generate an ACK even if the received segment had payload size = 0?
 				if(!tcb->ms_option_enabled){
 					if(tcb->txfirst==NULL){
 						// Generate an ACK without MS Option

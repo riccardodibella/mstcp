@@ -14,6 +14,9 @@ perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei co
 - E' giusto che io pensi allo scheduler in principio come una funzione stateless, da chiamare ogni volta che c'è la possibilità di
 poter forse trasmettere qualcosa di nuovo, e lui valuta lo stato del TCB per capire cosa fare? Quindi le chiamate dovrebbero essere
 idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente (a parte sprecare tempo)
+- Penso di sì, ma per sicurezza chiedo... Se consumo metà del payload di un segmento nella RX queue di stream, devo aumentare la
+adwin per quello stream del numero di byte che ho consumato, anche se non ho ancora liberato la memoria per quel segmento (che ha
+ancora dei byte da consumare) giusto?
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
