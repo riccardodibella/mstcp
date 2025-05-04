@@ -53,7 +53,7 @@
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 0x1000
+#define RX_VIRTUAL_BUFFER_SIZE 100
 #define TX_BUFFER_SIZE 64000
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
@@ -466,6 +466,7 @@ void print_tcp_segment(struct tcp_segment* tcp){
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
 	printf("SEQ %u ACK %u\n", htonl(tcp->seq), htonl(tcp->ack));
+	printf("WINDOW: %u\n", htons(tcp->window));
 	printf("FLAGS: ");
 	/*
 	#define FIN 0x001
@@ -1162,6 +1163,7 @@ void direct_segmentation_scheduler(int s){
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
 				}
+				DEBUG("Segment in stream %d added to channel tx queue (payload_length %d)", sid, payload_length);
 			}
 		}
 	}
@@ -1169,25 +1171,72 @@ void direct_segmentation_scheduler(int s){
 	DEBUG("direct_segmentation_scheduler end");
 }
 
+void flow_controlled_scheduler(int s){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("flow_controlled_scheduler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("flow_controlled_scheduler tcb NULL");
+	}
+	DEBUG("flow_controlled_scheduler start");
+	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
+	uint8_t* temp_payload_buf = malloc(max_payload_length);
+	for(int sid = 0; sid < TOT_SID; sid++){
+		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
+			// We can transmit some more data on the stream
+			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
+
+			/* FLOW CONTROL START */
+			int in_flight_bytes = 0;
+			struct txcontrolbuf* tx_cursor = tcb->txfirst;
+			while(tx_cursor != NULL){
+				if(tx_cursor->sid == sid){
+					in_flight_bytes += tx_cursor->payloadlen;
+				}
+				tx_cursor = tx_cursor->next;
+			}
+			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Could be negative if there are some DMP segments beyond the radwin limit
+			available_bytes = MIN(available_bytes, MAX(flow_control_allowed_bytes, 0));
+			/* FLOW CONTROL END */
+
+			DEBUG("Stream %d: available_bytes = %d (radwin %d in_flight_bytes %d flow_control_allowed_bytes %d)", sid, available_bytes, tcb->radwin[sid], in_flight_bytes, flow_control_allowed_bytes);
+			while(available_bytes > 0){
+				int payload_length = MIN(available_bytes, max_payload_length);
+				for(int i=0; i<payload_length; i++){
+					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
+					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
+					tcb->txfree[sid]++;
+					available_bytes--;
+				}
+				if(!tcb->ms_option_enabled){
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}else{
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
+					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
+					DEBUG("Packet inserted in TX queue (sid %d ssn %d) - payload length %d", sid, tcb->next_ssn[sid], payload_length);
+		
+					tcb->next_ssn[sid]++;
+					DEBUG("new next_ssn for stream %d: %d", sid, tcb->next_ssn[sid]);
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
+					free(opt);
+				}
+			}
+		}
+	}
+	free(temp_payload_buf);
+	DEBUG("flow_controlled_scheduler end");
+}
+
 // Abstract scheduler stub to call one of the different scheduler implementations
-void scheduler(int s){
-	/*
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	acquire_handler_lock();
-	*/
-
-	direct_segmentation_scheduler(s);
-
-	/*
-	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	*/
+void scheduler(int s /* socket fd */){
+	//direct_segmentation_scheduler(s);
+	flow_controlled_scheduler(s);
 }
 
 
@@ -1778,6 +1827,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->timeout = INIT_TIMEOUT;
 				tcb->txfirst = tcb->txlast = NULL;
 
+				tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
+
+				fdinfo[s].sid = 0; // We use stream 0 to open the connection
+
 				uint8_t* opt_ptr = NULL;
 				int opt_len;
 				if(tcb->ms_option_enabled){
@@ -1873,7 +1926,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					backlog_tcb->stream_state[0] = STREAM_STATE_READY;
 					backlog_tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
 					backlog_tcb->stream_rx_queue[0] = NULL;
-					backlog_tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
+					//backlog_tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
 					backlog_tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
 					backlog_tcb->txfree[0] = TX_BUFFER_SIZE;
 					backlog_tcb->tx_buffer_occupied_region_start[0] = backlog_tcb->tx_buffer_occupied_region_end[0] = 0;
@@ -1903,6 +1956,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->st = TCB_ST_LISTEN;
 					fdinfo[s].tcb->is_active_side = false;
 					fdinfo[s].tcb->listening_fd = s;
+					fdinfo[s].sid = SID_UNASSIGNED; // Go back from stream 0 (used to open the incoming connection) to unassigned
 				}
 			}
 			break;
@@ -2699,8 +2753,8 @@ void myio(int ignored){
 							}
 							tcb->cumulativeack += tcb->unack->payload_length;
 							if(tcb->unack->channel_offset != channel_offset){
-								// We don't advance radwin if we go past the segment that we just received
-								tcb->radwin[tcb->unack->sid] -= tcb->unack->payload_length;
+								// We don't advance adwin if we go past the segment that we just received
+								tcb->adwin[tcb->unack->sid] -= tcb->unack->payload_length;
 							}
 							struct channel_rx_queue_node* next = tcb->unack->next;
 							free(tcb->unack);
@@ -2760,6 +2814,8 @@ void myio(int ignored){
 			if((segment_ts_val - tcb->ts_offset) >= (tcb->ts_recent - tcb->ts_offset) && (segment_seq - tcb->ack_offs) <= tcb->cumulativeack){
 				tcb->ts_recent = segment_ts_val;
 			}
+
+			scheduler(i);
 		}
 	}//packet reception while end
 	//DEBUG("eio");
@@ -2995,6 +3051,7 @@ int main(){
 				DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
 				DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
 			}
+			persistent_nanosleep(30, 0);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);

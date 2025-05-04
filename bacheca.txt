@@ -17,6 +17,11 @@ idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente 
 - Penso di sì, ma per sicurezza chiedo... Se consumo metà del payload di un segmento nella RX queue di stream, devo aumentare la
 adwin per quello stream del numero di byte che ho consumato, anche se non ho ancora liberato la memoria per quel segmento (che ha
 ancora dei byte da consumare) giusto?
+- A rigore, dato che li sto considerando per la adwin in ricezione, dovrei contare che i pacchetti con flag DMP occupano un byte
+nella window anche al trasmettitore, giusto? In questo caso però, se devo mandare un ACK DMP potrei andare oltre la adwin del
+ricevitore, quindi forse serve prevedere un po' di margine garantito per permettere lo scambio di segmenti DMP anche quando la
+finestra è satura. Poter mandare segmenti DMP è necessario, perchè non si possono mandare aggiornamenti della advertised window 
+senza specificare lo stream, e se non ci sono dati in uscita serve per forza il flag DMP
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
