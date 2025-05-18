@@ -1,27 +1,7 @@
 Domande:
-- In TCP normale era facile capire se un segmento cadeva all'interno del RX buffer, perchè il sequence number corrispondeva a una
-posizione precisa (relativa all'inizio del buffer circolare). Adesso questa cosa non si può più fare: da un lato non ci interessa
-più posizionare i segmenti direttamente in un buffer perchè c'è una linked list, dall'altro però è più difficile (/impossibile)
-capire se un segmento cade dentro o fuori dalla advertised window. Per il momento sto ignorando il controllo di se i segmenti
-sono all'interno della advertised window, ma (molto più avanti) come si può fare?
-- Gestione del flag DMP per la advertised window: Al ricevitore non viene contato il fatto che usano spazio (quindi quando vengono
-ACKed il loro payload non viene contato come "spazio occupato"), però il trasmettitore lì conta comunque come spazio occupato (1 byte)
-all'interno della window che è in-flight. Ho capito giusto? Devo fare attenzione a qualcos'altro?
 - Probabilmente è una domanda stupida, ma a cosa serve precisamente il controllo fdinfo[s].tcb->st == TCB_ST_CLOSED in mywrite? Anche
 perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei controllare lo stato dello stream, non del TCB, giusto?
-- La advertised window ricevuta va aggiornata ogni volta che il cumulative ack avanza oltre un segmento di uno stream, giusto?
 - Dovrei avere sempre i segnali bloccati quando eseguo lo scheduler, giusto?
-- E' giusto che io pensi allo scheduler in principio come una funzione stateless, da chiamare ogni volta che c'è la possibilità di
-poter forse trasmettere qualcosa di nuovo, e lui valuta lo stato del TCB per capire cosa fare? Quindi le chiamate dovrebbero essere
-idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente (a parte sprecare tempo)
-- Penso di sì, ma per sicurezza chiedo... Se consumo metà del payload di un segmento nella RX queue di stream, devo aumentare la
-adwin per quello stream del numero di byte che ho consumato, anche se non ho ancora liberato la memoria per quel segmento (che ha
-ancora dei byte da consumare) giusto?
-- A rigore, dato che li sto considerando per la adwin in ricezione, dovrei contare che i pacchetti con flag DMP occupano un byte
-nella window anche al trasmettitore, giusto? In questo caso però, se devo mandare un ACK DMP potrei andare oltre la adwin del
-ricevitore, quindi forse serve prevedere un po' di margine garantito per permettere lo scambio di segmenti DMP anche quando la
-finestra è satura. Poter mandare segmenti DMP è necessario, perchè non si possono mandare aggiornamenti della advertised window 
-senza specificare lo stream, e se non ci sono dati in uscita serve per forza il flag DMP
 
 - [Più avanti] Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
 che solo una? Ho letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
@@ -174,8 +154,34 @@ ogni volta facendo la differenza tra il valore "massimo" (RX_VIRTUAL_BUFFER_SIZE
 tutta la coda di segmenti pronti da essere consumati, considerando solo quelli che hanno un sequence number più basso di cumulativeack (con
 riferimento all'offset iniziale). 
     => Dovrebbe andare bene salvarla nel tcb e cambiarla ogni volta che serve
-
-
+- La advertised window ricevuta va aggiornata ogni volta che il cumulative ack avanza oltre un segmento di uno stream, giusto?
+    => Giusto
+- Penso di sì, ma per sicurezza chiedo... Se consumo metà del payload di un segmento nella RX queue di stream, devo aumentare la
+adwin per quello stream del numero di byte che ho consumato, anche se non ho ancora liberato la memoria per quel segmento (che ha
+ancora dei byte da consumare) giusto?
+    => Giusto
+- Gestione del flag DMP per la advertised window: Al ricevitore non viene contato il fatto che usano spazio (quindi quando vengono
+ACKed il loro payload non viene contato come "spazio occupato"), però il trasmettitore lì conta comunque come spazio occupato (1 byte)
+all'interno della window che è in-flight. Ho capito giusto? Devo fare attenzione a qualcos'altro?
+    => NO! I segmenti DMP non consumano mai spazio nella advertised window
+- A rigore, dato che li sto considerando per la adwin in ricezione, dovrei contare che i pacchetti con flag DMP occupano un byte
+nella window anche al trasmettitore, giusto? In questo caso però, se devo mandare un ACK DMP potrei andare oltre la adwin del
+ricevitore, quindi forse serve prevedere un po' di margine garantito per permettere lo scambio di segmenti DMP anche quando la
+finestra è satura. Poter mandare segmenti DMP è necessario, perchè non si possono mandare aggiornamenti della advertised window 
+senza specificare lo stream, e se non ci sono dati in uscita serve per forza il flag DMP
+    => I segmenti DMP non occupano spazio nella advertised window
+- In TCP normale era facile capire se un segmento cadeva all'interno del RX buffer, perchè il sequence number corrispondeva a una
+posizione precisa (relativa all'inizio del buffer circolare). Adesso questa cosa non si può più fare: da un lato non ci interessa
+più posizionare i segmenti direttamente in un buffer perchè c'è una linked list, dall'altro però è più difficile (/impossibile)
+capire se un segmento cade dentro o fuori dalla advertised window. Per il momento sto ignorando il controllo di se i segmenti
+sono all'interno della advertised window, ma (molto più avanti) come si può fare?
+    => Per il momento lo si può ignorare, ma potenzialmente con MS-TCP ci può essere qualche vantaggio che deriva dal fatto di
+    avere un pool di memoria unico tra tutti gli stream, bisognerà pensarci meglio
+- E' giusto che io pensi allo scheduler in principio come una funzione stateless, da chiamare ogni volta che c'è la possibilità di
+poter forse trasmettere qualcosa di nuovo, e lui valuta lo stato del TCB per capire cosa fare? Quindi le chiamate dovrebbero essere
+idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente (a parte sprecare tempo)
+    => In testa mia è giusto, volendo lo si può vedere diversamente come una macchina a stati, in cui oltre che il tcb gli si passa
+    l'evento che è successo, questo permetterebbe di fare molte meno operazioni ad ogni chiamata
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
@@ -184,6 +190,6 @@ Problemi di MYTCP:
 - Il bind automatico in mybind di mytcp non fa htons() per salvare in fdinfo[s].l_port
 - Problema con il timer per il timeout se non si specifica il timeout iniziale in mytcp
 - Il ciclo che toglie i pacchetti di cui si è ricevuto l'ack toglie l'ACK del 3-way handshake
-- Confermo che viene accettata solo una connessione alla volta
+- Viene accettata solo una connessione alla volta
 - In myaccept, viene dato errore se lo stato del TCB è SYN_RECEIVED, anche se c'è il toggle tra i due stati
 - In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"
