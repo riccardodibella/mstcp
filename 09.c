@@ -2933,8 +2933,7 @@ void mytimer(int ignored){
 				if(!txcb->dummy_payload){
 					tcb->flightsize += txcb->payloadlen;
 				}
-			}
-			if(txcb->txtime+tcb->timeout > tick){
+			} else if(txcb->txtime+tcb->timeout > tick){
 				acc += txcb->totlen;
 				txcb = txcb->next;
 				continue;
@@ -3129,7 +3128,7 @@ int main(){
 				DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
 				DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
 			}
-			persistent_nanosleep(10, 0);
+			persistent_nanosleep(5, 0);
 		}
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
