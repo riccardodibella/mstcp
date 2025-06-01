@@ -28,7 +28,7 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 2
-#define NUM_CLIENT_MESSAGES 1000
+#define NUM_CLIENT_MESSAGES 10000
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -53,7 +53,7 @@
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 100
+#define RX_VIRTUAL_BUFFER_SIZE 1000
 #define TX_BUFFER_SIZE 64000
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
@@ -351,7 +351,7 @@ struct socket_info {
 /* GLOBAL VARIABLES */
 
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
-int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
+int mywrite_mode = MYWRITE_MODE_BLOCKING;
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -3125,9 +3125,14 @@ int main(){
 				uint8_t data[100];
 				sprintf(data, "Client %d message %d;", i, num_message);
 				int data_length = strlen(data);
-				int res = mywrite(client_sockets[i], data, data_length);
-				if(res != data_length){
-					ERROR("mywrite invalid return value (for direct segmentation) %d != %d", res, data_length);
+				int consumed = 0;
+				while(consumed < data_length){
+					int res = mywrite(client_sockets[i], data + consumed, data_length - consumed);
+					if(res <= 0){
+						perror("mywrite");
+						ERROR("mywrite error");
+					}
+					consumed += res;
 				}
 			}
 		}
@@ -3171,7 +3176,7 @@ int main(){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
 				//char myread_buf[100000];
-				char myread_buf[100];
+				char myread_buf[1000];
 				memset(myread_buf, 0, sizeof(myread_buf));
 				// DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
 				int n = myread(s, myread_buf, sizeof(myread_buf));
