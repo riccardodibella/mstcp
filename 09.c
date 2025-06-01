@@ -603,7 +603,6 @@ void acquire_handler_lock(){
 		ERROR("acquire_handler_lock global_handler_lock %d != 1", global_handler_lock);
 	}
 	global_handler_lock--;
-	//DEBUG("a");
 }
 
 void release_handler_lock(){
@@ -611,15 +610,12 @@ void release_handler_lock(){
 		ERROR("release_handler_lock global_handler_lock %d != 0", global_handler_lock);
 	}
 	global_handler_lock++;
-	//DEBUG("r");
 }
 
 void assert_handler_lock_acquired(char* error_string){
-	//#if 0
 	if(global_handler_lock != 0){
 		ERROR("assert_handler_lock_acquired fail %s", error_string);
 	}
-	//#endif
 }
 
 void enable_signal_reception(){
@@ -914,7 +910,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
-	//assert_handler_lock_acquired("prepare_tcp");
+	assert_handler_lock_acquired("prepare_tcp");
 	DEBUG("prepare_tcp inizio");
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
@@ -1355,7 +1351,7 @@ int mysocket(int family, int type, int proto){
 	if(i==MAX_FD) {
 		myerrno = ENFILE; 
 		return -1;
-	}  
+	}
 	else {
 		bzero(fdinfo+i, sizeof(struct socket_info));
 		fdinfo[i].st = FDINFO_ST_UNBOUND;
@@ -1368,6 +1364,7 @@ int mysocket(int family, int type, int proto){
 
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
+	assert_handler_lock_acquired("fsm");
 	if(s < 3 || s >= MAX_FD){
 		ERROR("FSM invalid s %d", s);
 	}
@@ -2104,13 +2101,9 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 
 	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
 
-	//#if 0
 	disable_signal_reception();
-	//#endif
 	int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
-	//#if 0
 	enable_signal_reception();
-	//#endif
 	if(res < 0){
 		// Bind may fail, or other errors
 		return res;
@@ -2179,36 +2172,17 @@ int myaccept(int s, struct sockaddr* addr, int * len){
   	*len = sizeof(struct sockaddr_in);
 	DEBUG("Before myaccept loop");
 	do{
-		#if 0
-		if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-			perror("sigprocmask"); 
-			exit(EXIT_FAILURE);
-		}
-		acquire_handler_lock();
-		#endif
+		disable_signal_reception();
 	
 		if(fdinfo[s].ready_streams == 0){
 			/*
 			"Within a do or a while statement, the next iteration starts by reevaluating the expression of the do or while statement."
 			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
 			*/
-			#if 0
-			release_handler_lock();
-			if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-				perror("sigprocmask"); 
-				exit(EXIT_FAILURE);
-			}
-			#endif
+			enable_signal_reception();
 			continue;
 		}
 		
-		#if 0
-		if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-			perror("sigprocmask"); 
-			exit(EXIT_FAILURE);
-		}
-		acquire_handler_lock();
-		#endif
 
 
 
@@ -2217,13 +2191,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for free fd
 		if(free_fd == MAX_FD){
 			myerrno=ENFILE; 
-			#if 0
-			release_handler_lock();
-			if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-				perror("sigprocmask"); 
-				exit(EXIT_FAILURE);
-			}
-			#endif
+			enable_signal_reception();
 			return -1;
 		}
 		if(fdinfo[s].ready_channels > 0){
@@ -2255,13 +2223,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			fdinfo[s].ready_channels--;
 
 			prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-			#if 0
-			release_handler_lock();
-			if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-				perror("sigprocmask"); 
-				exit(EXIT_FAILURE);
-			}
-			#endif
+			enable_signal_reception();
 			return free_fd;
 		}
 
@@ -2286,16 +2248,10 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		fdinfo[s].stream_backlog_head.next = first->next;
 
 		prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-		#if 0
-		release_handler_lock();
-		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-			perror("sigprocmask"); 
-			exit(EXIT_FAILURE);
-		}
-		#endif
+		enable_signal_reception();
 		return free_fd;
 	}while(pause());
-	ERROR("myaccept something went very wrong, you should never reach after the do while"); // pause always returns -1
+	ERROR("myaccept something went very wrong, you should never reach after the do while in myaccept"); // pause always returns -1
 }
 
 int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
@@ -2383,22 +2339,14 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 	}
 	
 	DEBUG("mywrite actual_len %d", actual_len);
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	acquire_handler_lock();
+	disable_signal_reception();
 	for(int byte_num = 0; byte_num < actual_len; byte_num++){
 		fdinfo[s].tcb->stream_tx_buffer[sid][fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
 		fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] = (fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] + 1) % TX_BUFFER_SIZE;
 		fdinfo[s].tcb->txfree[sid]--;
 	}
 	scheduler(s);
-	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
+	enable_signal_reception();
 	return actual_len;
 }
 
@@ -2458,9 +2406,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				ERROR("myread invalid myread_mode %d", myread_mode);
 		}
 	}
-	//#if 0
-	//disable_signal_reception();
-	//#endif
+
 	// At this point there is something to consume
 	DEBUG("myread sid %d maxlen %d there is something to consume", sid, maxlen);
 	int read_consumed_bytes = 0;
@@ -2527,9 +2473,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		ERROR("adwin not increased during myread consumption");
 	}
 	DEBUG("myread successful return %d", read_consumed_bytes);
-	//#if 0
 	enable_signal_reception();
-	//#endif
 	return read_consumed_bytes;
 }
 
@@ -2576,11 +2520,7 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 	printf("NULL\n");
 }
 void myio(int ignored){
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	acquire_handler_lock();
+	disable_signal_reception();
 	assert_handler_lock_acquired("myio start");
 	//DEBUG("io");
 
@@ -2595,13 +2535,8 @@ void myio(int ignored){
 
 	if(!(fds[0].revents & POLLIN)){
 		// There is nothing to read
-		//DEBUG("ntr");
-		release_handler_lock();
-		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-			perror("sigprocmask"); 
-			exit(EXIT_FAILURE);
-		}
-		// DEBUG("nntr");
+		
+		enable_signal_reception();
 		return;
 	}
 
@@ -3016,26 +2951,14 @@ void myio(int ignored){
 			scheduler(i);
 		}
 	}//packet reception while end
-	//DEBUG("eio");
+
 	assert_handler_lock_acquired("myio end");
-	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	//DEBUG("eeio");
+	enable_signal_reception();
 }
 void mytimer(int ignored){
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	acquire_handler_lock();
-	//DEBUG("t");
+	disable_signal_reception();
 
 	tick++;
-	//DEBUG("mytimer tick %"PRIu64, tick);
-
 
 	for(int i=0;i<MAX_FD;i++){
 		if(fdinfo[i].st != FDINFO_ST_TCB_CREATED){
@@ -3103,13 +3026,7 @@ void mytimer(int ignored){
 		}
 	}
 
-	// DEBUG("et");
-	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
-	}
-	//DEBUG("eet");
+	enable_signal_reception();
 }
 
 int main(){
