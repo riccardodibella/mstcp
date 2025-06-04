@@ -53,7 +53,7 @@
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 100
+#define RX_VIRTUAL_BUFFER_SIZE 5000
 #define TX_BUFFER_SIZE 64000
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
@@ -888,10 +888,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 
-	DEBUG("Outgoing send_ip packet:");
-	print_l2_packet(packet);
 
-	DEBUG("sendto raw packet length %d", 14+20+payloadlen);
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		if(errno == EMSGSIZE){
@@ -911,7 +908,6 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("prepare_tcp");
-	DEBUG("prepare_tcp inizio");
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
@@ -961,7 +957,6 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	}else{
 		txcb->sid = (tcp->payload[multi_stream_opt_index+2]>>2) & 0x1F;
 		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) | tcp->payload[multi_stream_opt_index+3];
-		DEBUG("txcb sid %d ssn %d", txcb->sid, txcb->ssn);
 		
 		// Deactivate the FSM timer for this stream (we are sending a segment, so we don't need to wait for the timeout to open the new stream)
 		tcb->stream_fsm_timer[txcb->sid] = 0;
@@ -977,7 +972,6 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	Timestamps (Fill TS Echo Reply if not SYN packet)
 	SACK (Add up to 3 records and change length accordingly)
 	*/
-	DEBUG("prepare_tcp fine");
 }
 
 uint16_t compl1(uint8_t* b, int len){
@@ -1061,7 +1055,6 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->checksum = htons(0);
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
 	if(txctrl->sid >= 0){
-		DEBUG("update_tcp_header sid %d window %u", txctrl->sid, tcb->adwin[txctrl->sid]);
 		tcp->window = htons(tcb->adwin[txctrl->sid]);
 	}else{
 		tcp->window = htons(0);
@@ -1108,7 +1101,6 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	}
 	to_return->segment = malloc(to_return->total_segment_length);
 	memcpy(to_return->segment, tcp, to_return->total_segment_length);
-	DEBUG("RX -> Channel offset %d", channel_offset);
 	return to_return;
 }
 
@@ -1153,8 +1145,6 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 	ch_node->segment = NULL;
 
-	DEBUG("Channel -> Stream SID %d SSN %d (offset %d)", sid, ssn, ch_node->channel_offset);
-
 	return to_return;
 }
 
@@ -1169,14 +1159,12 @@ void direct_segmentation_scheduler(int s){
 	if(tcb == NULL){
 		ERROR("direct_segmentation_scheduler tcb NULL");
 	}
-	DEBUG("direct_segmentation_scheduler start");
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
 	uint8_t* temp_payload_buf = malloc(max_payload_length);
 	for(int sid = 0; sid < TOT_SID; sid++){
 		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
 			// We can transmit some more data on the stream
 			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
-			DEBUG("Stream %d: available_bytes = %d", sid, available_bytes);
 			while(available_bytes > 0){
 				int payload_length = MIN(available_bytes, max_payload_length);
 				for(int i=0; i<payload_length; i++){
@@ -1195,19 +1183,15 @@ void direct_segmentation_scheduler(int s){
 					// Stream update
 					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
 					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-					DEBUG("Packet inserted in TX queue (sid %d ssn %d) - payload length %d", sid, tcb->next_ssn[sid], payload_length);
 		
 					tcb->next_ssn[sid]++;
-					DEBUG("new next_ssn for stream %d: %d", sid, tcb->next_ssn[sid]);
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
 				}
-				DEBUG("Segment in stream %d added to channel tx queue (payload_length %d)", sid, payload_length);
 			}
 		}
 	}
 	free(temp_payload_buf);
-	DEBUG("direct_segmentation_scheduler end");
 }
 
 void flow_controlled_scheduler(int s){
@@ -1218,7 +1202,6 @@ void flow_controlled_scheduler(int s){
 	if(tcb == NULL){
 		ERROR("flow_controlled_scheduler tcb NULL");
 	}
-	DEBUG("flow_controlled_scheduler start");
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
 	uint8_t* temp_payload_buf = malloc(max_payload_length);
 	for(int sid = 0; sid < TOT_SID; sid++){
@@ -1242,7 +1225,6 @@ void flow_controlled_scheduler(int s){
 			available_bytes = MIN(available_bytes, MAX(flow_control_allowed_bytes, 0));
 			/* FLOW CONTROL END */
 
-			DEBUG("Stream %d: available_bytes = %d (radwin %d in_flight_bytes %d flow_control_allowed_bytes %d)", sid, available_bytes, tcb->radwin[sid], in_flight_bytes, flow_control_allowed_bytes);
 			while(available_bytes > 0){
 				int payload_length = MIN(available_bytes, max_payload_length);
 				for(int i=0; i<payload_length; i++){
@@ -1261,10 +1243,8 @@ void flow_controlled_scheduler(int s){
 					// Stream update
 					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
 					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-					DEBUG("Packet inserted in TX queue (sid %d ssn %d) - payload length %d", sid, tcb->next_ssn[sid], payload_length);
 		
 					tcb->next_ssn[sid]++;
-					DEBUG("new next_ssn for stream %d: %d", sid, tcb->next_ssn[sid]);
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
 				}
@@ -1272,7 +1252,6 @@ void flow_controlled_scheduler(int s){
 		}
 	}
 	free(temp_payload_buf);
-	DEBUG("flow_controlled_scheduler end");
 }
 
 // Abstract scheduler stub to call one of the different scheduler implementations
@@ -1334,7 +1313,6 @@ int mybind(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EADDRINUSE; // mytcp: ENOMEM 
 		return -1;
 	}
-	DEBUG("mybind assigned port %d", ntohs(fdinfo[s].l_port));
 	fdinfo[s].l_addr = (a->sin_addr.s_addr) ? a->sin_addr.s_addr : *(unsigned int*)myip;
 	fdinfo[s].st = FDINFO_ST_BOUND;
 	myerrno = 0;
@@ -1443,7 +1421,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				*/
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				DEBUG("adwin[%d]=%u", i, tcb->adwin[i]);
 				if(tcb->out_window_scale_factor != 0){
 					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
 				}
@@ -1549,7 +1526,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TX_BUFFER_SIZE);
 							fdinfo[s].tcb->stream_rx_queue[stream] = NULL;
 							fdinfo[s].tcb->adwin[stream] = RX_VIRTUAL_BUFFER_SIZE;
-							DEBUG("adwin[%d]=%u", stream, tcb->adwin[stream]);
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
 							return 0;
 						}
@@ -1623,7 +1599,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->stream_rx_queue[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				DEBUG("adwin[%d]=%u", i, tcb->adwin[i]);
 				if(tcb->out_window_scale_factor != 0){
 					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
 				}
@@ -1785,7 +1760,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					}
 					// We don't need to do anything with stream_rx_queue as it is already empty
 					tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
-					DEBUG("adwin[%d]=%u", 0, tcb->adwin[0]);
 
 					/*
 					We include all the usual payload options in this ACK
@@ -1802,7 +1776,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				if(!(tcp->flags & SYN)){
 					break;
 				}
-				DEBUG("Received SYN!");
 
 				bool ms_received = false;
 				bool sack_perm_received = false;
@@ -1876,7 +1849,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->txfirst = tcb->txlast = NULL;
 
 				tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
-				DEBUG("adwin[%d]=%u", 0, tcb->adwin[0]);
 
 				fdinfo[s].sid = 0; // We use stream 0 to open the connection
 
@@ -1988,7 +1960,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->stream_tx_buffer[i] = NULL;
 						backlog_tcb->stream_rx_queue[i] = NULL;
 						backlog_tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
-						DEBUG("adwin[%d]=%u", i, tcb->adwin[i]);
 						if(tcb->out_window_scale_factor != 0){
 							ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
 						}
@@ -2059,7 +2030,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_tx_buffer[sid] = malloc(TX_BUFFER_SIZE);
 							tcb->stream_rx_queue[sid] = NULL;
 							tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE;
-							DEBUG("adwin[%d]=%u", sid, tcb->adwin[sid]);
 							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
 
 							// Insertion in the listening socket backlog
@@ -2072,9 +2042,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							cursor->next->tcb = tcb;
 							cursor->next->next = NULL;
 							fdinfo[tcb->listening_fd].ready_streams++;
-
-							DEBUG("Ready stream %d", sid);
-							DEBUG("Number of ready streams for fd %d: %d",tcb->listening_fd, fdinfo[tcb->listening_fd].ready_streams);
 						}
 					}
 				}
@@ -2110,7 +2077,6 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	if(fdinfo[s].sid == 0){
-		DEBUG("waiting for ack in myconnect...");
 		while(sleep(10)){
 			// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
 			if(tcb->st == TCB_ST_ESTABLISHED){
@@ -2170,7 +2136,6 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	}
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
-	DEBUG("Before myaccept loop");
 	do{
 		disable_signal_reception();
 	
@@ -2202,15 +2167,11 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			if(cursor_index == fdinfo[s].backlog_length){
 				ERROR("myaccept ready_channels > 0 but no TCB found in the backlog");
 			}
-			//DEBUG("%u %u", htons(fdinfo[s].tcb->r_port), htons(fdinfo[s].channel_backlog[cursor_index].r_port));
 			struct tcpctrlblk* tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
 			memcpy(tcb, fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 			bzero(fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 
-			//DEBUG("%d",tcb->stream_state[0]);
 			tcb->stream_state[0] = STREAM_STATE_OPENED;
-			//DEBUG("%d",tcb->stream_state[0]);
-			DEBUG("myaccept fd %d sid %d stream state %d ", s, 0, tcb->stream_state[0]);
 
 			fdinfo[free_fd].st = FDINFO_ST_TCB_CREATED;
 			fdinfo[free_fd].tcb = tcb;
@@ -2255,7 +2216,6 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 }
 
 int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
-	DEBUG("mywrite_direct_segmentation s %d data |%s| maxlen %d", s, buffer, maxlen);
 	// Direct segmentation mywrite
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
 		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
@@ -2274,7 +2234,6 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 	// do-while skipped for direct segmentation
 	int start_byte_number = 0;
 	while(start_byte_number < maxlen){
-		// DEBUG("start_byte_number %d", start_byte_number);
 		int remaining_length = maxlen - start_byte_number;
 		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH);
 		
@@ -2290,10 +2249,8 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 			// Stream update
 			opt[2] = fdinfo[s].sid<<2 | (((fdinfo[s].tcb->next_ssn[fdinfo[s].sid])>>8) & 0x03);
 			opt[3] = (fdinfo[s].tcb->next_ssn[fdinfo[s].sid]) & 0xFF;
-			DEBUG("Packet inserted in TX queue (sid %d ssn %d)", fdinfo[s].sid, fdinfo[s].tcb->next_ssn[fdinfo[s].sid]);
 
 			fdinfo[s].tcb->next_ssn[fdinfo[s].sid]++;
-			DEBUG("new next_ssn for stream %d: %d", fdinfo[s].sid, fdinfo[s].tcb->next_ssn[fdinfo[s].sid]);
 			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, opt, optlen);
 			free(opt);
 		}
@@ -2308,7 +2265,6 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 }
 
 int mywrite(int s, uint8_t * buffer, int maxlen){
-	DEBUG("mywrite s %d data |%s| maxlen %d", s, buffer, maxlen);
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
 		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
 	}
@@ -2338,7 +2294,6 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		}while(pause());
 	}
 	
-	DEBUG("mywrite actual_len %d", actual_len);
 	disable_signal_reception();
 	for(int byte_num = 0; byte_num < actual_len; byte_num++){
 		fdinfo[s].tcb->stream_tx_buffer[sid][fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
@@ -2371,7 +2326,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
-	// DEBUG("myread waiting stream %d", sid);
 	disable_signal_reception();
 	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
 		/* 
@@ -2385,7 +2339,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
 			// tcb->adwin[sid] does not account for dmp segments
-			DEBUG("Removed DMP node from stream %d rx queue", sid);
 			free(dmp_node->segment);
 			free(dmp_node);
 			//enable_signal_reception();
@@ -2408,7 +2361,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}
 
 	// At this point there is something to consume
-	DEBUG("myread sid %d maxlen %d there is something to consume", sid, maxlen);
 	int read_consumed_bytes = 0;
 	while(tcb->stream_rx_queue[sid] != NULL && read_consumed_bytes < maxlen){
 		bool lss = false; // TODO
@@ -2420,7 +2372,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
 			// tcb->adwin[sid] does not account for dmp segments
-			DEBUG("Removed DMP node from stream %d rx queue", sid);
 			// free dmp_node and its segment
 			free(dmp_node->segment);
 			free(dmp_node);
@@ -2435,11 +2386,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 		read_consumed_bytes += current_segment_read_bytes;
 		tcb->stream_rx_queue[sid]->consumed_bytes += current_segment_read_bytes;
-		DEBUG("Increasing adwin of stream %d during myread %d bytes", sid, current_segment_read_bytes);
-		DEBUG("pre %u", tcb->adwin[sid]);
 		tcb->adwin[sid] += current_segment_read_bytes;
-		DEBUG("adwin[%d]=%u", sid, tcb->adwin[sid]);
-		DEBUG("post %u", tcb->adwin[sid]);
 		adwin_increased = true;
 		if(!lss && tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length){
 			// Segment fully consumed: remove it from the stream rx queue
@@ -2452,7 +2399,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		}
 	}
 	if(adwin_increased){
-		DEBUG("myread adwin increased: sending DMP");
 		int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 		uint8_t* opt = malloc(optlen);
 		memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
@@ -2460,9 +2406,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		// Stream update
 		opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
 		opt[3] = (tcb->next_ssn[sid])&0xFF;
-		DEBUG("Generating ACK sid %d ssn %d", sid, tcb->next_ssn[sid]);
 		tcb->next_ssn[sid]++;
-		DEBUG("new SSN for sid %d: %d", sid, tcb->next_ssn[sid]);
 
 		uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
@@ -2472,7 +2416,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}else{
 		ERROR("adwin not increased during myread consumption");
 	}
-	DEBUG("myread successful return %d", read_consumed_bytes);
 	enable_signal_reception();
 	return read_consumed_bytes;
 }
@@ -2488,7 +2431,6 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		ERROR("rtt_estimate segment without Timestamps option");
 	}
 	uint32_t rtt = tick - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
-	//DEBUG("before rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 	if(tcb->rtt_e == 0) {
 		tcb->rtt_e = rtt; 
 		tcb->Drtt_e = rtt/2; 
@@ -2498,7 +2440,6 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt)>>3;
 	}
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
-	//DEBUG("after rtt_estimate\trtt_e=%d Drtt_e=%d timeout=%d", tcb->rtt_e, tcb->Drtt_e, tcb->timeout);
 }
 void print_rx_queue(struct tcpctrlblk* tcb){
 	struct channel_rx_queue_node *cursor = tcb->unack;
@@ -2522,7 +2463,6 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 void myio(int ignored){
 	disable_signal_reception();
 	assert_handler_lock_acquired("myio start");
-	//DEBUG("io");
 
 	struct pollfd fds[1];
 	fds[0].fd = unique_raw_socket_fd;
@@ -2596,11 +2536,7 @@ void myio(int ignored){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
-			DEBUG("Incoming myio tcp packet:");
-			print_l2_packet(l2_rx_buf);
 
-			//DEBUG("Incoming TCP segment:");
-			//print_tcp_segment(tcp);
 
 			struct tcpctrlblk * tcb = fdinfo[i].tcb;
 			assert_handler_lock_acquired("myio FSM_EVENT_PKT_RCV");
@@ -2644,7 +2580,6 @@ void myio(int ignored){
 				}
 
 				if((htonl(tcp->ack)-shifter >= 0) && (htonl(tcp->ack)-shifter-(tcb->stream_end)?1:0 <= htonl(tcb->txlast->segment->seq) + tcb->txlast->payloadlen - shifter)){ // -1 is to compensate the FIN
-					DEBUG("Prima del while per rimozione cumulative ack");
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
@@ -2664,19 +2599,12 @@ void myio(int ignored){
 							if(tcb->radwin[temp->sid] < temp->payloadlen){
 								ERROR("tcb->radwin[%d] would become < 0", temp->sid);
 							}
-							DEBUG("Reducing radwin for stream %d", temp->sid);
-							DEBUG("pre  %u", tcb->radwin[temp->sid]);
 							tcb->radwin[temp->sid] -= temp->payloadlen;
-							DEBUG("post %u", tcb->radwin[temp->sid]);
-						}else{
-							DEBUG("Removing a segment from TX queue without reducing radwin");
-							DEBUG("temp->payloadlen %d temp->dummy_payload %d", temp->payloadlen, temp->dummy_payload);
 						}
 						free(temp->segment);
 						free(temp);
 						if(tcb->txfirst	== NULL) tcb->txlast = NULL;
 					}//While
-					DEBUG("Dopo del while per rimozione cumulative ack");
 				}
 			}
 
@@ -2735,40 +2663,18 @@ void myio(int ignored){
 				}
 
 				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
-				DEBUG("channel_offset = %u (ntohl(seq) = %u ; ack_offs = %u)", channel_offset,  ntohl(tcp->seq), tcb->ack_offs);
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
-					//DEBUG("TODO currently not checking if the segment is within the max RX window size");
-					DEBUG("Previous radwin[%d] = %u", sid, tcb->radwin[sid]);
 					uint16_t new_radwin = htons(tcp->window);
 					if(new_radwin >= tcb->radwin[sid]){
 						tcb->radwin[sid] = new_radwin;
-						DEBUG("In-order segment: radwin[%d] updated = %u", sid, tcb->radwin[sid]);
-					}else{
-						DEBUG("radwin[%d] not updated (current %u received %u)", sid, tcb->radwin[sid], new_radwin);
-						//ERROR(".");
 					}
-					DEBUG("Resulting radwin[%d] = %u", sid, tcb->radwin[sid]);
 
 					struct channel_rx_queue_node* newrx = NULL;
 					if(tcb->unack == NULL){
 						// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
-						DEBUG("Insertion at the beginning of empty unack queue");
 						tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
-
-						/*
-						if(channel_offset == tcb->cumulativeack){
-							uint16_t new_radwin = htons(tcp->window);
-							if(new_radwin >= tcb->radwin[sid]){
-								tcb->radwin[sid] = new_radwin;
-								DEBUG("In-order segment: radwin[%d] updated = %u", sid, tcb->radwin[sid]);
-							}else{
-								DEBUG("radwin[%d] not updated (current %u received %u)", sid, tcb->radwin[sid], new_radwin);
-								//ERROR(".");
-							}
-						}
-						*/
 					}else{
 						// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
 						struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
@@ -2778,7 +2684,6 @@ void myio(int ignored){
 						}
 						if(cursor == NULL){
 							// We traversed the whole queue without finding any segment with a higher channel offset: insert the new one at the end of the queue
-							DEBUG("Insertion at the end of the queue");
 							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
 							prev->next = newrx;
 
@@ -2792,21 +2697,16 @@ void myio(int ignored){
 								newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
 								if(prev == NULL){
 									// Insertion at the beginning of the queue
-									DEBUG("Insertion at the beginning of the queue");
 									tcb->unack = newrx;
 								}else{
 									// Insertion in the middle (or at the end) of the queue
-									DEBUG("Insertion in the middle (or at the end) of the queue");
 									prev->next = newrx;
 								}
 							}else{
 								// Duplicate of an out-of-order packet (ignored)
-								DEBUG("Ignored duplicated packet");
 							}
 						}
 					}
-					DEBUG("newrx added to rx queue");
-					print_rx_queue(tcb);
 					// if newrx == NULL the packet was a duplicate of an out-of-order packet
 					if(newrx != NULL){
 						// new node has been inserted in the channel queue
@@ -2820,14 +2720,12 @@ void myio(int ignored){
 							ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
 						}
 						struct channel_rx_queue_node* cursor = newrx;
-						DEBUG("tcb->next_rx_ssn[%d] %d == ssn %d", sid, tcb->next_rx_ssn[sid], ssn);
 						int current_candidate_ssn = ssn; // Do avoid "polluting" the variable "ssn" used for newrx
 						while(cursor != NULL && tcb->next_rx_ssn[sid] == current_candidate_ssn){
 							// cursor contains an in-order segment for the stream
 							
 							// This unlinks the segments in cursor and links it to the new stream queue node
 							struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
-							DEBUG("Moving segment SID %d SSN %d from channel queue to stream queue", newrx_stream->sid, newrx_stream->ssn);
 
 							if(tcb->stream_rx_queue[sid] == NULL){
 								tcb->stream_rx_queue[sid] = newrx_stream;
@@ -2841,9 +2739,7 @@ void myio(int ignored){
 								last->next = newrx_stream;
 							}
 
-							DEBUG("Updating tcb->next_rx_ssn[%d] %u...", sid, tcb->next_rx_ssn[sid]);
 							tcb->next_rx_ssn[sid]++;
-							DEBUG("New value tcb->next_rx_ssn[%d] = %u", sid, tcb->next_rx_ssn[sid]);
 							// advance to the next segment of this stream in the channel RX queue
 							cursor = cursor->next;
 							while(cursor != NULL){
@@ -2853,15 +2749,11 @@ void myio(int ignored){
 										int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
 										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) | cursor->segment->payload[cursor_ms_index+3];
 										if(cursor_sid == sid){
-											DEBUG("Next found for channel -> stream transfer");
 											current_candidate_ssn = cursor_ssn;
 											break;
-										}else{
-											DEBUG("Skipped SID %d SSN %d for channel -> stream transfer", cursor_sid, cursor_ssn);
 										}
 									}
 								}else{
-									DEBUG("Skipped empty node for channel -> stream transfer");
 								}
 								cursor = cursor->next;
 							}
@@ -2869,8 +2761,6 @@ void myio(int ignored){
 						}
 
 						// Removal of in-order segments at the beginning of the channel RX queue
-						DEBUG("Initial channel RX queue:");
-						print_rx_queue(tcb);
 						while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
 							if(tcb->unack->segment != NULL){
 								DEBUG("Last received packet before error:");
@@ -2883,19 +2773,11 @@ void myio(int ignored){
 							}
 							tcb->cumulativeack += tcb->unack->payload_length;
 							if(!tcb->unack->dummy_payload){
-								DEBUG("Decreasing adwin of stream %d for removal of in order-segment -> %d bytes", tcb->unack->sid, tcb->unack->payload_length);
-								DEBUG("pre  %u", tcb->adwin[tcb->unack->sid]);
 								tcb->adwin[tcb->unack->sid] -= tcb->unack->payload_length;
-								DEBUG("adwin[%d]=%u", tcb->unack->sid, tcb->adwin[tcb->unack->sid]);
-								DEBUG("post %u", tcb->adwin[tcb->unack->sid]);
 							}
 							struct channel_rx_queue_node* next = tcb->unack->next;
 							free(tcb->unack);
 							tcb->unack = next;
-
-							DEBUG("something removed from rx queue");
-							DEBUG("Queue after removal:");
-							print_rx_queue(tcb);
 						}
 					}
 				}
@@ -2918,9 +2800,7 @@ void myio(int ignored){
 							// Stream update
 							opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
 							opt[3] = (tcb->next_ssn[sid])&0xFF;
-							DEBUG("Generating ACK sid %d ssn %d", sid, tcb->next_ssn[sid]);
 							tcb->next_ssn[sid]++;
-							DEBUG("new SSN for sid %d: %d", sid, tcb->next_ssn[sid]);
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
@@ -2928,7 +2808,6 @@ void myio(int ignored){
 							free(dummy_payload);
 							free(opt);
 						}else{
-							DEBUG("Generating non-MS ACK for incoming DMP segment");
 							// Generic ACK
 							prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						}
@@ -2992,7 +2871,6 @@ void mytimer(int ignored){
 				continue;
 			}
 			if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment->flags == ACK){
-				DEBUG("Dropping an ACK without payload");
 				// If this is only an ACK without payload it does not need to be RETXed
 				// we remove txcb from the TX queue
 				free(txcb->segment);
@@ -3011,9 +2889,9 @@ void mytimer(int ignored){
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
 			txcb->txtime = tick;
 			if(txcb->retry == 0){
-				DEBUG("Segment TX");
+				//DEBUG("Segment TX");
 			}else{
-				DEBUG("Segment RETX");
+				//DEBUG("Segment RETX");
 			}
 			txcb->retry++;
 
@@ -3176,15 +3054,15 @@ int main(){
 			for(int i=0; i<NUM_CLIENTS; i++){
 				int s = client_sockets[i];
 				//char myread_buf[100000];
-				char myread_buf[100];
+				char myread_buf[1000];
 				memset(myread_buf, 0, sizeof(myread_buf));
 				// DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
 				int n = myread(s, myread_buf, sizeof(myread_buf));
 				if(n == -1 && errno == EAGAIN){
 					continue;
 				}
-				DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
-				DEBUG("\n\n\nmyread result |%s|\n\n", myread_buf);
+				//DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
+				DEBUG("|%s|", myread_buf);
 			}
 			//persistent_nanosleep(1, 0);
 		}
