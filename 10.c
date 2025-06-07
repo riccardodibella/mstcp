@@ -27,8 +27,8 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 2
-#define NUM_CLIENT_MESSAGES 1000
+#define NUM_CLIENTS 15
+#define NUM_CLIENT_MESSAGES 500
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -49,7 +49,7 @@
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 #define MAX_ARP 200 // number of lines in the ARP cache
-#define MAX_FD 16 // File descriptors go from 3 (included) up to this value (excluded)
+#define MAX_FD 32 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 // #define TODO_BUFFER_SIZE 64000
@@ -351,7 +351,7 @@ struct socket_info {
 /* GLOBAL VARIABLES */
 
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
-int mywrite_mode = MYWRITE_MODE_BLOCKING;
+int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -2462,6 +2462,8 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 }
 void myio(int ignored){
 	disable_signal_reception();
+	struct timespec start, end;
+	clock_gettime(CLOCK_REALTIME, &start);
 	assert_handler_lock_acquired("myio start");
 
 	struct pollfd fds[1];
@@ -2832,10 +2834,20 @@ void myio(int ignored){
 	}//packet reception while end
 
 	assert_handler_lock_acquired("myio end");
+
+	clock_gettime(CLOCK_REALTIME, &end);
+	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
+	long duration_us = duration_ns / 1000;
+	if(duration_us > TIMER_USECS){
+		DEBUG("myio %ld us", duration_us);
+	}
+
 	enable_signal_reception();
 }
 void mytimer(int ignored){
 	disable_signal_reception();
+	struct timespec start, end;
+	clock_gettime(CLOCK_REALTIME, &start);
 
 	tick++;
 
@@ -2904,6 +2916,12 @@ void mytimer(int ignored){
 		}
 	}
 
+	clock_gettime(CLOCK_REALTIME, &end);
+	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
+	long duration_us = duration_ns / 1000;
+	if(duration_us > TIMER_USECS){
+		DEBUG("mytimer %ld us", duration_us);
+	}
 	enable_signal_reception();
 }
 
@@ -3007,11 +3025,27 @@ int main(){
 				while(consumed < data_length){
 					int res = mywrite(client_sockets[i], data + consumed, data_length - consumed);
 					if(res <= 0){
-						perror("mywrite");
-						ERROR("mywrite error");
+						if(errno == EAGAIN){
+							errno = 0;
+							pause();
+							continue;
+						}else{
+							perror("mywrite");
+							ERROR("mywrite error");
+						}
 					}
+
+					/*
+					uint8_t* tmp = malloc(res+1);
+					memcpy(tmp, data + consumed, res);
+					tmp[res] = 0;
+					DEBUG("mywrite |%s|", tmp);
+					free(tmp);
+					*/
+
 					consumed += res;
 				}
+				DEBUG("mywrite |%s|", data);
 			}
 		}
 		while(true){}
@@ -3062,7 +3096,7 @@ int main(){
 					continue;
 				}
 				//DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
-				DEBUG("|%s|", myread_buf);
+				DEBUG("myread |%s|", myread_buf);
 			}
 			//persistent_nanosleep(1, 0);
 		}
