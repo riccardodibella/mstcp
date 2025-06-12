@@ -27,8 +27,8 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 15
-#define NUM_CLIENT_MESSAGES 500
+#define NUM_CLIENTS 20
+#define NUM_CLIENT_MESSAGES 10000
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -48,10 +48,12 @@
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
+//#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 32 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
+//#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
 #define RX_VIRTUAL_BUFFER_SIZE 5000
 #define TX_BUFFER_SIZE 64000
@@ -888,14 +890,26 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 
-
+	int attempts = 0;
+	st:
 	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		if(errno == EMSGSIZE){
 			ERROR("EMSGSIZE");
 		}
-		perror("send_ip sendto failed"); 
+		perror("send_ip sendto failed");
+		DEBUG("ERRNO %d%s", errno, errno==EAGAIN?" (EAGAIN)":"");
+		print_l2_packet(packet);
+		DEBUG("attempts %d", attempts);
+		if(attempts < 1000){
+			attempts++;
+			goto st;
+		}
 		exit(EXIT_FAILURE);
+	}
+
+	if(attempts > 0){
+		DEBUG("sendto ok after EAGAIN!");
 	}
 }
 #pragma endregion RAW_SOCKET_ACCESS
@@ -1150,7 +1164,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 
-
+#if 0
 void direct_segmentation_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
 		ERROR("direct_segmentation_scheduler invalid fd %d", s);
@@ -1253,12 +1267,80 @@ void flow_controlled_scheduler(int s){
 	}
 	free(temp_payload_buf);
 }
+#endif
+
+void nagle_scheduler(int s){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("nagle_scheduler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("nagle_scheduler tcb NULL");
+	}
+	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
+	uint8_t* temp_payload_buf = malloc(max_payload_length);
+	for(int sid = 0; sid < TOT_SID; sid++){
+		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
+			// We can transmit some more data on the stream
+			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
+
+			/* FLOW CONTROL START */
+			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
+			bool small_in_flight = false;
+			struct txcontrolbuf* tx_cursor = tcb->txfirst;
+			while(tx_cursor != NULL){
+				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
+					if(in_flight_bytes != max_payload_length){
+						small_in_flight = true;
+					}
+					in_flight_bytes += tx_cursor->payloadlen;
+				}
+				tx_cursor = tx_cursor->next;
+			}
+			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Must always be >= 0
+			if(flow_control_allowed_bytes < 0){
+				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
+			}
+			available_bytes = MIN(available_bytes, MAX(flow_control_allowed_bytes, 0));
+			/* FLOW CONTROL END */
+
+			while(available_bytes > 0){
+				int payload_length = MIN(available_bytes, max_payload_length);
+				if(payload_length < max_payload_length && small_in_flight){
+					break;
+				}
+				for(int i=0; i<payload_length; i++){
+					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
+					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
+					tcb->txfree[sid]++;
+					available_bytes--;
+				}
+				if(!tcb->ms_option_enabled){
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}else{
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
+					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
+		
+					tcb->next_ssn[sid]++;
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
+					free(opt);
+				}
+			}
+		}
+	}
+	free(temp_payload_buf);
+}
 
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
 	//direct_segmentation_scheduler(s);
-	flow_controlled_scheduler(s);
+	nagle_scheduler(s);
 }
 
 
@@ -2423,6 +2505,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
+	return;
 	if(tcb == NULL || tcp == NULL){
 		ERROR("rtt_estimate NULL param");
 	}
@@ -2484,9 +2567,16 @@ void myio(int ignored){
 
 	int received_packet_size; // mytcp: size
 	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
+		if(received_packet_size < 0){
+			perror("recvfrom");
+			ERROR("recvfrom errno %d", errno);
+		}
 		if(received_packet_size < sizeof(struct ethernet_frame)){
+			DEBUG("low received_packet_size %d < %lu", received_packet_size, sizeof(struct ethernet_frame));
 			continue;
 		}
+		struct timespec start2, end2;
+		clock_gettime(CLOCK_REALTIME, &start2);
 		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
 		if(eth->type == htons(0x0806)){
 			// ARP
@@ -2831,6 +2921,13 @@ void myio(int ignored){
 
 			scheduler(i);
 		}
+
+
+
+		clock_gettime(CLOCK_REALTIME, &end2);
+		long duration_ns = (end2.tv_sec - start2.tv_sec) * 1000000000L + (end2.tv_nsec - start2.tv_nsec);
+		long duration_us = duration_ns / 1000;
+		//printf("pkt %ld us                                                \r", duration_us);
 	}//packet reception while end
 
 	assert_handler_lock_acquired("myio end");
@@ -2903,7 +3000,8 @@ void mytimer(int ignored){
 			if(txcb->retry == 0){
 				//DEBUG("Segment TX");
 			}else{
-				//DEBUG("Segment RETX");
+				//if(txcb->retry > 1){ continue; } // TODO togliere assolutamente
+				//DEBUG("Segment RETX %d", txcb->retry);
 			}
 			txcb->retry++;
 
@@ -2969,6 +3067,8 @@ int main(){
 
 	if(MAIN_MODE == CLIENT){
 		int client_sockets[NUM_CLIENTS];
+		int current_msg_num[NUM_CLIENTS] = {0};
+		int current_msg_sent_bytes[NUM_CLIENT_MESSAGES] = {0};
 		// Client code to connect to a server
 		int s = mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){
@@ -3015,40 +3115,33 @@ int main(){
 			}
 			client_sockets[i] = s_loop;
 		}
-		for(int num_message = 0; num_message < NUM_CLIENT_MESSAGES; num_message++){
-			// Write some data in all of the client sockets
+		while(true){
 			for(int i=0; i<NUM_CLIENTS; i++){
-				uint8_t data[100];
-				sprintf(data, "Client %d message %d;", i, num_message);
-				int data_length = strlen(data);
-				int consumed = 0;
-				while(consumed < data_length){
-					int res = mywrite(client_sockets[i], data + consumed, data_length - consumed);
+				if(current_msg_num[i] < NUM_CLIENT_MESSAGES){
+					uint8_t data[100];
+					sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
+					uint8_t* start = data+current_msg_sent_bytes[i];
+					int missing = strlen(data) - current_msg_sent_bytes[i];
+					int res = mywrite(client_sockets[i], start, missing);
 					if(res <= 0){
 						if(errno == EAGAIN){
 							errno = 0;
-							pause();
 							continue;
 						}else{
 							perror("mywrite");
 							ERROR("mywrite error");
 						}
 					}
-
-					/*
-					uint8_t* tmp = malloc(res+1);
-					memcpy(tmp, data + consumed, res);
-					tmp[res] = 0;
-					DEBUG("mywrite |%s|", tmp);
-					free(tmp);
-					*/
-
-					consumed += res;
+					current_msg_sent_bytes[i] += res;
+					if(current_msg_sent_bytes[i] == strlen(data)){
+						DEBUG("mywrite |%s|", data);
+						current_msg_num[i]++;
+						current_msg_sent_bytes[i] = 0;
+						//persistent_nanosleep(0, 1000);
+					}
 				}
-				DEBUG("mywrite |%s|", data);
 			}
 		}
-		while(true){}
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
