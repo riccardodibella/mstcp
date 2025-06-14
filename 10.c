@@ -27,8 +27,8 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 4
-#define NUM_CLIENT_MESSAGES 3000
+#define NUM_CLIENTS 2
+#define NUM_CLIENT_MESSAGES 1
 #define NUM_SERVER_MESSAGES 3000
 #define MS_ENABLED true
 #define CLIENT 0
@@ -1017,6 +1017,7 @@ unsigned short int tcp_checksum(uint8_t* b1, int len1, uint8_t* b2, int len2){
 
 void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	assert_handler_lock_acquired("update_tcp_header");
+	static bool ssn_wrap_warning[32] = {false};
 	if(txctrl == NULL){
 		ERROR("update_tcp_header NULL txctrl");
 	}
@@ -1071,6 +1072,15 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
 	if(txctrl->sid >= 0){
 		tcp->window = htons(tcb->adwin[txctrl->sid]);
+		if(txctrl->ssn > 500){
+			if(!ssn_wrap_warning[txctrl->sid]){
+				//DEBUG("\n\n\n#######################\nnupdate_tcp_header enabling wrap warning sid %d\n#######################\n", txctrl->sid);
+			}
+			ssn_wrap_warning[txctrl->sid] = true;
+		}
+		if(txctrl->ssn == 0 && ssn_wrap_warning[txctrl->sid]){
+			ERROR("update_tcp_header sid %d wrapped\n", txctrl->sid);
+		}
 	}else{
 		tcp->window = htons(0);
 	}
