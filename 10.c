@@ -27,8 +27,9 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 20
-#define NUM_CLIENT_MESSAGES 10000
+#define NUM_CLIENTS 4
+#define NUM_CLIENT_MESSAGES 3000
+#define NUM_SERVER_MESSAGES 3000
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -50,12 +51,12 @@
 #define TIMER_USECS 500
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
-#define MAX_FD 32 // File descriptors go from 3 (included) up to this value (excluded)
+#define MAX_FD 36 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MAXTIMEOUT 2000
 //#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 5000
+#define RX_VIRTUAL_BUFFER_SIZE 32000
 #define TX_BUFFER_SIZE 64000
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
@@ -1290,7 +1291,7 @@ void nagle_scheduler(int s){
 			struct txcontrolbuf* tx_cursor = tcb->txfirst;
 			while(tx_cursor != NULL){
 				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-					if(in_flight_bytes != max_payload_length){
+					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
 						small_in_flight = true;
 					}
 					in_flight_bytes += tx_cursor->payloadlen;
@@ -2416,6 +2417,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		di andare avanti. Va corretto quando si guarda la chiusura delle connessioni
 		*/
 		if(tcb->stream_rx_queue[sid] != NULL){
+			assert_handler_lock_acquired("dmp removal myread");
 			// condition "tcb->stream_rx_queue[sid]->dummy_payload" is true
 			//disable_signal_reception();
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
@@ -2443,6 +2445,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}
 
 	// At this point there is something to consume
+	assert_handler_lock_acquired("myread consumption start");
 	int read_consumed_bytes = 0;
 	while(tcb->stream_rx_queue[sid] != NULL && read_consumed_bytes < maxlen){
 		bool lss = false; // TODO
@@ -2498,6 +2501,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}else{
 		ERROR("adwin not increased during myread consumption");
 	}
+	assert_handler_lock_acquired("myread consumption end");
 	enable_signal_reception();
 	return read_consumed_bytes;
 }
@@ -2936,7 +2940,7 @@ void myio(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		DEBUG("myio %ld us", duration_us);
+		//DEBUG("myio %ld us", duration_us);
 	}
 
 	enable_signal_reception();
@@ -3018,9 +3022,60 @@ void mytimer(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		DEBUG("mytimer %ld us", duration_us);
+		//DEBUG("mytimer %ld us", duration_us);
 	}
 	enable_signal_reception();
+}
+
+void full_duplex_app(int* client_sockets, int n){
+	int* current_msg_num = calloc(n, sizeof(int));
+	int* current_msg_sent_bytes = calloc(n, sizeof(int));
+	for(int i=0; i<n; i++){
+		current_msg_num[i] = 0;
+		current_msg_sent_bytes[i] = 0;
+	}
+	while(true){
+		// Client: TX
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(current_msg_num[i] < ((MAIN_MODE == CLIENT) ? NUM_CLIENT_MESSAGES : NUM_SERVER_MESSAGES)){
+				uint8_t data[100];
+				sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
+				uint8_t* start = data+current_msg_sent_bytes[i];
+				int missing = strlen(data) - current_msg_sent_bytes[i];
+				int res = mywrite(client_sockets[i], start, missing);
+				if(res <= 0){
+					if(errno == EAGAIN){
+						errno = 0;
+						continue;
+					}else{
+						perror("mywrite");
+						ERROR("mywrite error");
+					}
+				}
+				current_msg_sent_bytes[i] += res;
+				if(current_msg_sent_bytes[i] == strlen(data)){
+					//DEBUG("mywrite |%s|", data);
+					//DEBUG("w %d %d", i, current_msg_num[i]);
+					current_msg_num[i]++;
+					current_msg_sent_bytes[i] = 0;
+				}
+			}
+		}
+
+		// Server: RX
+		for(int i=0; i<n; i++){
+			int s = client_sockets[i];
+			char myread_buf[100];
+			memset(myread_buf, 0, sizeof(myread_buf));
+			int n = myread(s, myread_buf, sizeof(myread_buf)-1);
+			if(n == -1 && errno == EAGAIN){
+				continue;
+			}
+			DEBUG("r |%s|", myread_buf);
+		}
+	}
+	free(current_msg_num);
+	free(current_msg_sent_bytes);
 }
 
 int main(){
@@ -3068,7 +3123,7 @@ int main(){
 	if(MAIN_MODE == CLIENT){
 		int client_sockets[NUM_CLIENTS];
 		int current_msg_num[NUM_CLIENTS] = {0};
-		int current_msg_sent_bytes[NUM_CLIENT_MESSAGES] = {0};
+		int current_msg_sent_bytes[NUM_CLIENTS] = {0};
 		// Client code to connect to a server
 		int s = mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){
@@ -3115,33 +3170,7 @@ int main(){
 			}
 			client_sockets[i] = s_loop;
 		}
-		while(true){
-			for(int i=0; i<NUM_CLIENTS; i++){
-				if(current_msg_num[i] < NUM_CLIENT_MESSAGES){
-					uint8_t data[100];
-					sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
-					uint8_t* start = data+current_msg_sent_bytes[i];
-					int missing = strlen(data) - current_msg_sent_bytes[i];
-					int res = mywrite(client_sockets[i], start, missing);
-					if(res <= 0){
-						if(errno == EAGAIN){
-							errno = 0;
-							continue;
-						}else{
-							perror("mywrite");
-							ERROR("mywrite error");
-						}
-					}
-					current_msg_sent_bytes[i] += res;
-					if(current_msg_sent_bytes[i] == strlen(data)){
-						DEBUG("mywrite |%s|", data);
-						current_msg_num[i]++;
-						current_msg_sent_bytes[i] = 0;
-						//persistent_nanosleep(0, 1000);
-					}
-				}
-			}
-		}
+		full_duplex_app(client_sockets, NUM_CLIENTS);
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
@@ -3175,24 +3204,7 @@ int main(){
 			}
 			client_sockets[i] = s;
 		}
-		// persistent_nanosleep(60, 0);
-		while(true){
-			//DEBUG("while(true) iteration");
-			for(int i=0; i<NUM_CLIENTS; i++){
-				int s = client_sockets[i];
-				//char myread_buf[100000];
-				char myread_buf[1000];
-				memset(myread_buf, 0, sizeof(myread_buf));
-				// DEBUG("wait myread fd %d stream %d", s, fdinfo[s].sid);
-				int n = myread(s, myread_buf, sizeof(myread_buf));
-				if(n == -1 && errno == EAGAIN){
-					continue;
-				}
-				//DEBUG("myread return %d fd %d stream %d", n, s, fdinfo[s].sid);
-				DEBUG("myread |%s|", myread_buf);
-			}
-			//persistent_nanosleep(1, 0);
-		}
+		full_duplex_app(client_sockets, NUM_CLIENTS);
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
 	}
