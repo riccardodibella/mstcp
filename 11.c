@@ -348,9 +348,6 @@ struct socket_info {
 
 
 
-
-
-
 /* GLOBAL VARIABLES */
 
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
@@ -409,7 +406,9 @@ uint8_t PAYLOAD_OPTIONS_TEMPLATE[] = {
 	2
 };
 
-uint8_t print_buffer[1024];
+FILE* log_file = NULL;
+int log_array_items = 0;
+int current_field_num = 0;
 
 /* FUNCTION DEFINITIONS */
 
@@ -468,6 +467,108 @@ int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
 	return to_return;
 }
 
+void LOG_TEXT(const char *text) {
+    fwrite(text, 1, strlen(text), log_file);
+}
+void LOG_OBJ_START(){
+	if(log_array_items > 0){
+		LOG_TEXT(",\n");
+	}
+	LOG_TEXT("{");
+	log_array_items++;
+
+	current_field_num = 0;
+}
+void LOG_OBJ_END(){
+	LOG_TEXT("}");
+}
+void LOG_FIELD(char* field_name, char* c, ...){
+	if(current_field_num > 0){
+		LOG_TEXT(", ");
+	}
+
+	// Attribute name must be between double quotes
+	LOG_TEXT("\"");
+	LOG_TEXT(field_name);
+	LOG_TEXT("\": ");
+	va_list args;
+	va_start(args, c);
+	vfprintf(log_file, c, args);
+	va_end(args);
+
+	current_field_num++;
+}
+
+void LOG_START(){
+	char* filename;
+	char* text;
+	if(MAIN_MODE == CLIENT){
+		filename = "log_client.json";
+	}else{
+		filename = "log_server.json";
+	}
+
+	log_file = fopen(filename, "w");
+	if(log_file == NULL){
+		perror("LOG_START fopen");
+		ERROR("log_file not created");
+	}
+	text = "[\n";
+	LOG_TEXT(text);
+}
+void LOG_END(){
+	if(log_file == NULL){
+		// Prevents issues when the end function is called more than one time
+		return;
+	}
+	LOG_TEXT("\n]");
+	fclose(log_file);
+	log_file = NULL;
+}
+
+void exit_handler(int sig) {
+    LOG_END();
+    exit(0);
+}
+
+void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
+	struct tcp_segment* tcp = (struct tcp_segment*) segment_buf;
+	LOG_OBJ_START();
+	LOG_FIELD("direction", "\"%s\"", direction);
+	int payload_length = len - (4*(tcp->d_offs_res >> 4));
+	LOG_FIELD("payload_length", "%d", payload_length);
+	bool syn = tcp->flags & SYN;
+	bool ack = tcp->flags & ACK;
+	bool fin = tcp->flags & FIN;
+	bool dmp = tcp->d_offs_res & (DMP >> 8);
+	LOG_FIELD("SYN", "%s", syn?"true":"false");
+	LOG_FIELD("ACK", "%s", ack?"true":"false");
+	LOG_FIELD("FIN", "%s", fin?"true":"false");
+	LOG_FIELD("DMP", "%s", dmp?"true":"false");
+	
+	LOG_FIELD("sequence_number", "%u", htonl(tcp->seq));
+	if(ack){
+		LOG_FIELD("ack_number", "%u", htonl(tcp->ack));
+	}
+	LOG_FIELD("window", "%u", htons(tcp->window));
+	
+
+	int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(ms_index>=0){
+		LOG_FIELD("lss", "%s", (tcp->payload[ms_index+2]>>7)?"true":"false");
+		LOG_FIELD("sid", "%d", (tcp->payload[ms_index+2]>>2) & 0x1F);
+		LOG_FIELD("ssn", "%d", (( tcp->payload[ms_index+2] & 0x3) << 8 ) | (tcp->payload[ms_index+3]));
+	}
+	if(payload_length > 0 && !dmp){
+		char* str = malloc(payload_length + 1);
+		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
+		str[payload_length] = 0;
+		LOG_FIELD("payload_str", "\"%s\"", str);
+		free(str);
+	}
+
+	LOG_OBJ_END();
+}
 void print_tcp_segment(struct tcp_segment* tcp){
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
@@ -882,6 +983,10 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 		ERROR("send_ip resolve_mac failed");
 	}
 
+	if(proto == TCP_PROTO){
+		LOG_TCP_SEGMENT("OUT", payload, payloadlen);
+	}
+
 	forge_ethernet(eth,destmac,0x0800);
 	forge_ip(ip,payloadlen,proto,*(unsigned int *)targetip); 
 	memcpy(ip->payload,payload,payloadlen);
@@ -1072,7 +1177,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
 	if(txctrl->sid >= 0){
 		tcp->window = htons(tcb->adwin[txctrl->sid]);
-		if(txctrl->ssn > 500){
+		if(txctrl->ssn >= 512){
 			if(!ssn_wrap_warning[txctrl->sid]){
 				//DEBUG("\n\n\n#######################\nnupdate_tcp_header enabling wrap warning sid %d\n#######################\n", txctrl->sid);
 			}
@@ -2643,6 +2748,7 @@ void myio(int ignored){
 				continue; // go to the processing of the next received packet, if any
 			}
 
+			LOG_TCP_SEGMENT("IN", (uint8_t*) tcp, htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 
 			struct tcpctrlblk * tcb = fdinfo[i].tcb;
 			assert_handler_lock_acquired("myio FSM_EVENT_PKT_RCV");
@@ -3094,6 +3200,15 @@ int main(){
 		perror("Failed to set stdout to unbuffered");
 		exit(EXIT_FAILURE);
 	}
+
+	LOG_START();
+	// Register cleanup function for normal program termination
+    // This handles exit() and normal return from main()
+    atexit(LOG_END);
+    
+    // Register signal handlers for interrupts
+    signal(SIGINT, exit_handler);   // Ctrl+C
+    signal(SIGTERM, exit_handler);  // Termination signal
 
 	load_ifconfig();
 
