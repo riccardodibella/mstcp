@@ -432,6 +432,17 @@ void DEBUG(char* c, ...){
 	printf("\n");
 }
 
+int64_t get_timestamp_ns(){
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+int64_t get_timestamp_us(){
+	return get_timestamp_ns() / 1000;
+}
+int64_t get_timestamp_ms(){
+	return get_timestamp_us() / 1000;
+}
 // -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
 int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
 	if(tcp == NULL){
@@ -470,18 +481,6 @@ int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
 void LOG_TEXT(const char *text) {
     fwrite(text, 1, strlen(text), log_file);
 }
-void LOG_OBJ_START(){
-	if(log_array_items > 0){
-		LOG_TEXT(",\n");
-	}
-	LOG_TEXT("{");
-	log_array_items++;
-
-	current_field_num = 0;
-}
-void LOG_OBJ_END(){
-	LOG_TEXT("}");
-}
 void LOG_FIELD(char* field_name, char* c, ...){
 	if(current_field_num > 0){
 		LOG_TEXT(", ");
@@ -497,6 +496,20 @@ void LOG_FIELD(char* field_name, char* c, ...){
 	va_end(args);
 
 	current_field_num++;
+}
+void LOG_OBJ_START(){
+	if(log_array_items > 0){
+		LOG_TEXT(",\n");
+	}
+	LOG_TEXT("{");
+	log_array_items++;
+
+	current_field_num = 0;
+
+	LOG_FIELD("timestamp_us", "%"PRId64, get_timestamp_us());
+}
+void LOG_OBJ_END(){
+	LOG_TEXT("}");
 }
 
 void LOG_START(){
