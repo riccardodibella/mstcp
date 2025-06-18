@@ -27,9 +27,9 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 2
+#define NUM_CLIENTS 1
 #define NUM_CLIENT_MESSAGES 1
-#define NUM_SERVER_MESSAGES 3000
+#define NUM_SERVER_MESSAGES 10000
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -56,7 +56,7 @@
 #define MAXTIMEOUT 2000
 //#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 32000
+#define RX_VIRTUAL_BUFFER_SIZE 10000
 #define TX_BUFFER_SIZE 64000
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
@@ -475,6 +475,11 @@ int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
 		*/
 		ERROR("search_tcp_option misaligned end of options (invalid last length)");
 	}
+	return to_return;
+}
+uint16_t update_next_ssn(uint16_t* ssn_field){
+	uint16_t to_return = *ssn_field;
+	*ssn_field = (to_return+1) % 1024; // 10 bits for ssn -> mod 1024
 	return to_return;
 }
 
@@ -1190,14 +1195,15 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
 	if(txctrl->sid >= 0){
 		tcp->window = htons(tcb->adwin[txctrl->sid]);
-		if(txctrl->ssn >= 512){
+		if(txctrl->ssn == 512){
 			if(!ssn_wrap_warning[txctrl->sid]){
 				//DEBUG("\n\n\n#######################\nnupdate_tcp_header enabling wrap warning sid %d\n#######################\n", txctrl->sid);
 			}
 			ssn_wrap_warning[txctrl->sid] = true;
 		}
 		if(txctrl->ssn == 0 && ssn_wrap_warning[txctrl->sid]){
-			ERROR("update_tcp_header sid %d wrapped\n", txctrl->sid);
+			DEBUG("update_tcp_header sid %d wrapped\n", txctrl->sid);
+			ssn_wrap_warning[txctrl->sid] = false;
 		}
 	}else{
 		tcp->window = htons(0);
@@ -1293,110 +1299,6 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 
-#if 0
-void direct_segmentation_scheduler(int s){
-	if(s < 3 || s >= MAX_FD){
-		ERROR("direct_segmentation_scheduler invalid fd %d", s);
-	}
-	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	if(tcb == NULL){
-		ERROR("direct_segmentation_scheduler tcb NULL");
-	}
-	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = malloc(max_payload_length);
-	for(int sid = 0; sid < TOT_SID; sid++){
-		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
-			// We can transmit some more data on the stream
-			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
-			while(available_bytes > 0){
-				int payload_length = MIN(available_bytes, max_payload_length);
-				for(int i=0; i<payload_length; i++){
-					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
-					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
-					tcb->txfree[sid]++;
-					available_bytes--;
-				}
-				if(!tcb->ms_option_enabled){
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-				}else{
-					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
-					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-					
-					// Stream update
-					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
-					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-		
-					tcb->next_ssn[sid]++;
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
-					free(opt);
-				}
-			}
-		}
-	}
-	free(temp_payload_buf);
-}
-
-void flow_controlled_scheduler(int s){
-	if(s < 3 || s >= MAX_FD){
-		ERROR("flow_controlled_scheduler invalid fd %d", s);
-	}
-	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	if(tcb == NULL){
-		ERROR("flow_controlled_scheduler tcb NULL");
-	}
-	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = malloc(max_payload_length);
-	for(int sid = 0; sid < TOT_SID; sid++){
-		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
-			// We can transmit some more data on the stream
-			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
-
-			/* FLOW CONTROL START */
-			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
-			struct txcontrolbuf* tx_cursor = tcb->txfirst;
-			while(tx_cursor != NULL){
-				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-					in_flight_bytes += tx_cursor->payloadlen;
-				}
-				tx_cursor = tx_cursor->next;
-			}
-			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Must always be >= 0
-			if(flow_control_allowed_bytes < 0){
-				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
-			}
-			available_bytes = MIN(available_bytes, MAX(flow_control_allowed_bytes, 0));
-			/* FLOW CONTROL END */
-
-			while(available_bytes > 0){
-				int payload_length = MIN(available_bytes, max_payload_length);
-				for(int i=0; i<payload_length; i++){
-					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
-					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
-					tcb->txfree[sid]++;
-					available_bytes--;
-				}
-				if(!tcb->ms_option_enabled){
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-				}else{
-					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
-					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-					
-					// Stream update
-					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
-					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-		
-					tcb->next_ssn[sid]++;
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
-					free(opt);
-				}
-			}
-		}
-	}
-	free(temp_payload_buf);
-}
-#endif
 
 void nagle_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
@@ -1454,8 +1356,8 @@ void nagle_scheduler(int s){
 					// Stream update
 					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
 					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-		
-					tcb->next_ssn[sid]++;
+					update_next_ssn(&(tcb->next_ssn[sid]));
+
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
 				}
@@ -1550,6 +1452,10 @@ int mysocket(int family, int type, int proto){
 	}
 }
 
+uint32_t gen_sequence_offset(){
+	// Should be random...
+	return 0;
+}
 
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
@@ -1589,7 +1495,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			fdinfo[s].sid = 0;
 			tcb->st = TCB_ST_CLOSED;
 
-			tcb->seq_offs=rand();
+			tcb->seq_offs=gen_sequence_offset();
 			tcb->ack_offs=0;
 			tcb->stream_end=0xFFFFFFFF; //Max file
 			tcb->mss = TCP_MSS;
@@ -1766,7 +1672,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			fdinfo[s].sid = 0;
 			tcb->st = TCB_ST_CLOSED;
 
-			tcb->seq_offs=rand();
+			tcb->seq_offs=gen_sequence_offset();
 			tcb->ack_offs=0;
 			tcb->stream_end=0xFFFFFFFF;
 			tcb->mss = TCP_MSS;
@@ -2052,7 +1958,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->r_addr = memcmp((uint8_t*) &ip->srcaddr, myip, 4) ? ip->srcaddr : inet_addr("127.0.0.1");
 				
 
-				tcb->seq_offs=rand();
+				tcb->seq_offs=gen_sequence_offset();
 				tcb->ack_offs=htonl(tcp->seq)+1;
 				tcb->cumulativeack=0;
 
@@ -2211,7 +2117,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				opt[2] = sid<<2;
 				opt[3] = 0; // SSN=0 for the opening segment
 
-				fdinfo[s].tcb->next_ssn[sid]++;
+				update_next_ssn(&(fdinfo[s].tcb->next_ssn[sid]));
 
 				uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
@@ -2461,7 +2367,7 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 			opt[2] = fdinfo[s].sid<<2 | (((fdinfo[s].tcb->next_ssn[fdinfo[s].sid])>>8) & 0x03);
 			opt[3] = (fdinfo[s].tcb->next_ssn[fdinfo[s].sid]) & 0xFF;
 
-			fdinfo[s].tcb->next_ssn[fdinfo[s].sid]++;
+			update_next_ssn(&(fdinfo[s].tcb->next_ssn[fdinfo[s].sid]));
 			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, opt, optlen);
 			free(opt);
 		}
@@ -2619,7 +2525,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		// Stream update
 		opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
 		opt[3] = (tcb->next_ssn[sid])&0xFF;
-		tcb->next_ssn[sid]++;
+		update_next_ssn(&(tcb->next_ssn[sid]));
 
 		uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
@@ -2938,12 +2844,14 @@ void myio(int ignored){
 						if(!tcb->ms_option_enabled){
 							ERROR("TODO insert in RX stream buffer non-MS");
 						}
+						/*
 						if((tcb->ms_option_requested || tcb->ms_option_enabled) && sid == 0 && ssn == 0){
 							// I don't really know how this might happen, but this for sure shouldn't happen so a check shouldn't hurt
 							// Note that the situation sid==0&&ssn==0 might happen if ms is not enabled or if the packet is only an ACK without payload
 							print_l2_packet(l2_rx_buf);
 							ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
 						}
+						*/
 						struct channel_rx_queue_node* cursor = newrx;
 						int current_candidate_ssn = ssn; // Do avoid "polluting" the variable "ssn" used for newrx
 						while(cursor != NULL && tcb->next_rx_ssn[sid] == current_candidate_ssn){
@@ -2964,7 +2872,7 @@ void myio(int ignored){
 								last->next = newrx_stream;
 							}
 
-							tcb->next_rx_ssn[sid]++;
+							update_next_ssn(&(tcb->next_rx_ssn[sid]));
 							// advance to the next segment of this stream in the channel RX queue
 							cursor = cursor->next;
 							while(cursor != NULL){
@@ -3025,7 +2933,7 @@ void myio(int ignored){
 							// Stream update
 							opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
 							opt[3] = (tcb->next_ssn[sid])&0xFF;
-							tcb->next_ssn[sid]++;
+							update_next_ssn(&(tcb->next_ssn[sid]));
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
