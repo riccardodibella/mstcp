@@ -28,8 +28,8 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_MESSAGES 1
-#define NUM_SERVER_MESSAGES 10000
+#define NUM_CLIENT_MESSAGES 500
+#define NUM_SERVER_MESSAGES 10
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -443,6 +443,14 @@ int64_t get_timestamp_us(){
 int64_t get_timestamp_ms(){
 	return get_timestamp_us() / 1000;
 }
+
+uint32_t get_tcp_timestamp_ms() {
+	// https://claude.ai/share/111f2d20-c083-4748-88ea-7e8f8ab2e514
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 // -1 if the option is not found, otherwise it returns the index for the "kind" field of the option
 int search_tcp_option(struct tcp_segment* tcp, uint8_t kind){
 	if(tcp == NULL){
@@ -552,6 +560,7 @@ void exit_handler(int sig) {
 void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 	struct tcp_segment* tcp = (struct tcp_segment*) segment_buf;
 	LOG_OBJ_START();
+	LOG_FIELD("type", "\"PKT\"");
 	LOG_FIELD("direction", "\"%s\"", direction);
 	int payload_length = len - (4*(tcp->d_offs_res >> 4));
 	LOG_FIELD("payload_length", "%d", payload_length);
@@ -585,6 +594,12 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		free(str);
 	}
 
+	LOG_OBJ_END();
+}
+void LOG_RTT(double rtt_sec){
+	LOG_OBJ_START();
+	LOG_FIELD("type", "\"RTT\"");
+	LOG_FIELD("value", "%f", rtt_sec);
 	LOG_OBJ_END();
 }
 void print_tcp_segment(struct tcp_segment* tcp){
@@ -1171,7 +1186,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
 
 			// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
-			*(uint32_t*) (tcp->payload+i+2) = htonl(tick);
+			*(uint32_t*) (tcp->payload+i+2) = htonl(get_tcp_timestamp_ms());
 
 			// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
 			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
@@ -2543,7 +2558,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
-	return;
 	if(tcb == NULL || tcp == NULL){
 		ERROR("rtt_estimate NULL param");
 	}
@@ -2551,14 +2565,19 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 	if(ts_index == -1){
 		ERROR("rtt_estimate segment without Timestamps option");
 	}
-	uint32_t rtt = tick - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
+	uint32_t now = get_tcp_timestamp_ms();
+	uint32_t rtt_ms = now - ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
+	double rtt_sec = ((double)rtt_ms)/1000; 
+	LOG_RTT(rtt_sec);
+	uint32_t rtt_ticks = rtt_ms * 1000 / TIMER_USECS;
+	return;
 	if(tcb->rtt_e == 0) {
-		tcb->rtt_e = rtt; 
-		tcb->Drtt_e = rtt/2; 
+		tcb->rtt_e = rtt_ticks; 
+		tcb->Drtt_e = rtt_ticks/2; 
 	}
 	else{
-		tcb->Drtt_e = ((8-BETA)*tcb->Drtt_e + BETA*abs(rtt-tcb->rtt_e))>>3;
-		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt)>>3;
+		tcb->Drtt_e = ((8-BETA)*tcb->Drtt_e + BETA*abs(rtt_ticks-tcb->rtt_e))>>3;
+		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt_ticks)>>3;
 	}
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
 }
@@ -2677,6 +2696,7 @@ void myio(int ignored){
 				continue;
 			}
 
+			#if 0
 			if(tcp->flags & ACK){
 				/* 
 				At this point I know that the connection is established, Timestamps is always supported, and I can modify my RTT estimate using the received segment.
@@ -2685,8 +2705,13 @@ void myio(int ignored){
 				// TODO spostare la chiamata, o farla solo in determinate condizioni https://www.rfc-editor.org/rfc/rfc7323#section-4
 				rtt_estimate(tcb, tcp);
 			}
+			#endif
 
 			if(tcp->flags & SYN){
+				if(tcp->flags & ACK){
+					// RTT estimate for SYN - SYN+ACK exchange
+					rtt_estimate(tcb, tcp);
+				}
 				// SYN or SYN+ACK packets don't need to remove anything from the queue and don't generate any ack after the FSM (everything is done in there)
 				continue;
 			}
@@ -2711,6 +2736,7 @@ void myio(int ignored){
 				}
 
 				if((htonl(tcp->ack)-shifter >= 0) && (htonl(tcp->ack)-shifter-(tcb->stream_end)?1:0 <= htonl(tcb->txlast->segment->seq) + tcb->txlast->payloadlen - shifter)){ // -1 is to compensate the FIN
+					bool send_window_advanced = false;
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
@@ -2734,8 +2760,26 @@ void myio(int ignored){
 						}
 						free(temp->segment);
 						free(temp);
-						if(tcb->txfirst	== NULL) tcb->txlast = NULL;
+						if(tcb->txfirst	== NULL){
+							tcb->txlast = NULL;
+						}
+
+						send_window_advanced = true;
 					}//While
+
+
+					if(send_window_advanced){
+						/*
+						Here we know that the received segment made an update to the "incoming" cumulativeack (it changed the left side of the send window).
+						According to RFC 7323, Section 4:
+						RTTM Rule:	A TSecr value received in a segment MAY be used to update
+									the averaged RTT measurement only if the segment advances
+									the left edge of the send window, i.e., SND.UNA is
+									increased.
+						// https://www.rfc-editor.org/rfc/rfc7323#section-4
+						*/
+						rtt_estimate(tcb, tcp);
+					}
 				}
 			}
 
