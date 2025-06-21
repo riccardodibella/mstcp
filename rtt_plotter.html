@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- https://claude.ai/share/7aab8112-1e13-40f9-9af6-f22bb2d6e75d -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTT Data Plotter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-date-fns/2.0.0/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(10px);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #4a5568;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            font-weight: 300;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        
+        .upload-area {
+            border: 3px dashed #cbd5e0;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            transition: all 0.3s ease;
+            background: rgba(237, 242, 247, 0.5);
+        }
+        
+        .upload-area:hover {
+            border-color: #667eea;
+            background: rgba(102, 126, 234, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        .upload-area.dragover {
+            border-color: #667eea;
+            background: rgba(102, 126, 234, 0.2);
+            transform: scale(1.02);
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .upload-btn {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .upload-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 500px;
+            margin-top: 30px;
+            background: white;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 8px 20px rgba(240, 147, 251, 0.3);
+            transition: transform 0.3s ease;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .stat-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        .error {
+            background: #fed7d7;
+            color: #c53030;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #c53030;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 RTT & RTO Data Visualization</h1>
+        
+        <div class="upload-area" id="uploadArea">
+            <p style="margin-bottom: 20px; font-size: 1.2em; color: #4a5568;">
+                Drop your JSON file here or click to browse
+            </p>
+            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                Choose File
+            </button>
+            <input type="file" id="fileInput" accept=".json" />
+        </div>
+        
+        <div id="errorDiv" class="hidden"></div>
+        
+        <div id="chartSection" class="hidden">
+            <div class="chart-container">
+                <canvas id="rttChart"></canvas>
+            </div>
+            
+            <div class="stats" id="statsContainer">
+                <!-- Stats will be populated by JavaScript -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let chart = null;
+        const fileInput = document.getElementById('fileInput');
+        const uploadArea = document.getElementById('uploadArea');
+        const errorDiv = document.getElementById('errorDiv');
+        const chartSection = document.getElementById('chartSection');
+        const statsContainer = document.getElementById('statsContainer');
+
+        // Handle drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFile(e.target.files[0]);
+            }
+        });
+
+        function showError(message) {
+            errorDiv.innerHTML = `<div class="error">❌ ${message}</div>`;
+            errorDiv.classList.remove('hidden');
+            chartSection.classList.add('hidden');
+        }
+
+        function hideError() {
+            errorDiv.classList.add('hidden');
+        }
+
+        function handleFile(file) {
+            if (!file.name.endsWith('.json')) {
+                showError('Please select a JSON file.');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    processData(data);
+                } catch (error) {
+                    console.error('JSON parsing error:', error);
+                    showError(`Invalid JSON file: ${error.message}. Please check the file format.`);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function processData(data) {
+            hideError();
+            
+            if (!Array.isArray(data)) {
+                showError('JSON file should contain an array of data points.');
+                return;
+            }
+
+            // Filter for RTT and RTO entries
+            const rttData = data.filter(item => item.type === 'RTT');
+            const rtoData = data.filter(item => item.type === 'RTO');
+            
+            if (rttData.length === 0 && rtoData.length === 0) {
+                showError('No RTT or RTO data found in the file.');
+                return;
+            }
+
+            // Sort by timestamp
+            rttData.sort((a, b) => a.timestamp_us - b.timestamp_us);
+            rtoData.sort((a, b) => a.timestamp_us - b.timestamp_us);
+
+            // Convert timestamps to dates and prepare chart data
+            const rttChartData = rttData.map(item => ({
+                x: new Date(item.timestamp_us / 1000), // Convert microseconds to milliseconds
+                y: item.value_s * 1000 // Convert seconds to milliseconds for display
+            }));
+
+            const rtoChartData = rtoData.map(item => ({
+                x: new Date(item.timestamp_us / 1000), // Convert microseconds to milliseconds
+                y: item.value_s * 1000 // Convert seconds to milliseconds for display
+            }));
+
+            createChart(rttChartData, rtoChartData);
+            updateStats(rttData, rtoData);
+            chartSection.classList.remove('hidden');
+        }
+
+        function createChart(rttData, rtoData) {
+            const ctx = document.getElementById('rttChart').getContext('2d');
+            
+            if (chart) {
+                chart.destroy();
+            }
+
+            // Find the earliest timestamp from both datasets
+            const allData = [...rttData, ...rtoData];
+            if (allData.length === 0) return;
+            
+            const startTime = Math.min(...allData.map(point => point.x.getTime()));
+
+            // Convert data to use relative time (seconds from start)
+            const rttChartData = rttData.map(point => ({
+                x: (point.x.getTime() - startTime) / 1000,
+                y: point.y
+            }));
+
+            const rtoChartData = rtoData.map(point => ({
+                x: (point.x.getTime() - startTime) / 1000,
+                y: point.y
+            }));
+
+            const datasets = [];
+            
+            if (rttData.length > 0) {
+                datasets.push({
+                    label: 'RTT (ms)',
+                    data: rttChartData,
+                    borderColor: 'rgb(102, 126, 234)',
+                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                });
+            }
+
+            if (rtoData.length > 0) {
+                datasets.push({
+                    label: 'RTO (ms)',
+                    data: rtoChartData,
+                    borderColor: 'rgb(245, 87, 108)',
+                    backgroundColor: 'rgba(245, 87, 108, 0.1)',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                });
+            }
+
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: {
+                                display: true,
+                                text: 'Time (seconds from start)'
+                            },
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(1) + 's';
+                                }
+                            }
+                        },
+                        y: {
+                            type: 'logarithmic',
+                            title: {
+                                display: true,
+                                text: 'Time (ms)'
+                            },
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(3) + 'ms';
+                                }
+                            }
+                        }
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Round Trip Time (RTT) & Retransmission Timeout (RTO) Over Time'
+                        },
+                        legend: {
+                            display: true
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(context) {
+                                    const originalTime = new Date(startTime + context[0].parsed.x * 1000);
+                                    return originalTime.toLocaleTimeString() + '.' + originalTime.getMilliseconds().toString().padStart(3, '0');
+                                },
+                                label: function(context) {
+                                    return `${context.dataset.label}: ${context.parsed.y.toFixed(3)}ms`;
+                                }
+                            }
+                        }
+                    },
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    }
+                }
+            });
+        }
+
+        function updateStats(rttData, rtoData) {
+            let statsHtml = '';
+
+            if (rttData.length > 0) {
+                const rttValues = rttData.map(item => item.value_s * 1000); // Convert to ms
+                const rttMin = Math.min(...rttValues);
+                const rttMax = Math.max(...rttValues);
+                const rttAvg = rttValues.reduce((a, b) => a + b, 0) / rttValues.length;
+                
+                const rttSorted = [...rttValues].sort((a, b) => a - b);
+                const rttMedian = rttSorted.length % 2 === 0 
+                    ? (rttSorted[rttSorted.length / 2 - 1] + rttSorted[rttSorted.length / 2]) / 2
+                    : rttSorted[Math.floor(rttSorted.length / 2)];
+
+                statsHtml += `
+                    <div class="stat-card">
+                        <div class="stat-value">${rttData.length}</div>
+                        <div class="stat-label">RTT Points</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${rttAvg.toFixed(2)}ms</div>
+                        <div class="stat-label">RTT Average</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${rttMedian.toFixed(2)}ms</div>
+                        <div class="stat-label">RTT Median</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${rttMin.toFixed(2)}ms</div>
+                        <div class="stat-label">RTT Min</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${rttMax.toFixed(2)}ms</div>
+                        <div class="stat-label">RTT Max</div>
+                    </div>
+                `;
+            }
+
+            if (rtoData.length > 0) {
+                const rtoValues = rtoData.map(item => item.value_s * 1000); // Convert to ms
+                const rtoMin = Math.min(...rtoValues);
+                const rtoMax = Math.max(...rtoValues);
+                const rtoAvg = rtoValues.reduce((a, b) => a + b, 0) / rtoValues.length;
+                
+                const rtoSorted = [...rtoValues].sort((a, b) => a - b);
+                const rtoMedian = rtoSorted.length % 2 === 0 
+                    ? (rtoSorted[rtoSorted.length / 2 - 1] + rtoSorted[rtoSorted.length / 2]) / 2
+                    : rtoSorted[Math.floor(rtoSorted.length / 2)];
+
+                statsHtml += `
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);">
+                        <div class="stat-value">${rtoData.length}</div>
+                        <div class="stat-label">RTO Points</div>
+                    </div>
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);">
+                        <div class="stat-value">${rtoAvg.toFixed(2)}ms</div>
+                        <div class="stat-label">RTO Average</div>
+                    </div>
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);">
+                        <div class="stat-value">${rtoMedian.toFixed(2)}ms</div>
+                        <div class="stat-label">RTO Median</div>
+                    </div>
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);">
+                        <div class="stat-value">${rtoMin.toFixed(2)}ms</div>
+                        <div class="stat-label">RTO Min</div>
+                    </div>
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);">
+                        <div class="stat-value">${rtoMax.toFixed(2)}ms</div>
+                        <div class="stat-label">RTO Max</div>
+                    </div>
+                `;
+            }
+
+            statsContainer.innerHTML = statsHtml;
+        }
+    </script>
+</body>
+</html>

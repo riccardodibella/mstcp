@@ -28,8 +28,8 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_MESSAGES 500
-#define NUM_SERVER_MESSAGES 10
+#define NUM_CLIENT_MESSAGES 1000
+#define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -53,7 +53,8 @@
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 36 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
-#define MAXTIMEOUT 2000
+#define MAXTIMEOUT_SEC 1
+#define MAXTIMEOUT (MAXTIMEOUT_SEC * 1000000 / TIMER_USECS)
 //#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
 #define RX_VIRTUAL_BUFFER_SIZE 10000
@@ -599,7 +600,14 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 void LOG_RTT(double rtt_sec){
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"RTT\"");
-	LOG_FIELD("value", "%f", rtt_sec);
+	LOG_FIELD("value_s", "%f", rtt_sec);
+	LOG_OBJ_END();
+}
+void LOG_RTO(long long rto_ticks){
+	LOG_OBJ_START();
+	LOG_FIELD("type", "\"RTO\"");
+	LOG_FIELD("value_ticks", "%lld", rto_ticks);
+	LOG_FIELD("value_s", "%f", ((double)rto_ticks)*TIMER_USECS/1000000);
 	LOG_OBJ_END();
 }
 void print_tcp_segment(struct tcp_segment* tcp){
@@ -2570,7 +2578,6 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 	double rtt_sec = ((double)rtt_ms)/1000; 
 	LOG_RTT(rtt_sec);
 	uint32_t rtt_ticks = rtt_ms * 1000 / TIMER_USECS;
-	return;
 	if(tcb->rtt_e == 0) {
 		tcb->rtt_e = rtt_ticks; 
 		tcb->Drtt_e = rtt_ticks/2; 
@@ -2580,6 +2587,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt_ticks)>>3;
 	}
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
+	LOG_RTO(tcb->timeout);
 }
 void print_rx_queue(struct tcpctrlblk* tcb){
 	struct channel_rx_queue_node *cursor = tcb->unack;
@@ -3111,13 +3119,22 @@ void mytimer(int ignored){
 void full_duplex_app(int* client_sockets, int n){
 	int* current_msg_num = calloc(n, sizeof(int));
 	int* current_msg_sent_bytes = calloc(n, sizeof(int));
+	int64_t* next_tx_ms = calloc(n, sizeof(int64_t));
 	for(int i=0; i<n; i++){
 		current_msg_num[i] = 0;
 		current_msg_sent_bytes[i] = 0;
+		next_tx_ms[i] = 0;
 	}
 	while(true){
-		// Client: TX
+		// TX
 		for(int i=0; i<NUM_CLIENTS; i++){
+			if(next_tx_ms[i] > 0){
+				if(get_timestamp_ms() < next_tx_ms[i]){
+					continue;
+				}else{
+					next_tx_ms[i] = 0;
+				}
+			}
 			if(current_msg_num[i] < ((MAIN_MODE == CLIENT) ? NUM_CLIENT_MESSAGES : NUM_SERVER_MESSAGES)){
 				uint8_t data[100];
 				sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
@@ -3139,14 +3156,19 @@ void full_duplex_app(int* client_sockets, int n){
 					//DEBUG("w %d %d", i, current_msg_num[i]);
 					current_msg_num[i]++;
 					current_msg_sent_bytes[i] = 0;
+					if(rand()%100 == 0){
+						int64_t ms_wait = rand() % 1000; // Not really uniform, but ok...
+						//DEBUG("wait %u ms", ms_wait);
+						next_tx_ms[i] = get_timestamp_ms() + ms_wait;
+					}
 				}
 			}
 		}
 
-		// Server: RX
+		// RX
 		for(int i=0; i<n; i++){
 			int s = client_sockets[i];
-			char myread_buf[100];
+			char myread_buf[2000];
 			memset(myread_buf, 0, sizeof(myread_buf));
 			int n = myread(s, myread_buf, sizeof(myread_buf)-1);
 			if(n == -1 && errno == EAGAIN){
@@ -3246,7 +3268,7 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("myconnect OK");
-		persistent_nanosleep(2,0);
+		persistent_nanosleep(1,0);
 		for(int i=1; i<NUM_CLIENTS; i++){
 			int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
 			if(s_loop == -1){
