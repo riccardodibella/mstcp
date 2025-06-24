@@ -336,11 +336,12 @@
                             }
                         },
                         y: {
-                            type: 'logarithmic',
+                            type: 'linear',
                             title: {
                                 display: true,
                                 text: 'Time (ms)'
                             },
+                            beginAtZero: true,
                             ticks: {
                                 callback: function(value) {
                                     return value.toFixed(3) + 'ms';

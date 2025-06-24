@@ -28,7 +28,7 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_MESSAGES 1000
+#define NUM_CLIENT_MESSAGES 1000000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
@@ -53,8 +53,12 @@
 #define MAX_ARP 200 // number of lines in the ARP cache
 #define MAX_FD 36 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
-#define MAXTIMEOUT_SEC 1
-#define MAXTIMEOUT (MAXTIMEOUT_SEC * 1000000 / TIMER_USECS)
+#define MIN_TIMEOUT_MSEC 300
+#define MIN_TIMEOUT (MIN_TIMEOUT_MSEC * 1000 / TIMER_USECS)
+#define INIT_TIMEOUT_SEC 1
+#define INIT_TIMEOUT (INIT_TIMEOUT_SEC * 1000000 / TIMER_USECS)
+#define MAX_TIMEOUT_SEC 10
+#define MAX_TIMEOUT (MAX_TIMEOUT_SEC * 1000000 / TIMER_USECS)
 //#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
 #define RX_VIRTUAL_BUFFER_SIZE 10000
@@ -362,7 +366,6 @@ unsigned char gateway[4];
 /* TXBUFSIZE and INIT_TIMEOUT may be modified at program startup */
 //int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
 // int INIT_TIMEOUT = 300*1000; // #define INIT_TIMEOUT (((g_argc<4) ?(300*1000):(atoi(g_argv[3])*1000))/TIMER_USECS)
-int INIT_TIMEOUT = MAXTIMEOUT;
 
 int unique_raw_socket_fd = -1; // mytcp: unique_s
 
@@ -594,6 +597,14 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		LOG_FIELD("payload_str", "\"%s\"", str);
 		free(str);
 	}
+	int ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
+	if(ts_index>=0){
+		uint32_t ts_val = ntohl(*(uint32_t*) (tcp->payload+ts_index+2));
+		uint32_t ts_recent = ntohl(*(uint32_t*) (tcp->payload+ts_index+6));
+		LOG_FIELD("ts_val", "%"PRIu32, ts_val);
+		LOG_FIELD("ts_recent", "%"PRIu32, ts_recent);
+	}
+	
 
 	LOG_OBJ_END();
 }
@@ -1075,7 +1086,7 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
 
-	txcb->txtime = -MAXTIMEOUT ; 
+	txcb->txtime = -MAX_TIMEOUT ; 
 	txcb->payloadlen = payloadlen;
 	txcb->dummy_payload = flags & DMP;
 	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
@@ -2586,7 +2597,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->Drtt_e = ((8-BETA)*tcb->Drtt_e + BETA*abs(rtt_ticks-tcb->rtt_e))>>3;
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt_ticks)>>3;
 	}
-	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,300*1000/TIMER_USECS), MAXTIMEOUT);
+	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,MIN_TIMEOUT), MAX_TIMEOUT);
 	LOG_RTO(tcb->timeout);
 }
 void print_rx_queue(struct tcpctrlblk* tcb){
@@ -2704,16 +2715,6 @@ void myio(int ignored){
 				continue;
 			}
 
-			#if 0
-			if(tcp->flags & ACK){
-				/* 
-				At this point I know that the connection is established, Timestamps is always supported, and I can modify my RTT estimate using the received segment.
-				For the Active Open side, this estimate includes also the RTT for the first SYN / SYN+ACK exchange
-				*/
-				// TODO spostare la chiamata, o farla solo in determinate condizioni https://www.rfc-editor.org/rfc/rfc7323#section-4
-				rtt_estimate(tcb, tcp);
-			}
-			#endif
 
 			if(tcp->flags & SYN){
 				if(tcp->flags & ACK){
@@ -3008,7 +3009,15 @@ void myio(int ignored){
 			uint32_t ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
 			uint32_t segment_ts_val = ntohl(*(uint32_t*) (tcp->payload+ts_index+2));
 			uint32_t segment_seq = ntohl(tcp->seq);
-			if((segment_ts_val - tcb->ts_offset) >= (tcb->ts_recent - tcb->ts_offset) && (segment_seq - tcb->ack_offs) <= tcb->cumulativeack){
+			/*
+			(2)	If:
+					SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+				then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+			*/
+			if(		((segment_ts_val - tcb->ts_offset) >= (tcb->ts_recent - tcb->ts_offset)) 
+					&& 
+					((segment_seq - tcb->ack_offs) <= tcb->cumulativeack)
+				){
 				tcb->ts_recent = segment_ts_val;
 			}
 
@@ -3156,8 +3165,8 @@ void full_duplex_app(int* client_sockets, int n){
 					//DEBUG("w %d %d", i, current_msg_num[i]);
 					current_msg_num[i]++;
 					current_msg_sent_bytes[i] = 0;
-					if(rand()%100 == 0){
-						int64_t ms_wait = rand() % 1000; // Not really uniform, but ok...
+					if(rand()%1000 == 0){
+						int64_t ms_wait = rand() % 200; // Not really uniform, but ok...
 						//DEBUG("wait %u ms", ms_wait);
 						next_tx_ms[i] = get_timestamp_ms() + ms_wait;
 					}
