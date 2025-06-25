@@ -27,7 +27,7 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 1
+#define NUM_CLIENTS 2
 #define NUM_CLIENT_MESSAGES 1000000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
@@ -529,38 +529,6 @@ void LOG_OBJ_END(){
 	LOG_TEXT("}");
 }
 
-void LOG_START(){
-	char* filename;
-	char* text;
-	if(MAIN_MODE == CLIENT){
-		filename = "log_client.json";
-	}else{
-		filename = "log_server.json";
-	}
-
-	log_file = fopen(filename, "w");
-	if(log_file == NULL){
-		perror("LOG_START fopen");
-		ERROR("log_file not created");
-	}
-	text = "[\n";
-	LOG_TEXT(text);
-}
-void LOG_END(){
-	if(log_file == NULL){
-		// Prevents issues when the end function is called more than one time
-		return;
-	}
-	LOG_TEXT("\n]");
-	fclose(log_file);
-	log_file = NULL;
-}
-
-void exit_handler(int sig) {
-    LOG_END();
-    exit(0);
-}
-
 void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 	struct tcp_segment* tcp = (struct tcp_segment*) segment_buf;
 	LOG_OBJ_START();
@@ -621,6 +589,47 @@ void LOG_RTO(long long rto_ticks){
 	LOG_FIELD("value_s", "%f", ((double)rto_ticks)*TIMER_USECS/1000000);
 	LOG_OBJ_END();
 }
+void LOG_MESSAGE(char* msg){
+	LOG_OBJ_START();
+	LOG_FIELD("type", "\"MSG\"");
+	LOG_FIELD("text", "\"%s\"", msg);
+	LOG_OBJ_END();
+}
+
+void LOG_START(){
+	char* filename;
+	char* text;
+	if(MAIN_MODE == CLIENT){
+		filename = "log_client.json";
+	}else{
+		filename = "log_server.json";
+	}
+
+	log_file = fopen(filename, "w");
+	if(log_file == NULL){
+		perror("LOG_START fopen");
+		ERROR("log_file not created");
+	}
+	text = "[\n";
+	LOG_TEXT(text);
+	LOG_MESSAGE("Program start");
+}
+void LOG_END(){
+	if(log_file == NULL){
+		// Prevents issues when the end function is called more than one time
+		return;
+	}
+	LOG_MESSAGE("Program end");
+	LOG_TEXT("\n]");
+	fclose(log_file);
+	log_file = NULL;
+}
+
+void exit_handler(int sig) {
+    LOG_END();
+    exit(0);
+}
+
 void print_tcp_segment(struct tcp_segment* tcp){
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
@@ -996,10 +1005,12 @@ unsigned short int ip_checksum(char * b, int len){
 }
 
 void forge_ip(struct ip_datagram * ip, int payloadsize, char proto, unsigned int target){
+	static uint16_t id_counter = 0;
 	ip->ver_ihl=0x45;
 	ip->tos=0;
 	ip->totlen=htons(20+payloadsize);
-	ip->id = rand()&0xFFFF;
+	ip->id = htons(id_counter);
+	id_counter++;
 	ip->fl_offs=htons(0);
 	ip->ttl=128;
 	ip->proto = proto;
@@ -1038,7 +1049,6 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	if(proto == TCP_PROTO){
 		LOG_TCP_SEGMENT("OUT", payload, payloadlen);
 	}
-
 	forge_ethernet(eth,destmac,0x0800);
 	forge_ip(ip,payloadlen,proto,*(unsigned int *)targetip); 
 	memcpy(ip->payload,payload,payloadlen);
@@ -1048,9 +1058,12 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	sll.sll_family=AF_PACKET;
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 
+	const int num_bytes_sendto = 14+20+payloadlen;
 	int attempts = 0;
 	st:
-	t=sendto(unique_raw_socket_fd, packet,14+20+payloadlen, 0, (struct sockaddr *)&sll,len);
+	;
+	// Why would this call block?
+	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		if(errno == EMSGSIZE){
 			ERROR("EMSGSIZE");
@@ -1064,6 +1077,9 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 			goto st;
 		}
 		exit(EXIT_FAILURE);
+	}
+	if(t != num_bytes_sendto){
+		DEBUG("sendto result %d != num_bytes_sendto %d", t, num_bytes_sendto);
 	}
 
 	if(attempts > 0){
@@ -3102,8 +3118,18 @@ void mytimer(int ignored){
 			if(txcb->retry == 0){
 				//DEBUG("Segment TX");
 			}else{
-				//if(txcb->retry > 1){ continue; } // TODO togliere assolutamente
-				//DEBUG("Segment RETX %d", txcb->retry);
+				DEBUG("Segment RETX %d", txcb->retry);
+
+				// 
+				/*
+				Copiato da congctrl_fsm(event = TIMEOUT)
+				Al momento aumento solo il timeout. Questo porterà ad un aumento improvviso fino a MAX_TIMEOUT se ci sono tanti segmenti
+				in volo quando ne viene perso uno, perchè si aumenterà il timeout per ciascuno di essi quando verranno ritrasmessi. 
+				Per avere un comportamento simile a TCP Tahoe, bisognerebbe ridurre la cwnd a 1 segmento
+				*/
+				tcb->timeout = MIN(MAX_TIMEOUT, tcb->timeout*2);
+				tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
+				LOG_RTO(tcb->timeout);
 			}
 			txcb->retry++;
 
@@ -3165,11 +3191,6 @@ void full_duplex_app(int* client_sockets, int n){
 					//DEBUG("w %d %d", i, current_msg_num[i]);
 					current_msg_num[i]++;
 					current_msg_sent_bytes[i] = 0;
-					if(rand()%1000 == 0){
-						int64_t ms_wait = rand() % 200; // Not really uniform, but ok...
-						//DEBUG("wait %u ms", ms_wait);
-						next_tx_ms[i] = get_timestamp_ms() + ms_wait;
-					}
 				}
 			}
 		}
@@ -3183,7 +3204,7 @@ void full_duplex_app(int* client_sockets, int n){
 			if(n == -1 && errno == EAGAIN){
 				continue;
 			}
-			DEBUG("r |%s|", myread_buf);
+			//DEBUG("r |%s|", myread_buf);
 		}
 	}
 	free(current_msg_num);
