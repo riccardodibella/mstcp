@@ -27,8 +27,14 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
-#define NUM_CLIENTS 2
-#define NUM_CLIENT_MESSAGES 1000000
+#define NUM_CLIENTS 32
+
+/*
+Up to 10000 is very safe, even with 32 streams, on a stable network. 
+Up to 100000 is safe with very few streams. 
+Up to 1000000 is safe only with 1 client, otherwise it breaks for some (unknown) reason.
+*/
+#define NUM_CLIENT_MESSAGES 10000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
@@ -3154,22 +3160,13 @@ void mytimer(int ignored){
 void full_duplex_app(int* client_sockets, int n){
 	int* current_msg_num = calloc(n, sizeof(int));
 	int* current_msg_sent_bytes = calloc(n, sizeof(int));
-	int64_t* next_tx_ms = calloc(n, sizeof(int64_t));
 	for(int i=0; i<n; i++){
 		current_msg_num[i] = 0;
 		current_msg_sent_bytes[i] = 0;
-		next_tx_ms[i] = 0;
 	}
 	while(true){
 		// TX
 		for(int i=0; i<NUM_CLIENTS; i++){
-			if(next_tx_ms[i] > 0){
-				if(get_timestamp_ms() < next_tx_ms[i]){
-					continue;
-				}else{
-					next_tx_ms[i] = 0;
-				}
-			}
 			if(current_msg_num[i] < ((MAIN_MODE == CLIENT) ? NUM_CLIENT_MESSAGES : NUM_SERVER_MESSAGES)){
 				uint8_t data[100];
 				sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
@@ -3187,7 +3184,7 @@ void full_duplex_app(int* client_sockets, int n){
 				}
 				current_msg_sent_bytes[i] += res;
 				if(current_msg_sent_bytes[i] == strlen(data)){
-					//DEBUG("mywrite |%s|", data);
+					//DEBUG("w |%s|", data);
 					//DEBUG("w %d %d", i, current_msg_num[i]);
 					current_msg_num[i]++;
 					current_msg_sent_bytes[i] = 0;
