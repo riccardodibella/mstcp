@@ -27,6 +27,20 @@
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
+
+/*
+Nota del 28/06/2025
+Ipotesi: ad oggi (ultimo commit "11 test 32 streams 10K msg") vedo che, per un numero di messaggi molto alto, se aumento anche 
+il numero di client (stream) il sistema si impianta, e vedo anche che ci sono molte più ritrasmissioni. La mia ipotesi è che questo sia legato ad un bug
+nel codice che per qualche motivo non gestisce bene un evento di congestione serio (non una perdita occasionale di un singolo pacchetto, che sembra
+essere gestita correttamente e aumenta solo l'RTO in questo momento). Con pochi stream questo non si verifica, perchè non è ancora implementata l'opzione
+di window scale, e 16KB per ogni client probabilmente non saturano la capacità del canale se i client sono pochi. Aumentando il numero di client si aumenta
+il numero massimo di byte che possono essere in viaggio per tutta la connessione, considerando solo le advertised window, e questo potrebbe portare al
+superamento della capacità del canale. Non ho verificato questa ipotesi, ma se l'introduzione di un Congestion Control (possibilmente molto conservativo)
+risolve il problema per un numero elevato di client allora forse l'ipotesi potrebbe essere giusta, in particolare se il problema dovesse peggiorare quando si
+aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
+il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
+*/
 #define NUM_CLIENTS 32
 
 /*
@@ -34,7 +48,7 @@ Up to 10000 is very safe, even with 32 streams, on a stable network.
 Up to 100000 is safe with very few streams. 
 Up to 1000000 is safe only with 1 client, otherwise it breaks for some (unknown) reason.
 */
-#define NUM_CLIENT_MESSAGES 10000
+#define NUM_CLIENT_MESSAGES 1000000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
@@ -291,6 +305,7 @@ struct tcpctrlblk{
 	long long timeout; // Channel property
 	unsigned int sequence; // Channel property 
 	unsigned int mss; // Channel property
+	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH (when ms-tcp is enabled, otherwise... I don't yet know)
 	unsigned int stream_end; // Channel property (bad name)
 	unsigned int fsm_timer; // Channel property
 	unsigned short init_radwin; // Used in MS-TCP as a default value for radwin of new streams
@@ -317,8 +332,7 @@ struct tcpctrlblk{
 	uint32_t ts_recent; // Channel property
 	uint32_t ts_offset; // Channel property, assumes the value of the 1st TS received from the peer
 
-	/* CONG CTRL (channel properties) */
-	//#ifdef CONGCTRL
+	/* CONGESTION CONTROL (channel properties) */
 	unsigned int ssthreshold;
 	unsigned int rtt_e;
 	unsigned int Drtt_e;
@@ -328,7 +342,6 @@ struct tcpctrlblk{
 	unsigned int flightsize;
 	unsigned int cgwin;
 	unsigned int lta;
-	//#endif
 };
 
 /*
@@ -1268,6 +1281,128 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 }
 
 
+
+
+
+
+
+
+void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize){
+	if(event == FSM_EVENT_PKT_RCV){
+		//DEBUG(" ACK: %d last ACK: %d",htonl(tcp->ack)-tcb->seq_offs, htonl(tcb->last_ack)-tcb->seq_offs);
+		switch( tcb->cong_st ){
+			case CONGCTRL_ST_SLOW_START : 
+				// when GRO is active tcb->cgwin += (htonl(tcp->ack)-htonl(tcb->last_ack));
+				tcb->cgwin += tcb->payload_mss;
+				if(tcb->cgwin > tcb->ssthreshold) {
+					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
+					//DEBUG(" SLOW START->CONG AVOID");	
+					tcb->repeated_acks = 0;
+				}
+				break;
+			case CONGCTRL_ST_CONG_AVOID: 
+				/* 
+				RFC 5681 page 9: 
+				1.   On the first and second duplicate ACKs received at a sender, a
+					TCP SHOULD send a segment of previously unsent data per [RFC3042] provided that the receiver's advertised window allows, the total
+					FlightSize would remain less than or equal to cwnd plus 2*SMSS, and that new data is available for transmission.  Further, the
+					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042]. 
+				*/
+				// Rimossa la condizione sulla window perchè non necessaria / incompatibile con MSTCP. Andrà rimessa nel caso in cui Multi-Stream sia disattivato
+				if((((tcp->flags)&(SYN|FIN))==0) && streamsegmentsize==0 && /*(htons(tcp->window) == tcb->radwin) &&*/ (tcp->ack == tcb->last_ack)){
+					if( tcp->ack == tcb->last_ack){
+						tcb->repeated_acks++;
+					}
+				}
+				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
+				if((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2)){
+					if (tcb->flightsize<=tcb->cgwin + 2* (tcb->payload_mss)){
+						tcb->lta = tcb->repeated_acks+2*tcb->payload_mss; //RFC 3042 Limited Transmit Extra-TX-win;
+					}
+				}
+				/*
+				2.  When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the value given in equation (4).  When [RFC3042]
+					is in use, additional data sent in limited transmit MUST NOT be included in this calculation.
+													ssthresh = max (FlightSize / 2, 2*SMSS)            (4)
+				*/
+				else if (tcb->repeated_acks == 3){
+					//DEBUG(" THIRD ACK...");
+					if(tcb->txfirst!= NULL){
+						struct txcontrolbuf * txcb;
+						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
+						tcb->cgwin = tcb->ssthreshold + 2*tcb->payload_mss; /* The third increment is in the FAST_RECOV state*/
+
+						/*
+						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
+						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
+						*/
+						unsigned int shifter = MIN(htonl(tcb->txfirst->segment->seq),htonl(tcb->txfirst->segment->ack));
+						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
+							tcb->txfirst->txtime = 0; //immediate retransmission
+						}
+						//DEBUG(" FAST RETRANSMIT....");
+						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
+						//DEBUG(" CONG AVOID-> FAST_RECOVERY");
+					}
+				}
+				else {// normal CONG AVOID 
+					tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
+					if (tcb->cgwin<tcb->payload_mss){
+						tcb->cgwin = tcb->payload_mss;
+					}
+				}
+				break;
+
+			case CONGCTRL_ST_FAST_RECOV:
+				/*
+				4.  For each additional duplicate ACK received (after the third), cwnd MUST be incremented by SMSS.  This artificially inflates the
+					congestion window in order to reflect the additional segment that has left the network.
+				*/
+				if(tcb->last_ack==tcp->ack) {
+					tcb->cgwin += tcb->payload_mss;
+					//DEBUG(" Increasing congestion window to : %d", tcb->cgwin);
+				} else {
+					/*
+					6.  When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
+						set in step 2).  This is termed "deflating" the window.
+					*/
+					tcb->cgwin = tcb->ssthreshold;
+					tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
+					//DEBUG("FAST_RECOVERY ---> CONG_AVOID");
+					tcb->repeated_acks=0;
+				}
+				break;
+        }
+		tcb->last_ack = tcp->ack; //in network order
+	
+	} else if (event == FSM_EVENT_TIMEOUT) {
+		if(tcb->cong_st == CONGCTRL_ST_CONG_AVOID) tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
+		if(tcb->cong_st == CONGCTRL_ST_FAST_RECOV) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
+		if(tcb->cong_st == CONGCTRL_ST_SLOW_START) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
+		tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
+		tcb->timeout = MIN( MAX_TIMEOUT , tcb->timeout*2 );
+		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
+		//DEBUG(" TIMEOUT: --->SLOW_START");
+		tcb->cong_st = CONGCTRL_ST_SLOW_START;
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offset, struct ip_datagram* ip, struct tcp_segment* tcp, struct channel_rx_queue_node* next){
 	// IP datagram is needed for segment and payload lengths
 	// Instead of channel_offset we could pass the tcb as a parameter and calculate the channel_offset again here
@@ -1555,6 +1690,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ack_offs=0;
 			tcb->stream_end=0xFFFFFFFF; //Max file
 			tcb->mss = TCP_MSS;
+			tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
 			tcb->sequence=0;
 			tcb->cumulativeack = 0;
 			tcb->timeout = INIT_TIMEOUT;
@@ -1732,6 +1868,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ack_offs=0;
 			tcb->stream_end=0xFFFFFFFF;
 			tcb->mss = TCP_MSS;
+			tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
 			tcb->sequence=0;
 			tcb->cumulativeack = 0;
 			tcb->timeout = INIT_TIMEOUT;
@@ -1894,6 +2031,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->in_window_scale_factor = win_scale_factor_received;
 					if(mss_received < tcb->mss){
 						tcb->mss = mss_received;
+						tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
 					}
 					tcb->ts_offset = tcb->ts_recent = received_remote_timestamp;
 
@@ -2000,6 +2138,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				tcb->in_window_scale_factor = win_scale_factor_received;
 				tcb->mss = MIN(mss_received, TCP_MSS);
+				tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
 				tcb->ts_offset = tcb->ts_recent = received_remote_timestamp;
 
 				tcb->ms_option_enabled = ms_received && MS_ENABLED;
@@ -2408,7 +2547,7 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 	int start_byte_number = 0;
 	while(start_byte_number < maxlen){
 		int remaining_length = maxlen - start_byte_number;
-		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH);
+		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH); // TODO we should read the MSS from the tcb, not from the TCP_MSS macro
 		
 		disable_signal_reception();
 
@@ -2811,6 +2950,8 @@ void myio(int ignored){
 						*/
 						rtt_estimate(tcb, tcp);
 					}
+
+					congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length);
 				}
 			}
 
@@ -3091,7 +3232,7 @@ void mytimer(int ignored){
 		struct txcontrolbuf* txcb = tcb->txfirst;
 		struct txcontrolbuf* prev = NULL;
 		int acc = 0; // payload bytes accumulator
-		while(txcb != NULL /*&& acc < tcb->cgwin+tcb->lta*/){
+		while(txcb != NULL && (acc < tcb->cgwin+tcb->lta || txcb->payloadlen == 0 || txcb->dummy_payload)){
 			// Karn invalidation not handled
 			if(txcb->retry == 0){
 				// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
@@ -3099,7 +3240,7 @@ void mytimer(int ignored){
 					tcb->flightsize += txcb->payloadlen;
 				}
 			} else if(txcb->txtime+tcb->timeout > tick){
-				acc += txcb->totlen;
+				acc += txcb->payloadlen;
 				txcb = txcb->next;
 				continue;
 			}
@@ -3121,20 +3262,9 @@ void mytimer(int ignored){
 			}
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
 			txcb->txtime = tick;
-			if(txcb->retry == 0){
-				//DEBUG("Segment TX");
-			}else{
-				DEBUG("Segment RETX %d", txcb->retry);
-
-				// 
-				/*
-				Copiato da congctrl_fsm(event = TIMEOUT)
-				Al momento aumento solo il timeout. Questo porterà ad un aumento improvviso fino a MAX_TIMEOUT se ci sono tanti segmenti
-				in volo quando ne viene perso uno, perchè si aumenterà il timeout per ciascuno di essi quando verranno ritrasmessi. 
-				Per avere un comportamento simile a TCP Tahoe, bisognerebbe ridurre la cwnd a 1 segmento
-				*/
-				tcb->timeout = MIN(MAX_TIMEOUT, tcb->timeout*2);
-				tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
+			if(txcb->retry > 0 && !is_fast_transmit){
+				//DEBUG("Segment RETX %d", txcb->retry);
+				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0);
 				LOG_RTO(tcb->timeout);
 			}
 			txcb->retry++;
@@ -3142,7 +3272,7 @@ void mytimer(int ignored){
 			update_tcp_header(i, txcb);
 			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
 
-			acc += txcb->totlen;
+			acc += txcb->payloadlen;
 			prev = txcb;
 			txcb = txcb->next;
 		}
@@ -3200,6 +3330,9 @@ void full_duplex_app(int* client_sockets, int n){
 			int n = myread(s, myread_buf, sizeof(myread_buf)-1);
 			if(n == -1 && errno == EAGAIN){
 				continue;
+			}
+			if(i == NUM_CLIENTS-1){
+				DEBUG("r |%s|", myread_buf);
 			}
 			//DEBUG("r |%s|", myread_buf);
 		}
