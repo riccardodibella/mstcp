@@ -608,6 +608,15 @@ void LOG_RTO(long long rto_ticks){
 	LOG_FIELD("value_s", "%f", ((double)rto_ticks)*TIMER_USECS/1000000);
 	LOG_OBJ_END();
 }
+void LOG_CONGCTRL(struct tcpctrlblk* tcb){
+	LOG_OBJ_START();
+	LOG_FIELD("type", "\"CNG\"");
+	LOG_FIELD("state", "%u", tcb->cong_st);
+	LOG_FIELD("ssth", "%u", tcb->ssthreshold);
+	LOG_FIELD("cgwin", "%u", tcb->cgwin);
+	LOG_FIELD("p_mss", "%u", tcb->payload_mss);
+	LOG_OBJ_END();
+}
 void LOG_MESSAGE(char* msg){
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"MSG\"");
@@ -1289,14 +1298,15 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 
 void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize){
 	if(event == FSM_EVENT_PKT_RCV){
+		bool dmp = tcp->d_offs_res & (DMP >> 8);
 		//DEBUG(" ACK: %d last ACK: %d",htonl(tcp->ack)-tcb->seq_offs, htonl(tcb->last_ack)-tcb->seq_offs);
 		switch( tcb->cong_st ){
-			case CONGCTRL_ST_SLOW_START : 
+			case CONGCTRL_ST_SLOW_START: 
 				// when GRO is active tcb->cgwin += (htonl(tcp->ack)-htonl(tcb->last_ack));
 				tcb->cgwin += tcb->payload_mss;
 				if(tcb->cgwin > tcb->ssthreshold) {
 					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
-					//DEBUG(" SLOW START->CONG AVOID");	
+					DEBUG("SLOW START->CONG AVOID");	
 					tcb->repeated_acks = 0;
 				}
 				break;
@@ -1342,14 +1352,16 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						}
 						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
-						//DEBUG(" CONG AVOID-> FAST_RECOVERY");
+						DEBUG("CONG AVOID-> FAST_RECOVERY");
 					}
 				}
 				else {// normal CONG AVOID 
-					tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
-					if (tcb->cgwin<tcb->payload_mss){
-						tcb->cgwin = tcb->payload_mss;
-					}
+					//if( streamsegmentsize > 0 && !dmp){
+						tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
+						if (tcb->cgwin<tcb->payload_mss){
+							tcb->cgwin = tcb->payload_mss;
+						}
+					//}
 				}
 				break;
 
@@ -1368,7 +1380,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					*/
 					tcb->cgwin = tcb->ssthreshold;
 					tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
-					//DEBUG("FAST_RECOVERY ---> CONG_AVOID");
+					DEBUG("FAST_RECOVERY ---> CONG_AVOID");
 					tcb->repeated_acks=0;
 				}
 				break;
@@ -1382,9 +1394,10 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 		tcb->timeout = MIN( MAX_TIMEOUT , tcb->timeout*2 );
 		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
-		//DEBUG(" TIMEOUT: --->SLOW_START");
+		DEBUG("TIMEOUT: --->SLOW_START");
 		tcb->cong_st = CONGCTRL_ST_SLOW_START;
 	}
+	LOG_CONGCTRL(tcb);
 }
 
 
@@ -1704,8 +1717,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ts_recent = 0;
 			tcb->ts_offset = 0;
 
-			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
-			tcb->cgwin = INIT_CGWIN* TCP_MSS;
+			tcb->ssthreshold = INIT_THRESH * tcb->payload_mss;
+			tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 			tcb->rtt_e = 0;
 			tcb->Drtt_e = 0;
 			tcb->cong_st = CONGCTRL_ST_SLOW_START;
@@ -1882,8 +1895,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->ts_recent = 0;
 			tcb->ts_offset = 0;
 
-			tcb->ssthreshold = INIT_THRESH * TCP_MSS;
-			tcb->cgwin = INIT_CGWIN* TCP_MSS;
+			tcb->ssthreshold = INIT_THRESH * tcb->payload_mss;
+			tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 			tcb->rtt_e = 0;
 			tcb->Drtt_e = 0;
 			tcb->cong_st = CONGCTRL_ST_SLOW_START;
@@ -2143,8 +2156,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				tcb->ms_option_enabled = ms_received && MS_ENABLED;
 
-				tcb->ssthreshold = INIT_THRESH * TCP_MSS;
-				tcb->cgwin = INIT_CGWIN* TCP_MSS;
+				tcb->ssthreshold = INIT_THRESH * tcb->payload_mss;
+				tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 				tcb->rtt_e = 0;
 				tcb->Drtt_e = 0;
 				tcb->cong_st = CONGCTRL_ST_SLOW_START;
