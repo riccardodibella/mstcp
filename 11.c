@@ -41,14 +41,14 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 32
+#define NUM_CLIENTS 4
 
 /*
 Up to 10000 is very safe, even with 32 streams, on a stable network. 
 Up to 100000 is safe with very few streams. 
 Up to 1000000 is safe only with 1 client, otherwise it breaks for some (unknown) reason.
 */
-#define NUM_CLIENT_MESSAGES 1000000
+#define NUM_CLIENT_MESSAGES 10000000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
@@ -811,17 +811,21 @@ void assert_handler_lock_acquired(char* error_string){
 	}
 }
 
-void enable_signal_reception(){
+void enable_signal_reception(bool handler){
 	release_handler_lock();
-	if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
+	if(!handler){
+		if(-1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){
+			perror("sigprocmask"); 
+			exit(EXIT_FAILURE);
+		}
 	}
 }
-void disable_signal_reception(){
-	if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
-		perror("sigprocmask"); 
-		exit(EXIT_FAILURE);
+void disable_signal_reception(bool handler){
+	if(!handler){
+		if(-1 == sigprocmask(SIG_BLOCK, &global_signal_mask, NULL)){
+			perror("sigprocmask"); 
+			exit(EXIT_FAILURE);
+		}
 	}
 	acquire_handler_lock();
 }
@@ -1306,7 +1310,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				tcb->cgwin += tcb->payload_mss;
 				if(tcb->cgwin > tcb->ssthreshold) {
 					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
-					DEBUG("SLOW START->CONG AVOID");	
+					//  DEBUG("SLOW START->CONG AVOID");	
 					tcb->repeated_acks = 0;
 				}
 				break;
@@ -1352,7 +1356,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						}
 						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
-						DEBUG("CONG AVOID-> FAST_RECOVERY");
+						//  DEBUG("CONG AVOID-> FAST_RECOVERY");
 					}
 				}
 				else {// normal CONG AVOID 
@@ -1380,7 +1384,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					*/
 					tcb->cgwin = tcb->ssthreshold;
 					tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
-					DEBUG("FAST_RECOVERY ---> CONG_AVOID");
+					//  DEBUG("FAST_RECOVERY ---> CONG_AVOID");
 					tcb->repeated_acks=0;
 				}
 				break;
@@ -1394,7 +1398,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 		tcb->timeout = MIN( MAX_TIMEOUT , tcb->timeout*2 );
 		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
-		DEBUG("TIMEOUT: --->SLOW_START");
+		//  DEBUG("TIMEOUT: --->SLOW_START");
 		tcb->cong_st = CONGCTRL_ST_SLOW_START;
 	}
 	LOG_CONGCTRL(tcb);
@@ -1571,11 +1575,85 @@ void nagle_scheduler(int s){
 	free(temp_payload_buf);
 }
 
+
+
+
+void unfair_congestion_scheduler(int s){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("unfair_congestion_scheduler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("unfair_congestion_scheduler tcb NULL");
+	}
+	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
+	uint8_t* temp_payload_buf = malloc(max_payload_length);
+	for(int sid = 0; sid < TOT_SID; sid++){
+		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
+			// We can transmit some more data on the stream
+			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
+
+			/* FLOW CONTROL START */
+			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
+			bool small_in_flight = false;
+			struct txcontrolbuf* tx_cursor = tcb->txfirst;
+			while(tx_cursor != NULL){
+				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
+					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
+						small_in_flight = true;
+					}
+					in_flight_bytes += tx_cursor->payloadlen;
+				}
+				tx_cursor = tx_cursor->next;
+			}
+			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Must always be >= 0
+			if(flow_control_allowed_bytes < 0){
+				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
+			}
+			int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
+
+			int allowed_bytes = MIN(flow_control_allowed_bytes, cong_control_allowed_bytes);
+			available_bytes = MIN(available_bytes, allowed_bytes);
+			/* FLOW CONTROL END */
+
+			while(available_bytes > 0){
+				int payload_length = MIN(available_bytes, max_payload_length);
+				if(payload_length < max_payload_length && small_in_flight){
+					break;
+				}
+				for(int i=0; i<payload_length; i++){
+					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
+					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
+					tcb->txfree[sid]++;
+					available_bytes--;
+				}
+				if(!tcb->ms_option_enabled){
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}else{
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
+					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
+					update_next_ssn(&(tcb->next_ssn[sid]));
+
+					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
+					free(opt);
+				}
+			}
+		}
+	}
+	free(temp_payload_buf);
+}
+
+
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
-	//direct_segmentation_scheduler(s);
-	nagle_scheduler(s);
+	//nagle_scheduler(s);
+	unfair_congestion_scheduler(s);
 }
 
 
@@ -2393,9 +2471,9 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 
 	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
 
-	disable_signal_reception();
+	disable_signal_reception(false);
 	int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
-	enable_signal_reception();
+	enable_signal_reception(false);
 	if(res < 0){
 		// Bind may fail, or other errors
 		return res;
@@ -2462,14 +2540,14 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
 	do{
-		disable_signal_reception();
+		disable_signal_reception(false);
 	
 		if(fdinfo[s].ready_streams == 0){
 			/*
 			"Within a do or a while statement, the next iteration starts by reevaluating the expression of the do or while statement."
 			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
 			*/
-			enable_signal_reception();
+			enable_signal_reception(false);
 			continue;
 		}
 		
@@ -2481,7 +2559,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for free fd
 		if(free_fd == MAX_FD){
 			myerrno=ENFILE; 
-			enable_signal_reception();
+			enable_signal_reception(false);
 			return -1;
 		}
 		if(fdinfo[s].ready_channels > 0){
@@ -2509,7 +2587,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			fdinfo[s].ready_channels--;
 
 			prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-			enable_signal_reception();
+			enable_signal_reception(false);
 			return free_fd;
 		}
 
@@ -2534,7 +2612,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		fdinfo[s].stream_backlog_head.next = first->next;
 
 		prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-		enable_signal_reception();
+		enable_signal_reception(false);
 		return free_fd;
 	}while(pause());
 	ERROR("myaccept something went very wrong, you should never reach after the do while in myaccept"); // pause always returns -1
@@ -2562,7 +2640,7 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 		int remaining_length = maxlen - start_byte_number;
 		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH); // TODO we should read the MSS from the tcb, not from the TCP_MSS macro
 		
-		disable_signal_reception();
+		disable_signal_reception(false);
 
 		if(!fdinfo[s].tcb->ms_option_enabled){
 			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
@@ -2580,7 +2658,7 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 			free(opt);
 		}
 
-		enable_signal_reception();
+		enable_signal_reception(false);
 		start_byte_number += payload_length;
 	}
 	if(start_byte_number != maxlen){
@@ -2619,14 +2697,14 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		}while(pause());
 	}
 	
-	disable_signal_reception();
+	disable_signal_reception(false);
 	for(int byte_num = 0; byte_num < actual_len; byte_num++){
 		fdinfo[s].tcb->stream_tx_buffer[sid][fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
 		fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] = (fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] + 1) % TX_BUFFER_SIZE;
 		fdinfo[s].tcb->txfree[sid]--;
 	}
 	scheduler(s);
-	enable_signal_reception();
+	enable_signal_reception(false);
 	return actual_len;
 }
 
@@ -2651,7 +2729,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
-	disable_signal_reception();
+	disable_signal_reception(false);
 	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
 		/* 
 		NOTA: Questo non gestisce bene il caso in cui è presente solo un segmento nella coda, e è un segmento con LSS attivo
@@ -2661,23 +2739,21 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		if(tcb->stream_rx_queue[sid] != NULL){
 			assert_handler_lock_acquired("dmp removal myread");
 			// condition "tcb->stream_rx_queue[sid]->dummy_payload" is true
-			//disable_signal_reception();
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
 			// tcb->adwin[sid] does not account for dmp segments
 			free(dmp_node->segment);
 			free(dmp_node);
-			//enable_signal_reception();
 			continue;
 		}
 		switch(myread_mode){
 			case MYREAD_MODE_BLOCKING:
-				enable_signal_reception();
+				enable_signal_reception(false);
 				pause();
-				disable_signal_reception();
+				disable_signal_reception(false);
 				break;
 			case MYREAD_MODE_NON_BLOCKING:
-				enable_signal_reception();
+				enable_signal_reception(false);
 				errno = EAGAIN;
 				return -1;
 				break;
@@ -2744,7 +2820,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		ERROR("adwin not increased during myread consumption");
 	}
 	assert_handler_lock_acquired("myread consumption end");
-	enable_signal_reception();
+	enable_signal_reception(false);
 	return read_consumed_bytes;
 }
 
@@ -2794,7 +2870,7 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 	printf("NULL\n");
 }
 void myio(int ignored){
-	disable_signal_reception();
+	disable_signal_reception(true);
 	struct timespec start, end;
 	clock_gettime(CLOCK_REALTIME, &start);
 	assert_handler_lock_acquired("myio start");
@@ -2811,7 +2887,7 @@ void myio(int ignored){
 	if(!(fds[0].revents & POLLIN)){
 		// There is nothing to read
 		
-		enable_signal_reception();
+		enable_signal_reception(true);
 		return;
 	}
 
@@ -3073,66 +3149,76 @@ void myio(int ignored){
 						if(!tcb->ms_option_enabled){
 							ERROR("TODO insert in RX stream buffer non-MS");
 						}
-						/*
-						if((tcb->ms_option_requested || tcb->ms_option_enabled) && sid == 0 && ssn == 0){
-							// I don't really know how this might happen, but this for sure shouldn't happen so a check shouldn't hurt
-							// Note that the situation sid==0&&ssn==0 might happen if ms is not enabled or if the packet is only an ACK without payload
-							print_l2_packet(l2_rx_buf);
-							ERROR("Unexpected sid 0 ssn 0 when inserting in the stream RX queue");
-						}
-						*/
-						struct channel_rx_queue_node* cursor = newrx;
-						int current_candidate_ssn = ssn; // Do avoid "polluting" the variable "ssn" used for newrx
-						while(cursor != NULL && tcb->next_rx_ssn[sid] == current_candidate_ssn){
-							// cursor contains an in-order segment for the stream
-							
-							// This unlinks the segments in cursor and links it to the new stream queue node
-							struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
 
-							if(tcb->stream_rx_queue[sid] == NULL){
-								tcb->stream_rx_queue[sid] = newrx_stream;
-							}else{
-								// Traverse the stream RX queue until you get to the end
-								// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
-								struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
-								while(last->next != NULL){
-									last = last->next;
-								}
-								last->next = newrx_stream;
+						bool newrx_in_order_for_stream = true;
+						struct channel_rx_queue_node* c = tcb->unack;
+						while(c != NULL && c != newrx){
+							if(c->sid == newrx->sid && c->segment != NULL){
+								newrx_in_order_for_stream = false;
+								break;
 							}
+							c = c->next;
+						}
+						if(newrx_in_order_for_stream){
+							struct channel_rx_queue_node* cursor = newrx;
+							int current_candidate_ssn = ssn; // Do avoid "polluting" the variable "ssn" used for newrx
+							while(cursor != NULL && tcb->next_rx_ssn[sid] == current_candidate_ssn){
+								// cursor contains an in-order segment for the stream
+								
+								// This unlinks the segments in cursor and links it to the new stream queue node
+								struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
 
-							update_next_ssn(&(tcb->next_rx_ssn[sid]));
-							// advance to the next segment of this stream in the channel RX queue
-							cursor = cursor->next;
-							while(cursor != NULL){
-								if(cursor->segment != NULL){
-									int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
-									if(cursor_ms_index>=0){
-										int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
-										int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) | cursor->segment->payload[cursor_ms_index+3];
-										if(cursor_sid == sid){
-											current_candidate_ssn = cursor_ssn;
-											break;
+								if(tcb->stream_rx_queue[sid] == NULL){
+									tcb->stream_rx_queue[sid] = newrx_stream;
+								}else{
+									// Traverse the stream RX queue until you get to the end
+									// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
+									struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
+									while(last->next != NULL){
+										last = last->next;
+									}
+									last->next = newrx_stream;
+								}
+
+								update_next_ssn(&(tcb->next_rx_ssn[sid]));
+								// advance to the next segment of this stream in the channel RX queue
+								cursor = cursor->next;
+								while(cursor != NULL){
+									if(cursor->segment != NULL){
+										int cursor_ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+										if(cursor_ms_index>=0){
+											int cursor_sid = (cursor->segment->payload[cursor_ms_index+2]>>2) & 0x1F;
+											int cursor_ssn = ((cursor->segment->payload[cursor_ms_index+2]&0x3) << 8) | cursor->segment->payload[cursor_ms_index+3];
+											if(cursor_sid == sid){
+												current_candidate_ssn = cursor_ssn;
+												break;
+											}
 										}
 									}
-								}else{
+									cursor = cursor->next;
 								}
-								cursor = cursor->next;
+								// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
 							}
-							// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
 						}
 
 						// Removal of in-order segments at the beginning of the channel RX queue
 						while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
+							//DEBUG("while channel_offset %u", newrx->channel_offset);
 							if(tcb->unack->segment != NULL){
 								DEBUG("Last received packet before error:");
 								print_l2_packet(l2_rx_buf);
+								DEBUG("unack:");
+								print_tcp_segment(tcb->unack->segment);
 								DEBUG("unack channel_offset: %u", tcb->unack->channel_offset);
 								DEBUG("unack payload length %d", tcb->unack->payload_length);
-								DEBUG("newrx channel_offset: %u", newrx->channel_offset);
-								DEBUG("newrx payload length %d", newrx->payload_length);
+								DEBUG("next_rx_ssn %d received %d", tcb->next_rx_ssn[sid], ssn);
 								ERROR("in-order segment not consumed from channel queue");
 							}
+
+							if(tcb->unack == newrx){
+								//DEBUG("free unack newrx");
+							}
+
 							tcb->cumulativeack += tcb->unack->payload_length;
 							if(!tcb->unack->dummy_payload){
 								tcb->adwin[tcb->unack->sid] -= tcb->unack->payload_length;
@@ -3217,10 +3303,10 @@ void myio(int ignored){
 		//DEBUG("myio %ld us", duration_us);
 	}
 
-	enable_signal_reception();
+	enable_signal_reception(true);
 }
 void mytimer(int ignored){
-	disable_signal_reception();
+	disable_signal_reception(true);
 	struct timespec start, end;
 	clock_gettime(CLOCK_REALTIME, &start);
 
@@ -3297,7 +3383,7 @@ void mytimer(int ignored){
 	if(duration_us > TIMER_USECS){
 		//DEBUG("mytimer %ld us", duration_us);
 	}
-	enable_signal_reception();
+	enable_signal_reception(true);
 }
 
 void full_duplex_app(int* client_sockets, int n){
@@ -3374,6 +3460,11 @@ int main(){
 
 	raw_socket_setup();
 
+	// Mask configuration (moved here for sa_mask reuse) 
+	if( -1 == sigemptyset(&global_signal_mask)) {perror("sigemtpyset"); return EXIT_FAILURE;}
+	if( -1 == sigaddset(&global_signal_mask, SIGIO)){perror("sigaddset SIGIO"); return EXIT_FAILURE;} 
+	if( -1 == sigaddset(&global_signal_mask, SIGALRM)){perror("sigaddset SIGALRM"); return EXIT_FAILURE;} 
+
 	// Signal handlers association
 	// https://claude.ai/share/cead81ba-d6f2-4f36-89e2-3a2dca9515fe
 	struct sigaction action_io, action_timer;
@@ -3381,15 +3472,14 @@ int main(){
 	memset(&action_timer, 0, sizeof(action_timer));
 	action_io.sa_flags = SA_RESTART;
 	action_timer.sa_flags = SA_RESTART;
+	action_io.sa_mask = global_signal_mask;
+	action_timer.sa_mask = global_signal_mask;
 	action_io.sa_handler = myio;
 	action_timer.sa_handler = mytimer;
 	sigaction(SIGIO, &action_io, NULL);
 	sigaction(SIGALRM, &action_timer, NULL);
 
 	// Enable the reception of signals
-	if( -1 == sigemptyset(&global_signal_mask)) {perror("sigemtpyset"); return EXIT_FAILURE;}
-	if( -1 == sigaddset(&global_signal_mask, SIGIO)){perror("sigaddset SIGIO"); return EXIT_FAILURE;} 
-	if( -1 == sigaddset(&global_signal_mask, SIGALRM)){perror("sigaddset SIGALRM"); return EXIT_FAILURE;} 
 	if( -1 == sigprocmask(SIG_UNBLOCK, &global_signal_mask, NULL)){perror("sigprocmask"); return EXIT_FAILURE;}
 
 	// Create and start the periodic timer
