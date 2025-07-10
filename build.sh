@@ -5,6 +5,6 @@ gcc 11.c -DMAIN_MODE=CLIENT -o client.out
 if [[ "$1" == "--local" ]]; then
     gcc 11.c -g -DMAIN_MODE=SERVER -DLOCAL_SERVER -o server.out
 else
-    scp 11.c dibella@liquigas.duckdns.org:/home/dibella
-    ssh dibella@liquigas.duckdns.org 'gcc 11.c -g -DMAIN_MODE=SERVER -o server.out'
+    scp 11.c dibella@172.104.237.69:/home/dibella
+    ssh dibella@172.104.237.69 'gcc 11.c -g -DMAIN_MODE=SERVER -o server.out'
 fi

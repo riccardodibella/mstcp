@@ -41,14 +41,14 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 4
+#define NUM_CLIENTS 1
 
 /*
 Up to 10000 is very safe, even with 32 streams, on a stable network. 
 Up to 100000 is safe with very few streams. 
 Up to 1000000 is safe only with 1 client, otherwise it breaks for some (unknown) reason.
 */
-#define NUM_CLIENT_MESSAGES 10000000
+#define NUM_CLIENT_MESSAGES 100000
 #define NUM_SERVER_MESSAGES 0
 #define MS_ENABLED true
 #define CLIENT 0
@@ -613,7 +613,8 @@ void LOG_CONGCTRL(struct tcpctrlblk* tcb){
 	LOG_FIELD("type", "\"CNG\"");
 	LOG_FIELD("state", "%u", tcb->cong_st);
 	LOG_FIELD("ssth", "%u", tcb->ssthreshold);
-	LOG_FIELD("cgwin", "%u", tcb->cgwin);
+	LOG_FIELD("cgwin", "%u", tcb->cgwin+tcb->lta);
+	LOG_FIELD("lta", "%u", tcb->lta);
 	LOG_FIELD("p_mss", "%u", tcb->payload_mss);
 	LOG_OBJ_END();
 }
@@ -1303,6 +1304,21 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize){
 	if(event == FSM_EVENT_PKT_RCV){
 		bool dmp = tcp->d_offs_res & (DMP >> 8);
+		if(streamsegmentsize > 0 && !dmp){
+			return;
+		}
+		if(streamsegmentsize == 0 && dmp){
+			ERROR("congctrl_fsm invalid dmp segment (len 0)");
+		}
+		int sid = -1;
+		// We don't care about ssn
+		int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+		if(ms_index >= 0){
+			sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+		}
+		if(dmp && sid == -1){
+			ERROR("congctrl_fsm invalid dmp segment (no sid)");
+		}
 		//DEBUG(" ACK: %d last ACK: %d",htonl(tcp->ack)-tcb->seq_offs, htonl(tcb->last_ack)-tcb->seq_offs);
 		switch( tcb->cong_st ){
 			case CONGCTRL_ST_SLOW_START: 
@@ -1322,17 +1338,21 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					FlightSize would remain less than or equal to cwnd plus 2*SMSS, and that new data is available for transmission.  Further, the
 					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042]. 
 				*/
-				// Rimossa la condizione sulla window perchè non necessaria / incompatibile con MSTCP. Andrà rimessa nel caso in cui Multi-Stream sia disattivato
-				if((((tcp->flags)&(SYN|FIN))==0) && streamsegmentsize==0 && /*(htons(tcp->window) == tcb->radwin) &&*/ (tcp->ack == tcb->last_ack)){
-					if( tcp->ack == tcb->last_ack){
-						tcb->repeated_acks++;
-					}
+				tcb->lta = 0;
+				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0 || (false && dmp && (htons(tcp->window) == tcb->radwin[sid]))) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
+					tcb->repeated_acks++;
 				}
 				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
 				if((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2)){
+					/*
+					Ho modificato questa sezione perchè:
+					- A quanto ho capito, la condizione dell'if è sulla adwin, non sulla cgwin, e la adwin (dell'altro peer) viene gestita già altrove quindi non ce ne preoccupiamo qui
+					- Non ha senso sommare repeated_acks (che è un intero che vale 1 o 2) e 2*payload_mss che è molto grande; a quanto ho capito, dovrebbe esserci repeated_acks invece di 2
 					if (tcb->flightsize<=tcb->cgwin + 2* (tcb->payload_mss)){
 						tcb->lta = tcb->repeated_acks+2*tcb->payload_mss; //RFC 3042 Limited Transmit Extra-TX-win;
 					}
+					*/
+					tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 				}
 				/*
 				2.  When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the value given in equation (4).  When [RFC3042]
@@ -1344,7 +1364,9 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					if(tcb->txfirst!= NULL){
 						struct txcontrolbuf * txcb;
 						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
-						tcb->cgwin = tcb->ssthreshold + 2*tcb->payload_mss; /* The third increment is in the FAST_RECOV state*/
+						// tcb->cgwin = tcb->ssthreshold + 2*tcb->payload_mss; /* The third increment is in the FAST_RECOV state*/
+						tcb->cgwin = tcb->ssthreshold;
+						tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 
 						/*
 						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
@@ -1361,10 +1383,10 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				}
 				else {// normal CONG AVOID 
 					//if( streamsegmentsize > 0 && !dmp){
-						tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
-						if (tcb->cgwin<tcb->payload_mss){
-							tcb->cgwin = tcb->payload_mss;
-						}
+					tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
+					if (tcb->cgwin<tcb->payload_mss){
+						tcb->cgwin = tcb->payload_mss;
+					}
 					//}
 				}
 				break;
@@ -1375,7 +1397,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					congestion window in order to reflect the additional segment that has left the network.
 				*/
 				if(tcb->last_ack==tcp->ack) {
-					tcb->cgwin += tcb->payload_mss;
+					tcb->lta += tcb->payload_mss;
 					//DEBUG(" Increasing congestion window to : %d", tcb->cgwin);
 				} else {
 					/*
@@ -1383,14 +1405,16 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						set in step 2).  This is termed "deflating" the window.
 					*/
 					tcb->cgwin = tcb->ssthreshold;
+					tcb->lta = 0;
 					tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
 					//  DEBUG("FAST_RECOVERY ---> CONG_AVOID");
 					tcb->repeated_acks=0;
 				}
 				break;
         }
+
 		tcb->last_ack = tcp->ack; //in network order
-	
+
 	} else if (event == FSM_EVENT_TIMEOUT) {
 		if(tcb->cong_st == CONGCTRL_ST_CONG_AVOID) tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
 		if(tcb->cong_st == CONGCTRL_ST_FAST_RECOV) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
@@ -3237,9 +3261,9 @@ void myio(int ignored){
 					}
 				}else{
 					if(ms_option_included){
+						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload){
 							// Allocate a new SSN and send an ACK on the stream with the DMP flag
-							//DEBUG("TODO fix the way ACKs are generated for MS segments");
 
 							int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 							uint8_t* opt = malloc(optlen);
@@ -3255,7 +3279,8 @@ void myio(int ignored){
 							prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
 							free(dummy_payload);
 							free(opt);
-						}else{
+						}
+						else{
 							// Generic ACK
 							prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						}
