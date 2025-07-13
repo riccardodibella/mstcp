@@ -1,4 +1,5 @@
 #define _DEFAULT_SOURCE
+#define _GNU_SOURCE // strcasestr
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -41,15 +42,14 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 1
+#define NUM_CLIENTS 10
 
-/*
-Up to 10000 is very safe, even with 32 streams, on a stable network. 
-Up to 100000 is safe with very few streams. 
-Up to 1000000 is safe only with 1 client, otherwise it breaks for some (unknown) reason.
-*/
-#define NUM_CLIENT_MESSAGES 100000
-#define NUM_SERVER_MESSAGES 0
+#define NUM_CLIENT_REQUESTS 100
+
+#define RESP_PAYLOAD_BYTES 5000
+#define REQ_BUF_SIZE 100
+#define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
+
 #define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
@@ -2710,7 +2710,7 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 	int actual_len;
 	if(mywrite_mode == MYWRITE_MODE_NON_BLOCKING){
 		if(fdinfo[s].tcb->txfree[sid] == 0){
-			errno = EAGAIN;
+			myerrno = EAGAIN;
 			return -1;
 		}
 		actual_len = MIN(maxlen,fdinfo[s].tcb->txfree[sid]);
@@ -2778,7 +2778,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				break;
 			case MYREAD_MODE_NON_BLOCKING:
 				enable_signal_reception(false);
-				errno = EAGAIN;
+				myerrno = EAGAIN;
 				return -1;
 				break;
 			default:
@@ -3411,6 +3411,7 @@ void mytimer(int ignored){
 	enable_signal_reception(true);
 }
 
+#if 0
 void full_duplex_app(int* client_sockets, int n){
 	int* current_msg_num = calloc(n, sizeof(int));
 	int* current_msg_sent_bytes = calloc(n, sizeof(int));
@@ -3463,6 +3464,179 @@ void full_duplex_app(int* client_sockets, int n){
 	}
 	free(current_msg_num);
 	free(current_msg_sent_bytes);
+}
+#endif
+
+
+enum client_state{
+	CLIENT_ST_REQ = 0,
+	CLIENT_ST_RESP_H,
+	CLIENT_ST_RESP_P
+};
+
+enum client_state cl_st[NUM_CLIENTS];
+int current_req_num[NUM_CLIENTS];
+int current_req_bytes[NUM_CLIENTS];
+char resp_arr[NUM_CLIENTS][RESP_BUF_SIZE];
+int resp_tot_bytes[NUM_CLIENTS];
+int resp_recv_bytes[NUM_CLIENTS];
+
+
+void single_client_app(int* client_sockets, int i /* num_client */){
+	if(current_req_num[i] < NUM_CLIENT_REQUESTS){
+		if(cl_st[i] == CLIENT_ST_REQ){
+			uint8_t data[REQ_BUF_SIZE];
+			sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_req_num[i]);
+			uint8_t* start = data+current_req_bytes[i];
+			int missing = strlen(data) - current_req_bytes[i];
+			int res = mywrite(client_sockets[i], start, missing);
+			if(res <= 0){
+				if(myerrno == EAGAIN){
+					myerrno = 0;
+					return;
+				}else{
+					myperror("mywrite");
+					ERROR("mywrite error");
+				}
+			}
+			current_req_bytes[i] += res;
+			if(current_req_bytes[i] == strlen(data)){
+				cl_st[i] = CLIENT_ST_RESP_H;
+				memset(resp_arr[i], 0, sizeof(resp_arr[i]));
+			}
+		}else if(cl_st[i] == CLIENT_ST_RESP_H){
+			int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], sizeof(resp_arr[i]));
+			if(n == -1 && myerrno == EAGAIN){
+				myerrno = 0;
+				return;
+			}
+			resp_recv_bytes[i]+=n;
+			resp_arr[i][resp_recv_bytes[i]] = '\0';
+
+			char* end_of_headers_substr = strstr(resp_arr[i], "\r\n\r\n"); 
+			if(end_of_headers_substr != NULL){
+				int header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - resp_arr[i];
+
+				int content_length = RESP_PAYLOAD_BYTES; // Assume the expected payload length by default
+
+				char* content_length_str = strcasestr(resp_arr[i], "Content-Length");
+				if(content_length_str != NULL){
+					while(*content_length_str != ':'){
+						content_length_str++;
+					}
+					content_length_str++; // Skip ':
+					while(*content_length_str == ' '){
+						content_length_str++;
+					}
+
+					content_length = atoi(content_length_str);
+				}
+				resp_tot_bytes[i] = header_portion_length + content_length;
+				cl_st[i] = CLIENT_ST_RESP_P;
+			}
+		}else if(cl_st[i] == CLIENT_ST_RESP_P){
+			int missing =  resp_tot_bytes[i] - resp_recv_bytes[i];
+			if(missing == 0){
+				goto after_read;
+			}
+			if(missing < 0){
+				ERROR(".");
+			}
+			int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], missing);
+			if(n == -1 && myerrno == EAGAIN){
+				myerrno = 0;
+				return;
+			}
+			resp_recv_bytes[i]+=n;
+
+			after_read:
+			if(resp_recv_bytes[i] == resp_tot_bytes[i]){
+				resp_arr[i][resp_recv_bytes[i]] = 0;
+				DEBUG(resp_arr[i]);
+				resp_recv_bytes[i] = 0;
+				resp_tot_bytes[i] = 0;
+				current_req_bytes[i] = 0;
+				memset(resp_arr[i], 0, sizeof(resp_arr[i]));
+				current_req_num[i]++;
+				cl_st[i] = CLIENT_ST_REQ;
+			}
+		}
+	}
+}
+
+void full_duplex_client_app(int* client_sockets){
+	while(true){
+		for(int i=0; i<NUM_CLIENTS; i++){
+			single_client_app(client_sockets, i);
+		}
+	}
+}
+
+
+enum server_state{
+	SERVER_ST_REQ = 0,
+	SERVER_ST_RESP,
+};
+
+enum server_state srv_st[NUM_CLIENTS];
+char req_arr[NUM_CLIENTS][REQ_BUF_SIZE];
+int requested_payload_bytes[NUM_CLIENTS];
+int current_resp_bytes[NUM_CLIENTS];
+
+void single_server_app(int* client_sockets, int i /* num_client */){
+	if(srv_st[i] == SERVER_ST_REQ){
+		char* strend = req_arr[i];
+		while(*strend){
+			strend++;
+		}
+		int n = myread(client_sockets[i], strend, sizeof(req_arr[i]));
+		if(n == -1 && myerrno == EAGAIN){
+			myerrno = 0;
+			return;
+		}
+		strend += n;
+		*strend= '\0';
+		char* end_of_headers_substr = strstr(req_arr[i], "\r\n\r\n"); 
+		if(end_of_headers_substr != NULL){
+			DEBUG(req_arr[i]);
+
+			requested_payload_bytes[i] = atoi(strstr(req_arr[i], "/")+1);
+			current_resp_bytes[i] = 0;
+			srv_st[i] = SERVER_ST_RESP;
+		}else{
+			DEBUG("request still incomplete");
+		}
+	}else if(srv_st[i] == SERVER_ST_RESP){
+		uint8_t data[RESP_BUF_SIZE];
+		sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", requested_payload_bytes[i], i);
+		for(int j=0; j<requested_payload_bytes[i]; j++){
+			strcat(data, "X");
+		}
+		uint8_t* start = data+current_resp_bytes[i];
+		int missing = strlen(data) - current_resp_bytes[i];
+		int res = mywrite(client_sockets[i], start, missing);
+		if(res <= 0){
+			if(myerrno == EAGAIN){
+				myerrno = 0;
+				return;
+			}else{
+				perror("mywrite");
+				ERROR("mywrite error");
+			}
+		}
+		current_resp_bytes[i] += res;
+		if(current_resp_bytes[i] == strlen(data)){
+			srv_st[i] = SERVER_ST_REQ;
+			memset(req_arr[i], 0, sizeof(req_arr[i]));
+		}
+	}
+}
+void full_duplex_server_app(int* client_sockets){
+	while(true){
+		for(int i=0; i<NUM_CLIENTS; i++){
+			single_server_app(client_sockets, i);
+		}
+	}
 }
 
 int main(){
@@ -3570,7 +3744,7 @@ int main(){
 			}
 			client_sockets[i] = s_loop;
 		}
-		full_duplex_app(client_sockets, NUM_CLIENTS);
+		full_duplex_client_app(client_sockets);
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
@@ -3604,7 +3778,7 @@ int main(){
 			}
 			client_sockets[i] = s;
 		}
-		full_duplex_app(client_sockets, NUM_CLIENTS);
+		full_duplex_server_app(client_sockets);
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
 	}
