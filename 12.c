@@ -44,7 +44,7 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 */
 #define NUM_CLIENTS 10
 
-#define NUM_CLIENT_REQUESTS 100
+#define NUM_CLIENT_REQUESTS 50
 
 #define RESP_PAYLOAD_BYTES 5000
 #define REQ_BUF_SIZE 100
@@ -287,6 +287,7 @@ struct tcpctrlblk{
 	uint16_t next_rx_ssn[TOT_SID]; // SSN of the next segment that has to be inserted in the buffer
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 	struct stream_rx_queue_node* stream_rx_queue[TOT_SID]; // Contains only in-order segments for each stream, ready to be consumed by myread()
+	bool lss_requested[TOT_SID];
 
     int st; // Channel property
 
@@ -1649,11 +1650,11 @@ void unfair_congestion_scheduler(int s){
 			int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
 
 			int allowed_bytes = MIN(flow_control_allowed_bytes, cong_control_allowed_bytes);
-			available_bytes = MIN(available_bytes, allowed_bytes);
+			int current_transfer_bytes = MIN(available_bytes, allowed_bytes);
 			/* FLOW CONTROL END */
 
-			while(available_bytes > 0){
-				int payload_length = MIN(available_bytes, max_payload_length);
+			while(current_transfer_bytes > 0){
+				int payload_length = MIN(current_transfer_bytes, max_payload_length);
 				if(payload_length < max_payload_length && small_in_flight){
 					break;
 				}
@@ -1661,7 +1662,7 @@ void unfair_congestion_scheduler(int s){
 					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
 					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
 					tcb->txfree[sid]++;
-					available_bytes--;
+					current_transfer_bytes--;
 				}
 				if(!tcb->ms_option_enabled){
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
@@ -1677,6 +1678,28 @@ void unfair_congestion_scheduler(int s){
 
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
+				}
+			}
+
+			if(tcb->lss_requested[sid]){
+				if(tcb->txfree[sid] == TX_BUFFER_SIZE){
+					// Enqueue LSS segment
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = (0b1 << 7) | sid<<2 | ((tcb->next_ssn[sid] >> 8)&0x3);
+					opt[3] = (tcb->next_ssn[sid])&0xFF;
+					update_next_ssn(&(tcb->next_ssn[sid]));
+
+					uint8_t* dummy_payload = malloc(1); // value doesn't matter
+
+					prepare_tcp(s, ACK | DMP, dummy_payload, 1, opt, optlen);
+					free(dummy_payload);
+					free(opt);
+
+					tcb->lss_requested[sid] = false;
 				}
 			}
 		}
@@ -1868,6 +1891,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->next_rx_ssn[i] = 0;
 				tcb->stream_fsm_timer[i] = 0;
 				tcb->stream_rx_queue[i] = NULL;
+
+				tcb->lss_requested[i] = false;
 			}
 
 
@@ -1963,6 +1988,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].tcb->stream_rx_queue[stream] = NULL;
 							fdinfo[s].tcb->adwin[stream] = RX_VIRTUAL_BUFFER_SIZE;
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
+							fdinfo[s].tcb->lss_requested[stream] = false;
 							return 0;
 						}
 					}
@@ -2045,6 +2071,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->next_ssn[i] = 0;
 				tcb->next_rx_ssn[i] = 0;
 				tcb->stream_fsm_timer[i] = 0;
+				tcb->lss_requested[i] = false;
 			}
 
 
@@ -2198,6 +2225,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					}
 					// We don't need to do anything with stream_rx_queue as it is already empty
 					tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
+
+					tcb->lss_requested[0] = false;
 
 					/*
 					We include all the usual payload options in this ACK
@@ -2408,6 +2437,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->next_ssn[i] = 0;
 						backlog_tcb->next_rx_ssn[0] = 1;
 						backlog_tcb->stream_fsm_timer[i] = 0;
+						backlog_tcb->lss_requested[i] = false;
 					}
 					backlog_tcb->listening_fd = s;
 
@@ -2470,6 +2500,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_rx_queue[sid] = NULL;
 							tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE;
 							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
+
+							tcb->lss_requested[sid] = false;
 
 							// Insertion in the listening socket backlog
 							struct stream_backlog_node* cursor = &fdinfo[tcb->listening_fd].stream_backlog_head;
@@ -2654,6 +2686,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	ERROR("myaccept something went very wrong, you should never reach after the do while in myaccept"); // pause always returns -1
 }
 
+#if 0
 int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 	// Direct segmentation mywrite
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
@@ -2702,6 +2735,7 @@ int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
 	}
 	return start_byte_number;
 }
+#endif
 
 int mywrite(int s, uint8_t * buffer, int maxlen){
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
@@ -2812,7 +2846,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				free(dmp_node);
 
 				// Nota: potrebbero esserci altri segmenti rimasti in coda: non dovrebbero avere payload, ma potrebbero essere DMP usati per ACK o window update
-
+				enable_signal_reception(false);
 				return 0;
 			}
 			
@@ -2871,7 +2905,14 @@ int myread(int s, unsigned char *buffer, int maxlen){
 }
 
 int myclose(int s){
-	ERROR("TODO myclose");
+	
+	int sid = fdinfo[s].sid;
+	DEBUG("myclose sid %d", sid);
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	disable_signal_reception(false);
+	tcb->lss_requested[sid] = true;
+	scheduler(s);
+	enable_signal_reception(false);
 	return 0;
 }
 
@@ -3558,7 +3599,7 @@ void full_duplex_client_app(int* client_sockets){
 		for(int i=0; i<NUM_CLIENTS; i++){
 			single_client_app(client_sockets, i);
 		}
-		bool all_stopped = false;
+		bool all_stopped = true;
 		for(int i=0; i<NUM_CLIENTS; i++){
 			if(cl_st[i] != CLIENT_ST_STOPPED){
 				all_stopped = false;
@@ -3602,6 +3643,7 @@ void single_server_app(int* client_sockets, int i /* num_client */){
 			DEBUG("received close from client %d", i);
 			myclose(client_sockets[i]);
 			srv_st[i] = SERVER_ST_STOPPED;
+			return;
 		}
 		strend += n;
 		*strend= '\0';
@@ -3645,7 +3687,7 @@ void full_duplex_server_app(int* client_sockets){
 		for(int i=0; i<NUM_CLIENTS; i++){
 			single_server_app(client_sockets, i);
 		}
-		bool all_stopped = false;
+		bool all_stopped = true;
 		for(int i=0; i<NUM_CLIENTS; i++){
 			if(srv_st[i] != SERVER_ST_STOPPED){
 				all_stopped = false;
