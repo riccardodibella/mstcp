@@ -23,8 +23,16 @@ corretto?
 - Probabilmente è una domanda stupida, ma a cosa serve precisamente il controllo fdinfo[s].tcb->st == TCB_ST_CLOSED in mywrite? Anche
 perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei controllare lo stato dello stream, non del TCB, giusto?
 - Bisogna capire come fare il congctrl con flusso bidirezionale, e come gestire bene gli ACK DMP
+- La frase "When the last segment is acknowledged for both directions, the stream socket is closed the stream buffers are freed." secondo me non
+è giusta, perchè questo non succede neanche in TCP. In TCP, un host può consumare dati anche dopo aver chiamato close(), quindi i buffer devono
+essere conservati anche dopo. Questo non è tanto un problema per la chiusura degli stream e delle connessioni in sè, ma per il riuso, perchè non
+c'è modo per distinguere se l'altro peer è in questa situazione o no
 
 
+- myclose è facile: metto un flag che dice "accoda il LSS", chiamo lo scheduler per sicurezza, e poi lo scheduler deciderà quando accodare il LSS
+per quello stream
+- ritornare 0 è facile: quando consumo LSS e mi rimaneva solo quello, ritorno 0
+- il problema sono gli stati delle FSM
 
 
 Risposte:

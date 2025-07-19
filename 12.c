@@ -2848,6 +2848,11 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	return read_consumed_bytes;
 }
 
+int myclose(int s){
+	ERROR("TODO myclose");
+	return 0;
+}
+
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
@@ -3411,67 +3416,14 @@ void mytimer(int ignored){
 	enable_signal_reception(true);
 }
 
-#if 0
-void full_duplex_app(int* client_sockets, int n){
-	int* current_msg_num = calloc(n, sizeof(int));
-	int* current_msg_sent_bytes = calloc(n, sizeof(int));
-	for(int i=0; i<n; i++){
-		current_msg_num[i] = 0;
-		current_msg_sent_bytes[i] = 0;
-	}
-	while(true){
-		// TX
-		for(int i=0; i<NUM_CLIENTS; i++){
-			if(current_msg_num[i] < ((MAIN_MODE == CLIENT) ? NUM_CLIENT_MESSAGES : NUM_SERVER_MESSAGES)){
-				uint8_t data[100];
-				sprintf(data, "Client %02d message %03d;", i, current_msg_num[i]);
-				uint8_t* start = data+current_msg_sent_bytes[i];
-				int missing = strlen(data) - current_msg_sent_bytes[i];
-				int res = mywrite(client_sockets[i], start, missing);
-				if(res <= 0){
-					if(errno == EAGAIN){
-						errno = 0;
-						continue;
-					}else{
-						perror("mywrite");
-						ERROR("mywrite error");
-					}
-				}
-				current_msg_sent_bytes[i] += res;
-				if(current_msg_sent_bytes[i] == strlen(data)){
-					//DEBUG("w |%s|", data);
-					//DEBUG("w %d %d", i, current_msg_num[i]);
-					current_msg_num[i]++;
-					current_msg_sent_bytes[i] = 0;
-				}
-			}
-		}
-
-		// RX
-		for(int i=0; i<n; i++){
-			int s = client_sockets[i];
-			char myread_buf[2000];
-			memset(myread_buf, 0, sizeof(myread_buf));
-			int n = myread(s, myread_buf, sizeof(myread_buf)-1);
-			if(n == -1 && errno == EAGAIN){
-				continue;
-			}
-			if(i == NUM_CLIENTS-1){
-				DEBUG("r |%s|", myread_buf);
-			}
-			//DEBUG("r |%s|", myread_buf);
-		}
-	}
-	free(current_msg_num);
-	free(current_msg_sent_bytes);
-}
-#endif
 
 
 enum client_state{
 	CLIENT_ST_REQ = 0,
 	CLIENT_ST_RESP_H,
-	CLIENT_ST_RESP_P
+	CLIENT_ST_RESP_P,
+	CLIENT_ST_WAIT_CLOSE,
+	CLIENT_ST_STOPPED
 };
 
 enum client_state cl_st[NUM_CLIENTS];
@@ -3483,83 +3435,98 @@ int resp_recv_bytes[NUM_CLIENTS];
 
 
 void single_client_app(int* client_sockets, int i /* num_client */){
-	if(current_req_num[i] < NUM_CLIENT_REQUESTS){
-		if(cl_st[i] == CLIENT_ST_REQ){
-			uint8_t data[REQ_BUF_SIZE];
-			sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_req_num[i]);
-			uint8_t* start = data+current_req_bytes[i];
-			int missing = strlen(data) - current_req_bytes[i];
-			int res = mywrite(client_sockets[i], start, missing);
-			if(res <= 0){
-				if(myerrno == EAGAIN){
-					myerrno = 0;
-					return;
-				}else{
-					myperror("mywrite");
-					ERROR("mywrite error");
-				}
-			}
-			current_req_bytes[i] += res;
-			if(current_req_bytes[i] == strlen(data)){
-				cl_st[i] = CLIENT_ST_RESP_H;
-				memset(resp_arr[i], 0, sizeof(resp_arr[i]));
-			}
-		}else if(cl_st[i] == CLIENT_ST_RESP_H){
-			int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], sizeof(resp_arr[i]));
-			if(n == -1 && myerrno == EAGAIN){
+	if(cl_st[i] == CLIENT_ST_REQ){
+		uint8_t data[REQ_BUF_SIZE];
+		sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_req_num[i]);
+		uint8_t* start = data+current_req_bytes[i];
+		int missing = strlen(data) - current_req_bytes[i];
+		int res = mywrite(client_sockets[i], start, missing);
+		if(res <= 0){
+			if(myerrno == EAGAIN){
 				myerrno = 0;
 				return;
+			}else{
+				myperror("mywrite");
+				ERROR("mywrite error");
 			}
-			resp_recv_bytes[i]+=n;
-			resp_arr[i][resp_recv_bytes[i]] = '\0';
+		}
+		current_req_bytes[i] += res;
+		if(current_req_bytes[i] == strlen(data)){
+			cl_st[i] = CLIENT_ST_RESP_H;
+			memset(resp_arr[i], 0, sizeof(resp_arr[i]));
+		}
+	}else if(cl_st[i] == CLIENT_ST_RESP_H){
+		int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], sizeof(resp_arr[i]));
+		if(n == -1 && myerrno == EAGAIN){
+			myerrno = 0;
+			return;
+		}
+		resp_recv_bytes[i]+=n;
+		resp_arr[i][resp_recv_bytes[i]] = '\0';
 
-			char* end_of_headers_substr = strstr(resp_arr[i], "\r\n\r\n"); 
-			if(end_of_headers_substr != NULL){
-				int header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - resp_arr[i];
+		char* end_of_headers_substr = strstr(resp_arr[i], "\r\n\r\n"); 
+		if(end_of_headers_substr != NULL){
+			int header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - resp_arr[i];
 
-				int content_length = RESP_PAYLOAD_BYTES; // Assume the expected payload length by default
+			int content_length = RESP_PAYLOAD_BYTES; // Assume the expected payload length by default
 
-				char* content_length_str = strcasestr(resp_arr[i], "Content-Length");
-				if(content_length_str != NULL){
-					while(*content_length_str != ':'){
-						content_length_str++;
-					}
-					content_length_str++; // Skip ':
-					while(*content_length_str == ' '){
-						content_length_str++;
-					}
-
-					content_length = atoi(content_length_str);
+			char* content_length_str = strcasestr(resp_arr[i], "Content-Length");
+			if(content_length_str != NULL){
+				while(*content_length_str != ':'){
+					content_length_str++;
 				}
-				resp_tot_bytes[i] = header_portion_length + content_length;
-				cl_st[i] = CLIENT_ST_RESP_P;
-			}
-		}else if(cl_st[i] == CLIENT_ST_RESP_P){
-			int missing =  resp_tot_bytes[i] - resp_recv_bytes[i];
-			if(missing == 0){
-				goto after_read;
-			}
-			if(missing < 0){
-				ERROR(".");
-			}
-			int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], missing);
-			if(n == -1 && myerrno == EAGAIN){
-				myerrno = 0;
-				return;
-			}
-			resp_recv_bytes[i]+=n;
+				content_length_str++; // Skip ':
+				while(*content_length_str == ' '){
+					content_length_str++;
+				}
 
-			after_read:
-			if(resp_recv_bytes[i] == resp_tot_bytes[i]){
-				resp_arr[i][resp_recv_bytes[i]] = 0;
-				DEBUG(resp_arr[i]);
-				resp_recv_bytes[i] = 0;
-				resp_tot_bytes[i] = 0;
-				current_req_bytes[i] = 0;
-				memset(resp_arr[i], 0, sizeof(resp_arr[i]));
-				current_req_num[i]++;
+				content_length = atoi(content_length_str);
+			}
+			resp_tot_bytes[i] = header_portion_length + content_length;
+			cl_st[i] = CLIENT_ST_RESP_P;
+		}
+	}else if(cl_st[i] == CLIENT_ST_RESP_P){
+		int missing =  resp_tot_bytes[i] - resp_recv_bytes[i];
+		if(missing == 0){
+			goto after_read;
+		}
+		if(missing < 0){
+			ERROR(".");
+		}
+		int n = myread(client_sockets[i], resp_arr[i]+resp_recv_bytes[i], missing);
+		if(n == -1 && myerrno == EAGAIN){
+			myerrno = 0;
+			return;
+		}
+		resp_recv_bytes[i]+=n;
+
+		after_read:
+		if(resp_recv_bytes[i] == resp_tot_bytes[i]){
+			resp_arr[i][resp_recv_bytes[i]] = 0;
+			DEBUG(resp_arr[i]);
+			resp_recv_bytes[i] = 0;
+			resp_tot_bytes[i] = 0;
+			current_req_bytes[i] = 0;
+			memset(resp_arr[i], 0, sizeof(resp_arr[i]));
+			current_req_num[i]++;
+			if(current_req_num[i] < NUM_CLIENT_REQUESTS){
 				cl_st[i] = CLIENT_ST_REQ;
+			}else{
+				myclose(client_sockets[i]);
+				cl_st[i] = CLIENT_ST_WAIT_CLOSE;
 			}
+		}
+	}else if(cl_st[i] == CLIENT_ST_WAIT_CLOSE){
+		int n = myread(client_sockets[i], resp_arr[i], 1);
+		if(n == -1 && myerrno == EAGAIN){
+			myerrno = 0;
+			return;
+		}
+		if(n==0){
+			DEBUG("client %d received remote close", i);
+			cl_st[i] = CLIENT_ST_STOPPED;
+		}else{
+			DEBUG("client %d st CLIENT_ST_WAIT_CLOSE myread > 0 (returned %d)", n);
 		}
 	}
 }
@@ -3569,13 +3536,28 @@ void full_duplex_client_app(int* client_sockets){
 		for(int i=0; i<NUM_CLIENTS; i++){
 			single_client_app(client_sockets, i);
 		}
+		bool all_stopped = false;
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(cl_st[i] != CLIENT_ST_STOPPED){
+				all_stopped = false;
+				break;
+			}
+		}
+		if(all_stopped){
+			break;
+		}
 	}
+	DEBUG("CLIENT - ALL STOPPED");
+	DEBUG("wait...");
+	persistent_nanosleep(2, 0);
+	DEBUG("full_duplex_client_app end");
 }
 
 
 enum server_state{
 	SERVER_ST_REQ = 0,
 	SERVER_ST_RESP,
+	SERVER_ST_STOPPED,
 };
 
 enum server_state srv_st[NUM_CLIENTS];
@@ -3593,6 +3575,11 @@ void single_server_app(int* client_sockets, int i /* num_client */){
 		if(n == -1 && myerrno == EAGAIN){
 			myerrno = 0;
 			return;
+		}
+		if(n == 0){
+			DEBUG("received close from client %d", i);
+			myclose(client_sockets[i]);
+			srv_st[i] = SERVER_ST_STOPPED;
 		}
 		strend += n;
 		*strend= '\0';
@@ -3636,7 +3623,21 @@ void full_duplex_server_app(int* client_sockets){
 		for(int i=0; i<NUM_CLIENTS; i++){
 			single_server_app(client_sockets, i);
 		}
+		bool all_stopped = false;
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(srv_st[i] != SERVER_ST_STOPPED){
+				all_stopped = false;
+				break;
+			}
+		}
+		if(all_stopped){
+			break;
+		}
 	}
+	DEBUG("SERVER - ALL STOPPED");
+	DEBUG("wait...");
+	persistent_nanosleep(2, 0);
+	DEBUG("full_duplex_server_app end");
 }
 
 int main(){
