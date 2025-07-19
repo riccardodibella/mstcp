@@ -27,6 +27,8 @@ perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei co
 è giusta, perchè questo non succede neanche in TCP. In TCP, un host può consumare dati anche dopo aver chiamato close(), quindi i buffer devono
 essere conservati anche dopo. Questo non è tanto un problema per la chiusura degli stream e delle connessioni in sè, ma per il riuso, perchè non
 c'è modo per distinguere se l'altro peer è in questa situazione o no
+- Dopo aver inviato un LSS, bisogna poter inviare altri segmenti DMP su quello stream, ad esempio per fare dei window update, altrimenti la ricezione
+potrebbe ingolfarsi dopo che si ha chiuso solo l'invio, non la ricezione
 
 
 - myclose è facile: metto un flag che dice "accoda il LSS", chiamo lo scheduler per sicurezza, e poi lo scheduler deciderà quando accodare il LSS

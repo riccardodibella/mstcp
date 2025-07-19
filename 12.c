@@ -252,6 +252,7 @@ struct channel_rx_queue_node{
 	int total_segment_length;
 	int payload_length;
 	int sid;
+	bool lss;
 	bool dummy_payload;
 	struct tcp_segment* segment;
 };
@@ -259,6 +260,7 @@ struct stream_rx_queue_node{
 	struct stream_rx_queue_node* next;
 	int sid;
 	uint16_t ssn;
+	bool lss; // LSS flag in MS option
 	int total_segment_length;
 	int payload_length;
 	bool dummy_payload; // DMP flag
@@ -581,6 +583,11 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		char* str = malloc(payload_length + 1);
 		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
 		str[payload_length] = 0;
+		for(int i=0; i<strlen(str); i++){
+			if(( !(str[i] >= 'A' && str[i] <= 'Z') && !(str[i] >= 'a' && str[i] <= 'z') || !(str[i] >= '0' && str[i] <= '9') || !(str[i] == '/'||str[i] == '.'||str[i] == ':'))){
+				str[i] = ' ';
+			}
+		}
 		LOG_FIELD("payload_str", "\"%s\"", str);
 		free(str);
 	}
@@ -1460,9 +1467,11 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 		ERROR("create_channel_rx_queue_node unexpected NULL parameter");
 	}
 	int sid = 0;
+	bool lss = false;
 	int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
 	if(ms_index >= 0){
 		sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+		lss = (tcp->payload[ms_index+2]>>7);
 	}
 
 	struct channel_rx_queue_node* to_return = malloc(sizeof(struct channel_rx_queue_node));
@@ -1470,6 +1479,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	to_return->channel_offset = channel_offset;
 	to_return->total_segment_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4;
 	to_return->sid = sid;
+	to_return->lss = sid;
 	to_return->payload_length = to_return->total_segment_length - (tcp->d_offs_res>>4)*4;
 	to_return->dummy_payload = tcp->d_offs_res & 0x01;
 	if(to_return->payload_length <= 0 || to_return->total_segment_length <= 0){
@@ -1511,6 +1521,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 	}
 	int sid = (ch_node->segment->payload[ms_index+2]>>2) & 0x1F;
 	int ssn = ((ch_node->segment->payload[ms_index+2]&0x3) << 8) | ch_node->segment->payload[ms_index+3];
+	bool lss  = ch_node->segment->payload[ms_index+2]>>7;
 	// Last stream segment bit currently ignored
 
 	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) malloc(sizeof(struct stream_rx_queue_node));
@@ -1518,6 +1529,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 	to_return->next = NULL; // Always inserted at the end of the stream queue
 	to_return->sid = sid;
 	to_return->ssn = ssn;
+	to_return->lss = lss;
 	to_return->total_segment_length = ch_node->total_segment_length;
 	to_return->payload_length = ch_node->payload_length;
 	to_return->dummy_payload = (ch_node->segment->d_offs_res & 0x01);
@@ -2754,12 +2766,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
 	disable_signal_reception(false);
-	while(tcb->stream_rx_queue[sid] == NULL || tcb->stream_rx_queue[sid]->dummy_payload){
-		/* 
-		NOTA: Questo non gestisce bene il caso in cui è presente solo un segmento nella coda, e è un segmento con LSS attivo
-		e DMP=1, che può essere inviato alla fine di uno stream, e in questo caso bisognerebbe uscire da questo ciclo invece
-		di andare avanti. Va corretto quando si guarda la chiusura delle connessioni
-		*/
+	while(tcb->stream_rx_queue[sid] == NULL || (tcb->stream_rx_queue[sid]->dummy_payload && !tcb->stream_rx_queue[sid]->lss)){
 		if(tcb->stream_rx_queue[sid] != NULL){
 			assert_handler_lock_acquired("dmp removal myread");
 			// condition "tcb->stream_rx_queue[sid]->dummy_payload" is true
@@ -2790,10 +2797,25 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	assert_handler_lock_acquired("myread consumption start");
 	int read_consumed_bytes = 0;
 	while(tcb->stream_rx_queue[sid] != NULL && read_consumed_bytes < maxlen){
-		bool lss = false; // TODO
-		if(lss && read_consumed_bytes != 0  && (tcb->stream_rx_queue[sid]->dummy_payload || (tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length))){
-			// Do not consume this segment at this time: it will be consumed at the next call of myread, that will return 0
-			break;
+		bool lss = tcb->stream_rx_queue[sid]->lss;
+		if(lss && (tcb->stream_rx_queue[sid]->dummy_payload || (tcb->stream_rx_queue[sid]->consumed_bytes == tcb->stream_rx_queue[sid]->payload_length))){
+			if(read_consumed_bytes != 0){
+				// Do not consume this segment at this time: it will be consumed at the next call of myread, that will return 0
+				break;
+			}else{
+				// Received the LSS!
+
+				// Remove the LSS segment from the queue
+				struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
+				tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+				free(dmp_node->segment);
+				free(dmp_node);
+
+				// Nota: potrebbero esserci altri segmenti rimasti in coda: non dovrebbero avere payload, ma potrebbero essere DMP usati per ACK o window update
+
+				return 0;
+			}
+			
 		}
 		if(tcb->stream_rx_queue[sid]->dummy_payload){
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
