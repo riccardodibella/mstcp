@@ -42,11 +42,11 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 10
+#define NUM_CLIENTS 32
 
 #define NUM_CLIENT_REQUESTS 50
 
-#define RESP_PAYLOAD_BYTES 5000
+#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -1302,7 +1302,127 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, txctrl->totlen));
 }
 
+// Just send it! Used for ACKs (in particular dupACKs)
+// Same signature as prepare_tcp but without the payload
+void fast_send_tcp(int s, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
+	LOG_MESSAGE("Fast send");
+	assert_handler_lock_acquired("send_tcp");
+	struct tcpctrlblk*tcb = fdinfo[s].tcb;
+	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
+	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
+		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
+	}
 
+	/*
+	txcb->txtime = -MAX_TIMEOUT ; 
+	txcb->payloadlen = payloadlen;
+	txcb->dummy_payload = flags & DMP;
+	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
+	txcb->retry = 0;
+	*/
+	uint16_t tcp_totlen = 20 + FIXED_OPTIONS_LENGTH;
+	if(flags & DMP){
+		ERROR("cannot use DMP with fast_send_tcp");
+	}
+	
+	struct tcp_segment * tcp = /*txcb->segment =*/ (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
+	tcp->s_port = fdinfo[s].l_port;
+	tcp->d_port = tcb->r_port;
+	tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
+	tcp->d_offs_res=((5+FIXED_OPTIONS_LENGTH/4) << 4) | ((flags >> 8)&0b1111);
+	tcp->flags = flags & 0xFF;
+	tcp->urgp=0;
+	for(int i=0; i<FIXED_OPTIONS_LENGTH; i++){
+		tcp->payload[i] = (i<optlen) ? options[i] : OPT_KIND_END_OF_OPT;
+	}
+	/*
+	if((payload != NULL) != (payloadlen != 0)){
+		// probably there is an error in the code, if this behaviour is intended it is weird
+		ERROR("prepare_tcp payload is not null and payloadlen = 0, or vice versa");
+	}
+	if(payloadlen != 0){
+		memcpy(tcp->payload+FIXED_OPTIONS_LENGTH, payload, payloadlen);
+	}
+	*/
+
+	/*
+	// Insertion in the TX queue
+	txcb->next=NULL;
+	if(tcb->txfirst == NULL) { 
+		tcb->txlast = tcb->txfirst = txcb;
+	}
+	else {
+		tcb->txlast->next = txcb; 
+		tcb->txlast = tcb->txlast->next; // tcb->txlast = txcb;
+	}
+	*/
+	//tcb->sequence += payloadlen;
+
+	/* Calculation of new txcb fields */
+	/*
+	txcb->seq = ntohl(tcp->seq);
+	int multi_stream_opt_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(multi_stream_opt_index<0){
+		txcb->sid = -1;
+		txcb->ssn = -1;
+	}else{
+		txcb->sid = (tcp->payload[multi_stream_opt_index+2]>>2) & 0x1F;
+		txcb->ssn = ((tcp->payload[multi_stream_opt_index+2]&0x3) << 8) | tcp->payload[multi_stream_opt_index+3];
+		
+		// Deactivate the FSM timer for this stream (we are sending a segment, so we don't need to wait for the timeout to open the new stream)
+		tcb->stream_fsm_timer[txcb->sid] = 0;
+	}
+	*/
+
+
+	/*
+	DEFERRED FIELDS
+	tcp->ack;
+	tcp->window;
+	tcp->checksum;
+
+	DEFERRED OPTIONS
+	Timestamps (Fill TS Echo Reply if not SYN packet)
+	SACK (Add up to 3 records and change length accordingly)
+	*/
+
+	for(int i=0; i<optlen; i++){
+		if(tcp->payload[i] == OPT_KIND_END_OF_OPT){
+			break;
+		}
+		if(tcp->payload[i] == OPT_KIND_NO_OP){
+			continue;
+		}
+		if(tcp->payload[i] == OPT_KIND_TIMESTAMPS){
+			// https://www.ietf.org/rfc/rfc1323.txt pp. 15-16
+
+			// bytes i+2, i+3, i+4 and i+5 are for the current tick value (current Timestamp)
+			*(uint32_t*) (tcp->payload+i+2) = htonl(get_tcp_timestamp_ms());
+
+			// bytes i+6, i+7, i+8 and i+9 are for the most recent TS value to echo
+			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
+		}
+		if(tcp->payload[i] == OPT_KIND_SACK){
+			// DEBUG("TODO SACK update");
+		}
+		int length = tcp->payload[i+1];
+		i += length - 1; // with the i++ we go to the start of the next option
+	}
+
+	struct pseudoheader pseudo;
+	pseudo.s_addr = fdinfo[s].l_addr;
+	pseudo.d_addr = tcb->r_addr;
+	pseudo.zero = 0;
+	pseudo.prot = TCP_PROTO;
+	pseudo.len = htons(tcp_totlen);
+
+	tcp->checksum = htons(0);
+	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
+	tcp->window = htons(0);
+	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, tcp_totlen));
+
+	send_ip((unsigned char*) tcp, (unsigned char*) &(tcb->r_addr), tcp_totlen, TCP_PROTO);
+}
 
 
 
@@ -1543,78 +1663,6 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 }
 
 
-
-
-void nagle_scheduler(int s){
-	if(s < 3 || s >= MAX_FD){
-		ERROR("nagle_scheduler invalid fd %d", s);
-	}
-	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	if(tcb == NULL){
-		ERROR("nagle_scheduler tcb NULL");
-	}
-	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = malloc(max_payload_length);
-	for(int sid = 0; sid < TOT_SID; sid++){
-		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
-			// We can transmit some more data on the stream
-			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
-
-			/* FLOW CONTROL START */
-			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
-			bool small_in_flight = false;
-			struct txcontrolbuf* tx_cursor = tcb->txfirst;
-			while(tx_cursor != NULL){
-				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
-						small_in_flight = true;
-					}
-					in_flight_bytes += tx_cursor->payloadlen;
-				}
-				tx_cursor = tx_cursor->next;
-			}
-			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Must always be >= 0
-			if(flow_control_allowed_bytes < 0){
-				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
-			}
-			available_bytes = MIN(available_bytes, MAX(flow_control_allowed_bytes, 0));
-			/* FLOW CONTROL END */
-
-			while(available_bytes > 0){
-				int payload_length = MIN(available_bytes, max_payload_length);
-				if(payload_length < max_payload_length && small_in_flight){
-					break;
-				}
-				for(int i=0; i<payload_length; i++){
-					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
-					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
-					tcb->txfree[sid]++;
-					available_bytes--;
-				}
-				if(!tcb->ms_option_enabled){
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-				}else{
-					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
-					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-					
-					// Stream update
-					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
-					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-					update_next_ssn(&(tcb->next_ssn[sid]));
-
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
-					free(opt);
-				}
-			}
-		}
-	}
-	free(temp_payload_buf);
-}
-
-
-
-
 void unfair_congestion_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
 		ERROR("unfair_congestion_scheduler invalid fd %d", s);
@@ -1711,7 +1759,6 @@ void unfair_congestion_scheduler(int s){
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
-	//nagle_scheduler(s);
 	unfair_congestion_scheduler(s);
 }
 
@@ -3344,13 +3391,17 @@ void myio(int ignored){
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
+							LOG_MESSAGE("DMP ACK");
 							prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
 							free(dummy_payload);
 							free(opt);
 						}
 						else{
 							// Generic ACK
-							prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+							LOG_MESSAGE("non-DMP ACK");
+							//ERROR("Inviare subito, non accodare!");
+							//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+							fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						}
 					}else{
 						DEBUG("Unexpected packet with payload but no MSTCP option:");
@@ -3566,7 +3617,7 @@ void single_client_app(int* client_sockets, int i /* num_client */){
 		after_read:
 		if(resp_recv_bytes[i] == resp_tot_bytes[i]){
 			resp_arr[i][resp_recv_bytes[i]] = 0;
-			DEBUG(resp_arr[i]);
+			//DEBUG(resp_arr[i]);
 			resp_recv_bytes[i] = 0;
 			resp_tot_bytes[i] = 0;
 			current_req_bytes[i] = 0;
