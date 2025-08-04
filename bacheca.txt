@@ -1,34 +1,14 @@
 Domande:
-- Chiedo per sicurezza... per il congestion control prendo come base quello che viene fatto in mytcp e lo modifico solo dove necessario
-per adattarlo alla struttura del mio programma (ad esempio spostare rtt_estimate), giusto? Ci sono altre correzioni da fare o bug noti nel
-funzionamento di quel meccanismo in mytcp?
-- In mytcp, per controllare che un pacchetto sia un DupACK si controlla che sia solo un ACK, che abbia payload 0, che il numero di ACK
-sia uguale al precedente, e che la sua window sia uguale a quella precedente. Dato che con MS-TCP la window non viene mai inviata con segmenti
-di lunghezza 0 (perchè per l'aggiornamento della advertised window si usa un segmento DMP), posso togliere la condizione sulla finestra che
-non è stata modificata? Anche perchè dato che quel pacchetto con lunghezza 0 non avrà un SID non so neanche a quale entry di radwin dovrei fare
-riferimento
-- I segmenti DMP non vengono considerati per la advertised window. Devono essere ignorati anche per il calcolo della congestion window? Quindi
-sia per evitare un update della congestion window quando arriva un ACK, sia per ignorarli quando si calcola il numero di byte in volo durante
-le ritrasmissioni
 - Se non ho capito male, in mytcp viene considerato che un pacchetto "pieno" porta 1MSS byte. Nel nostro caso però non è così: se trasmettiamo
 un MSS con la sua estensione, noi in pratica trasmetteremo segmenti da 1MSS - 40B, per la dimensione fissa delle opzioni. In questo modo per il
 congestion control c'è un mismatch continuo tra quello che si può inviare in più dopo un incremento di 1MSS e quello che si può inviare in un
 segmento singolo. Come dovrei gestire questa cosa?
-- Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
-che solo una? Avevo letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
-- Perchè in mytcp in myio si imposta un accumulatore (tot) usando totlen (cioè 20+optlen+payloadlen) invece che usare payloadlen?
-- La cwmd va considerata anche nello scheduler per evitare di avere una coda troppo lunga di segmenti non acked per uno stream e permettere
-di aggiungere segmenti DMP che verranno trasmessi in tempi brevi, giusto? Quindi la cwnd verrà considerata sia in mytimer sia nello scheduler,
-corretto?
 - Probabilmente è una domanda stupida, ma a cosa serve precisamente il controllo fdinfo[s].tcb->st == TCB_ST_CLOSED in mywrite? Anche
 perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei controllare lo stato dello stream, non del TCB, giusto?
-- Bisogna capire come fare il congctrl con flusso bidirezionale, e come gestire bene gli ACK DMP
 - La frase "When the last segment is acknowledged for both directions, the stream socket is closed the stream buffers are freed." secondo me non
 è giusta, perchè questo non succede neanche in TCP. In TCP, un host può consumare dati anche dopo aver chiamato close(), quindi i buffer devono
 essere conservati anche dopo. Questo non è tanto un problema per la chiusura degli stream e delle connessioni in sè, ma per il riuso, perchè non
 c'è modo per distinguere se l'altro peer è in questa situazione o no
-- Dopo aver inviato un LSS, bisogna poter inviare altri segmenti DMP su quello stream, ad esempio per fare dei window update, altrimenti la ricezione
-potrebbe ingolfarsi dopo che si ha chiuso solo l'invio, non la ricezione
 
 
 - myclose è facile: metto un flag che dice "accoda il LSS", chiamo lo scheduler per sicurezza, e poi lo scheduler deciderà quando accodare il LSS
@@ -209,6 +189,34 @@ poter forse trasmettere qualcosa di nuovo, e lui valuta lo stato del TCB per cap
 idempotenti, e chiamare lo scheduler due volte di fila non dovrebbe fare niente (a parte sprecare tempo)
     => In testa mia è giusto, volendo lo si può vedere diversamente come una macchina a stati, in cui oltre che il tcb gli si passa
     l'evento che è successo, questo permetterebbe di fare molte meno operazioni ad ogni chiamata
+- Chiedo per sicurezza... per il congestion control prendo come base quello che viene fatto in mytcp e lo modifico solo dove necessario
+per adattarlo alla struttura del mio programma (ad esempio spostare rtt_estimate), giusto? Ci sono altre correzioni da fare o bug noti nel
+funzionamento di quel meccanismo in mytcp?
+    => Ci sono sicuramente problemi in quello che viene fatto in mytcp
+- In mytcp, per controllare che un pacchetto sia un DupACK si controlla che sia solo un ACK, che abbia payload 0, che il numero di ACK
+sia uguale al precedente, e che la sua window sia uguale a quella precedente. Dato che con MS-TCP la window non viene mai inviata con segmenti
+di lunghezza 0 (perchè per l'aggiornamento della advertised window si usa un segmento DMP), posso togliere la condizione sulla finestra che
+non è stata modificata? Anche perchè dato che quel pacchetto con lunghezza 0 non avrà un SID non so neanche a quale entry di radwin dovrei fare
+riferimento
+    => Non ho chiesto, ma va bene come ho fatto, considerando solo ACK non MS
+- I segmenti DMP non vengono considerati per la advertised window. Devono essere ignorati anche per il calcolo della congestion window? Quindi
+sia per evitare un update della congestion window quando arriva un ACK, sia per ignorarli quando si calcola il numero di byte in volo durante
+le ritrasmissioni
+    => Esatto, non si considerano nella congestion window
+- Bisogna cambiare il modo di aggiornare l'RTT adesso che si considerano più misure per ogni ciclo di RTT invece
+che solo una? Avevo letto qualche discussione a riguardo, ma non ho trovato nessuna indicazione precisa
+    => Non ho chiesto, ma dai grafici l'rtt è molto stabile sotto al minimo RTO, quindi non c'è problema per il momento
+- Perchè in mytcp in myio si imposta un accumulatore (tot) usando totlen (cioè 20+optlen+payloadlen) invece che usare payloadlen?
+    => Non ho chiesto, ma probabilmente è un bug
+- La cwmd va considerata anche nello scheduler per evitare di avere una coda troppo lunga di segmenti non acked per uno stream e permettere
+di aggiungere segmenti DMP che verranno trasmessi in tempi brevi, giusto? Quindi la cwnd verrà considerata sia in mytimer sia nello scheduler,
+corretto?
+    => Sembra essere giusto
+- Dopo aver inviato un LSS, bisogna poter inviare altri segmenti DMP su quello stream, ad esempio per fare dei window update, altrimenti la ricezione
+potrebbe ingolfarsi dopo che si ha chiuso solo l'invio, non la ricezione
+    => Corretto
+- Bisogna capire come fare il congctrl con flusso bidirezionale, e come gestire bene gli ACK DMP
+    => Già risolto, si considerano sono ACK non-MS, bisognava sistemare il bug dell'invio ritardato degli ACK
 
 Fonti:
 https://www.rfc-editor.org/rfc/rfc7323#section-4 Spiegazione di quali misure dell'RTT vanno usate per l'aggiornamento
@@ -220,3 +228,5 @@ Problemi di MYTCP:
 - Viene accettata solo una connessione alla volta
 - In myaccept, viene dato errore se lo stato del TCB è SYN_RECEIVED, anche se c'è il toggle tra i due stati
 - In myio, dopo aver chiamato la FSM, se la connessione non è established viene fatto "break" invece di "continue"
+- In un punto, si accumula (accumulatore tot) usando totlen invece di payloadlen
+- Gli ACK vengono inviati tutti assieme in mytimer invece che subito per ogni pacchetto, dall'altro lato sono dupACK
