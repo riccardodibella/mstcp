@@ -42,11 +42,11 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 32
+#define NUM_CLIENTS 1
 
-#define NUM_CLIENT_REQUESTS 50
+#define NUM_CLIENT_REQUESTS 10
 
-#define RESP_PAYLOAD_BYTES 10000
+#define RESP_PAYLOAD_BYTES 1000000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -585,7 +585,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
 		str[payload_length] = 0;
 		for(int i=0; i<strlen(str); i++){
-			if(( !(str[i] >= 'A' && str[i] <= 'Z') && !(str[i] >= 'a' && str[i] <= 'z') || !(str[i] >= '0' && str[i] <= '9') || !(str[i] == '/'||str[i] == '.'||str[i] == ':'))){
+			if(( !(str[i] >= 'A' && str[i] <= 'Z') && !(str[i] >= 'a' && str[i] <= 'z') && !(str[i] >= '0' && str[i] <= '9') && !(str[i] == '/'||str[i] == '.'||str[i] == ':'))){
 				str[i] = ' ';
 			}
 		}
@@ -3711,9 +3711,11 @@ void single_server_app(int* client_sockets, int i /* num_client */){
 	}else if(srv_st[i] == SERVER_ST_RESP){
 		uint8_t data[RESP_BUF_SIZE];
 		sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", requested_payload_bytes[i], i);
+		int end_index = strlen(data);
 		for(int j=0; j<requested_payload_bytes[i]; j++){
-			strcat(data, "X");
+			data[end_index++] = 'X';
 		}
+		data[end_index] = 0;
 		uint8_t* start = data+current_resp_bytes[i];
 		int missing = strlen(data) - current_resp_bytes[i];
 		int res = mywrite(client_sockets[i], start, missing);
