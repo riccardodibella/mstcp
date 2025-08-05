@@ -626,6 +626,33 @@ void LOG_CONGCTRL(struct tcpctrlblk* tcb){
 	LOG_FIELD("p_mss", "%u", tcb->payload_mss);
 	LOG_OBJ_END();
 }
+void LOG_SCHEDULER_BYTES(int sid, int available, int flow, int congestion){
+	LOG_OBJ_START();
+	LOG_FIELD("type", "\"SCB\"");
+	LOG_FIELD("sid", "%d", sid);
+	LOG_FIELD("av", "%d", available);
+	LOG_FIELD("flow", "%d", flow);
+	LOG_FIELD("cng", "%d", congestion);
+
+	/*
+	Limiting factor:	0 -> available (slow source)
+						1 -> flow control (small window)
+						2 -> congestion control
+	*/
+	int limiting = 0;
+	int min = available;
+	if(flow < min){
+		limiting = 1;
+		min = flow;
+	}
+	if(congestion < min){
+		limiting = 2;
+		min = congestion;
+	}
+	LOG_FIELD("min", "%d", min);
+	LOG_FIELD("cause", "%d", limiting);
+	LOG_OBJ_END();
+}
 void LOG_MESSAGE(char* msg){
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"MSG\"");
@@ -1699,6 +1726,7 @@ void unfair_congestion_scheduler(int s){
 
 			int allowed_bytes = MIN(flow_control_allowed_bytes, cong_control_allowed_bytes);
 			int current_transfer_bytes = MIN(available_bytes, allowed_bytes);
+			LOG_SCHEDULER_BYTES(sid, available_bytes, flow_control_allowed_bytes, cong_control_allowed_bytes);
 			/* FLOW CONTROL END */
 
 			while(current_transfer_bytes > 0){

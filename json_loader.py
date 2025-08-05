@@ -5,8 +5,8 @@ import matplotlib.patches as mpatches
 import matplotlib
 matplotlib.use('TkAgg')  # Ensures GUI backend
 
-FILENAME = "log_client.json"
-#FILENAME = "log_server.json"
+#FILENAME = "log_client.json"
+FILENAME = "log_server.json"
 
 
 full_log = []
@@ -18,6 +18,11 @@ start_ts_us = full_log[0].get("timestamp_us")
 cng = [row for row in full_log if row.get('type') == 'CNG']
 cng_df = pd.DataFrame(cng)
 cng_ts = (cng_df['timestamp_us'] - start_ts_us)/1E6
+
+scb = [row for row in full_log if row.get('type') == 'SCB']
+scb = [row for row in scb if row.get('sid') == 0]
+scb_df = pd.DataFrame(scb)
+scb_ts = (scb_df['timestamp_us'] - start_ts_us)/1E6
 
 rtt = [row for row in full_log if row.get('type') == 'RTT']
 rtt_df = pd.DataFrame(rtt)
@@ -37,10 +42,15 @@ pkt_in_df = pd.DataFrame(pkt_in)
 pkt_in_ts = (pkt_in_df['timestamp_us'] - start_ts_us) / 1E6
 
 # State label and color mapping
-state_labels = {
+state_labels_cng = {
     0: "Slow Start",
     1: "Congestion Avoidance",
     2: "Fast Recovery"
+}
+state_labels_scb = {
+    0: "Available",
+    1: "Flow control",
+    2: "Congestion Control"
 }
 color_map = {
     0: 'red',
@@ -51,20 +61,45 @@ color_map = {
 
 
 
-colors = cng_df['state'].map(color_map)
 
 plt.figure()
-plt.scatter(cng_ts, cng_df['cgwin'], c=colors, marker='x', s = 5)
+colors_cng = cng_df['state'].map(color_map)
+plt.scatter(cng_ts, cng_df['cgwin'], c=colors_cng, marker='x', s = 5)
 plt.xlabel('Timestamp [s]')
 plt.ylabel('cgwin')
 plt.title("Congestion Window")
 # Legend with string labels
-legend_patches = [
-    mpatches.Patch(color=color_map[state], label=state_labels[state])
-    for state in sorted(state_labels)
+legend_patches_cng = [
+    mpatches.Patch(color=color_map[state], label=state_labels_cng[state])
+    for state in sorted(state_labels_cng)
 ]
-plt.legend(handles=legend_patches, title="TCP State", loc='best')
+plt.legend(handles=legend_patches_cng, title="TCP State", loc='best')
 plt.tight_layout()
+
+
+
+
+
+
+plt.figure()
+plt.scatter(scb_ts, scb_df['av'], c='#777', marker='x', s = 0.5)
+plt.scatter(scb_ts, scb_df['flow'], c='#AAA', marker='x', s = 0.5)
+plt.scatter(scb_ts, scb_df['cng'], c='#DDD', marker='x', s = 0.5)
+colors_scb = scb_df['cause'].map(color_map)
+plt.scatter(scb_ts, scb_df['min'], c=colors_scb, marker='+', s = 1)
+plt.xlabel('Timestamp [s]')
+plt.ylabel('Bytes')
+plt.title("Scheduler bytes")
+# Legend with string labels
+legend_patches_scb = [
+    mpatches.Patch(color=color_map[state], label=state_labels_scb[state])
+    for state in sorted(state_labels_scb)
+]
+plt.legend(handles=legend_patches_scb, title="Limiting factor", loc='best')
+plt.tight_layout()
+
+
+
 
 plt.figure()
 plt.scatter(rtt_ts, rtt_df['value_s'], marker='x', label='RTT', s = 5)
