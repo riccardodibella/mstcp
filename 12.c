@@ -44,7 +44,7 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 */
 #define NUM_CLIENTS 1
 
-#define NUM_CLIENT_REQUESTS 10
+#define NUM_CLIENT_REQUESTS 100
 
 #define RESP_PAYLOAD_BYTES 1000000
 #define REQ_BUF_SIZE 100
@@ -81,8 +81,10 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 #define MAX_TIMEOUT (MAX_TIMEOUT_SEC * 1000000 / TIMER_USECS)
 //#define MAXTIMEOUT 10000
 // #define TODO_BUFFER_SIZE 64000
-#define RX_VIRTUAL_BUFFER_SIZE 10000
-#define TX_BUFFER_SIZE 64000
+#define RX_VIRTUAL_BUFFER_SIZE (1024*1024)
+#define DEFAULT_WINDOW_SCALE 10 // Default parameter sent during the handshake
+
+#define TX_BUFFER_SIZE (1024*1024)
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
 #define MIN_PORT 19000
@@ -95,7 +97,6 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
 
-#define DEFAULT_WINDOW_SCALE 0 // Default parameter sent during the handshake
 
 // SID = Stream ID
 #define SID_UNASSIGNED -1
@@ -275,8 +276,8 @@ struct stream_rx_queue_node{
 
 struct tcpctrlblk{
 	int stream_state[TOT_SID];
-	unsigned short adwin[TOT_SID];
-	unsigned short radwin[TOT_SID];
+	uint32_t adwin[TOT_SID];
+	uint32_t radwin[TOT_SID];
 	unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
 	//unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
 	//unsigned int rx_win_start[TOT_SID]; // Index at which we can read the next byte in the RX buffer
@@ -311,7 +312,7 @@ struct tcpctrlblk{
 	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH (when ms-tcp is enabled, otherwise... I don't yet know)
 	unsigned int stream_end; // Channel property (bad name)
 	unsigned int fsm_timer; // Channel property
-	unsigned short init_radwin; // Used in MS-TCP as a default value for radwin of new streams
+	uint32_t init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
 	bool is_active_side; // Channel property
 	int listening_fd; // If it is a passive TCB, this is the fd of the listening socket where streams have to be inserted
@@ -515,6 +516,13 @@ uint16_t update_next_ssn(uint16_t* ssn_field){
 	uint16_t to_return = *ssn_field;
 	*ssn_field = (to_return+1) % 1024; // 10 bits for ssn -> mod 1024
 	return to_return;
+}
+
+uint32_t inflate_window_scale(uint16_t small_window, uint8_t factor){
+	return ((uint32_t)small_window)<<factor;
+}
+uint16_t deflate_window_scale(uint32_t big_window, uint8_t factor){
+	return (uint16_t)(big_window>>factor);
 }
 
 void LOG_TEXT(const char *text) {
@@ -1312,7 +1320,8 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	tcp->checksum = htons(0);
 	tcp->ack = htonl(tcb->ack_offs + tcb->cumulativeack);
 	if(txctrl->sid >= 0){
-		tcp->window = htons(tcb->adwin[txctrl->sid]);
+		//DEBUG("A %d f %d B %d", tcb->adwin[txctrl->sid], tcb->out_window_scale_factor, deflate_window_scale(tcb->adwin[txctrl->sid], tcb->out_window_scale_factor));
+		tcp->window = htons(deflate_window_scale(tcb->adwin[txctrl->sid], tcb->out_window_scale_factor));
 		if(txctrl->ssn == 512){
 			if(!ssn_wrap_warning[txctrl->sid]){
 				//DEBUG("\n\n\n#######################\nnupdate_tcp_header enabling wrap warning sid %d\n#######################\n", txctrl->sid);
@@ -1494,7 +1503,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042]. 
 				*/
 				tcb->lta = 0;
-				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0 || (false && dmp && (htons(tcp->window) == tcb->radwin[sid]))) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
+				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
 					tcb->repeated_acks++;
 				}
 				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
@@ -1955,9 +1964,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				*/
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				if(tcb->out_window_scale_factor != 0){
-					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
-				}
 				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->txfree[i] = 0;
@@ -2137,9 +2143,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->stream_rx_queue[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				if(tcb->out_window_scale_factor != 0){
-					ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
-				}
 				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
@@ -2287,7 +2290,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					fdinfo[s].sid = 0; // The first opened stream is always stream 0
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
-					tcb->init_radwin = tcb->radwin[0] = htons(tcp->window);
+					tcb->init_radwin = tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					tcb->txfree[0] = TX_BUFFER_SIZE;
 					tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 					if(tcb->stream_tx_buffer[0] != NULL){
@@ -2368,6 +2371,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				}
 
 				tcb->in_window_scale_factor = win_scale_factor_received;
+				tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 				tcb->mss = MIN(mss_received, TCP_MSS);
 				tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
 				tcb->ts_offset = tcb->ts_recent = received_remote_timestamp;
@@ -2492,7 +2496,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					backlog_tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
 					backlog_tcb->stream_rx_queue[0] = NULL;
 					//backlog_tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
-					backlog_tcb->radwin[0] = htons(tcp->window); // TODO Window scale not handled 
+					backlog_tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					backlog_tcb->txfree[0] = TX_BUFFER_SIZE;
 					backlog_tcb->tx_buffer_occupied_region_start[0] = backlog_tcb->tx_buffer_occupied_region_end[0] = 0;
 					backlog_tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
@@ -2503,9 +2507,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->stream_tx_buffer[i] = NULL;
 						backlog_tcb->stream_rx_queue[i] = NULL;
 						backlog_tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
-						if(tcb->out_window_scale_factor != 0){
-							ERROR("TODO tcb->adwin management with out_window_scale_factor != 0");
-						}
 						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
 						backlog_tcb->txfree[i] = 0;
 						backlog_tcb->tx_buffer_occupied_region_start[i] = backlog_tcb->tx_buffer_occupied_region_end[i] = 0;
@@ -2565,7 +2566,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
-							tcb->radwin[sid] = htons(tcp->window);
+							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -2760,57 +2761,6 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	}while(pause());
 	ERROR("myaccept something went very wrong, you should never reach after the do while in myaccept"); // pause always returns -1
 }
-
-#if 0
-int mywrite_direct_segmentation(int s, uint8_t * buffer, int maxlen){
-	// Direct segmentation mywrite
-	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
-		ERROR("mywrite invalid socket %d %d", fdinfo[s].st, FDINFO_ST_TCB_CREATED);
-	}
-	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
-		myerrno = EINVAL;
-		return -1;
-	}
-	if(maxlen < 0){
-		ERROR("mywrite invalid maxlen %d");
-	}
-	if(maxlen == 0){
-		return 0;
-	}
-
-	// do-while skipped for direct segmentation
-	int start_byte_number = 0;
-	while(start_byte_number < maxlen){
-		int remaining_length = maxlen - start_byte_number;
-		int payload_length = MIN(remaining_length, TCP_MSS - FIXED_OPTIONS_LENGTH); // TODO we should read the MSS from the tcb, not from the TCP_MSS macro
-		
-		disable_signal_reception(false);
-
-		if(!fdinfo[s].tcb->ms_option_enabled){
-			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-		}else{
-			int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-			uint8_t* opt = malloc(optlen);
-			memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-			
-			// Stream update
-			opt[2] = fdinfo[s].sid<<2 | (((fdinfo[s].tcb->next_ssn[fdinfo[s].sid])>>8) & 0x03);
-			opt[3] = (fdinfo[s].tcb->next_ssn[fdinfo[s].sid]) & 0xFF;
-
-			update_next_ssn(&(fdinfo[s].tcb->next_ssn[fdinfo[s].sid]));
-			prepare_tcp(s, ACK, buffer + start_byte_number, payload_length, opt, optlen);
-			free(opt);
-		}
-
-		enable_signal_reception(false);
-		start_byte_number += payload_length;
-	}
-	if(start_byte_number != maxlen){
-		ERROR("invalid start_byte_number at end of mywrite with direct segmentation");
-	}
-	return start_byte_number;
-}
-#endif
 
 int mywrite(int s, uint8_t * buffer, int maxlen){
 	if(fdinfo[s].st != FDINFO_ST_TCB_CREATED || fdinfo[s].tcb == NULL || fdinfo[s].tcb->st != TCB_ST_ESTABLISHED){
@@ -3269,7 +3219,7 @@ void myio(int ignored){
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
-					uint16_t new_radwin = htons(tcp->window);
+					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					if(new_radwin >= tcb->radwin[sid]){
 						tcb->radwin[sid] = new_radwin;
 					}
@@ -3292,7 +3242,7 @@ void myio(int ignored){
 
 							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
 
-							tcb->radwin[sid] = htons(tcp->window);
+							tcb->radwin[sid] = new_radwin;
 						}else{
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
