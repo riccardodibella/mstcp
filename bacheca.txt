@@ -9,6 +9,11 @@ perchè in mytcp dopo ci si comporta allo stesso modo in ogni caso. Io dovrei co
 è giusta, perchè questo non succede neanche in TCP. In TCP, un host può consumare dati anche dopo aver chiamato close(), quindi i buffer devono
 essere conservati anche dopo. Questo non è tanto un problema per la chiusura degli stream e delle connessioni in sè, ma per il riuso, perchè non
 c'è modo per distinguere se l'altro peer è in questa situazione o no
+- A occhio, direi che l'utilizzo del Fast Retransmit in MS introduce un vantaggio aggiuntivo rispetto a TCP normale, perchè se una richiesta occupa pochi
+segmenti e viene persa, non viene triggerato il fast retransmit, perchè non ci sono abbastanza dupACK; con MS invece, se viene persa una richiesta
+per uno stream il traffico sugli altri stream genera abbastanza dupACK da triggerare la ritrasmissione... è giusto come ragionamento? Questo dovrebbe
+essere utile soprattutto in Uplink se gran parte del traffico è in downlink, e si potrebbe vedere bene mettendo una drop probability più alta in ricezione
+quando si è nel server
 
 
 - myclose è facile: metto un flag che dice "accoda il LSS", chiamo lo scheduler per sicurezza, e poi lo scheduler deciderà quando accodare il LSS

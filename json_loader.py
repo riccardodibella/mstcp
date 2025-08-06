@@ -81,22 +81,36 @@ plt.tight_layout()
 
 
 
+# https://claude.ai/share/21b3c3f8-26fa-402d-87ff-dde21b6489c7
 plt.figure()
-plt.scatter(scb_ts, scb_df['av'], c='#777', marker='x', s = 0.5)
-plt.scatter(scb_ts, scb_df['flow'], c='#AAA', marker='x', s = 0.5)
-plt.scatter(scb_ts, scb_df['cng'], c='#DDD', marker='x', s = 0.5)
+# Plot the three baseline values with more distinct styling
+plt.scatter(scb_ts, scb_df['av'], c='orange', marker='o', s=2, alpha=0.7, label='Available')
+plt.scatter(scb_ts, scb_df['flow'], c='purple', marker='s', s=2, alpha=0.7, label='Flow Control')
+plt.scatter(scb_ts, scb_df['cng'], c='cyan', marker='^', s=2, alpha=0.7, label='Congestion Control')
+# Plot the minimum (limiting factor) with colored markers based on cause
 colors_scb = scb_df['cause'].map(color_map)
-plt.scatter(scb_ts, scb_df['min'], c=colors_scb, marker='+', s = 1)
+plt.scatter(scb_ts, scb_df['min'], c=colors_scb, marker='+', s=3, label='Limiting Factor')
 plt.xlabel('Timestamp [s]')
 plt.ylabel('Bytes')
 plt.title("Scheduler bytes")
-# Legend with string labels
+# Create combined legend
+# First, the baseline lines
+baseline_handles = [
+    plt.scatter([], [], c='orange', marker='o', s=20, alpha=0.7, label='Available'),
+    plt.scatter([], [], c='purple', marker='s', s=20, alpha=0.7, label='Flow Control'),
+    plt.scatter([], [], c='cyan', marker='^', s=20, alpha=0.7, label='Congestion Control')
+]
+# Then, the limiting factor legend
 legend_patches_scb = [
-    mpatches.Patch(color=color_map[state], label=state_labels_scb[state])
+    mpatches.Patch(color=color_map[state], label=f"Limiting: {state_labels_scb[state]}")
     for state in sorted(state_labels_scb)
 ]
-plt.legend(handles=legend_patches_scb, title="Limiting factor", loc='best')
+# Combine all legend elements
+all_handles = [h for h in baseline_handles] + legend_patches_scb
+plt.legend(handles=all_handles, loc='best')
 plt.tight_layout()
+
+
 
 
 

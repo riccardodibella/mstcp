@@ -44,9 +44,9 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 */
 #define NUM_CLIENTS 1
 
-#define NUM_CLIENT_REQUESTS 100
+#define NUM_CLIENT_REQUESTS 1000
 
-#define RESP_PAYLOAD_BYTES 1000000
+#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -635,6 +635,7 @@ void LOG_CONGCTRL(struct tcpctrlblk* tcb){
 	LOG_OBJ_END();
 }
 void LOG_SCHEDULER_BYTES(int sid, int available, int flow, int congestion){
+	congestion = MAX(0, congestion);
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"SCB\"");
 	LOG_FIELD("sid", "%d", sid);
