@@ -44,7 +44,7 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 */
 #define NUM_CLIENTS 1
 
-#define NUM_CLIENT_REQUESTS 1000
+#define NUM_CLIENT_REQUESTS 10
 
 #define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
@@ -130,9 +130,19 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 #define STREAM_STATE_UNUSED 0
 #define STREAM_STATE_READY 1 // only for passive open before accept
 #define STREAM_STATE_OPENED 2
-#define STREAM_STATE_LSS_SENT 3
-#define STREAM_STATE_LSS_RCV 4
-#define STREAM_STATE_CLOSED 5
+
+// Transitions to state CLOSED must be managed in 2 points: when write_side_close_state becomes LSS_ACKED, and where the flag lss_received is set, during myio
+#define STREAM_STATE_CLOSED 3
+// Transition back to state UNUSED may be done after a timeout, but this is TBD; After coming back to state unused, an endpoint must still discard segments with LSS flag set, because they are window updates of the old stream
+
+
+// Values for write_side_close_state
+#define WR_CLOSE_ST_OPEN 0 // close() has not been called
+#define WR_CLOSE_ST_LSS_REQUESTED 1 // close() has been called, we are waiting for the scheduler to enqueue the LSS once all the data is in the TX queue
+#define WR_CLOSE_ST_LSS_TXED 2 // the LSS has been enqueued in the TX queue (and TXed as soon as possible)
+#define WR_CLOSE_ST_LSS_ACKED 3 // the LSS has been removed from the TX queue because it has been ACKed (with SACK or with cumulative ACK)
+// If state > OPEN, we can no longer call close() or write()
+// If state >= LSS_TXED, all the segments that will be added with prepare_tcp will have the LSS flag set automatically, to allow stream reuse detection at the other side
 
 #define FIN 0x001
 #define SYN 0x002
@@ -288,7 +298,13 @@ struct tcpctrlblk{
 	uint16_t next_rx_ssn[TOT_SID]; // SSN of the next segment that has to be inserted in the buffer
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 	struct stream_rx_queue_node* stream_rx_queue[TOT_SID]; // Contains only in-order segments for each stream, ready to be consumed by myread()
-	bool lss_requested[TOT_SID];
+
+	// "write" direction
+	int write_side_close_state[TOT_SID];
+
+	// "read" direction
+	bool lss_received[TOT_SID]; // LSS dequeued from channel queue and enqueued in stream queue
+	bool lss_consumed[TOT_SID]; // LSS consumed from channel queue: subsequent read() calls must return 0
 
     int st; // Channel property
 
@@ -1711,7 +1727,7 @@ void unfair_congestion_scheduler(int s){
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
 	uint8_t* temp_payload_buf = malloc(max_payload_length);
 	for(int sid = 0; sid < TOT_SID; sid++){
-		if(tcb->stream_state[sid] == STREAM_STATE_OPENED || tcb->stream_state[sid] == STREAM_STATE_LSS_RCV){
+		if(tcb->stream_state[sid] == STREAM_STATE_OPENED){
 			// We can transmit some more data on the stream
 			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
 
@@ -1767,7 +1783,7 @@ void unfair_congestion_scheduler(int s){
 				}
 			}
 
-			if(tcb->lss_requested[sid]){
+			if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_REQUESTED){
 				if(tcb->txfree[sid] == TX_BUFFER_SIZE){
 					// Enqueue LSS segment
 					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -1785,7 +1801,7 @@ void unfair_congestion_scheduler(int s){
 					free(dummy_payload);
 					free(opt);
 
-					tcb->lss_requested[sid] = false;
+					tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_TXED;
 				}
 			}
 		}
@@ -1974,7 +1990,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_fsm_timer[i] = 0;
 				tcb->stream_rx_queue[i] = NULL;
 
-				tcb->lss_requested[i] = false;
+				tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
+				tcb->lss_received[i] = tcb->lss_consumed[i] = false;
 			}
 
 
@@ -2070,7 +2087,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].tcb->stream_rx_queue[stream] = NULL;
 							fdinfo[s].tcb->adwin[stream] = RX_VIRTUAL_BUFFER_SIZE;
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
-							fdinfo[s].tcb->lss_requested[stream] = false;
+							fdinfo[s].tcb->write_side_close_state[stream] = WR_CLOSE_ST_OPEN;
+							fdinfo[s].tcb->lss_received[stream] = fdinfo[s].tcb->lss_consumed[stream] = false;
 							return 0;
 						}
 					}
@@ -2150,7 +2168,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->next_ssn[i] = 0;
 				tcb->next_rx_ssn[i] = 0;
 				tcb->stream_fsm_timer[i] = 0;
-				tcb->lss_requested[i] = false;
+				tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
+				tcb->lss_received[i] = tcb->lss_consumed[i] = false;
 			}
 
 
@@ -2305,7 +2324,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					// We don't need to do anything with stream_rx_queue as it is already empty
 					tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
 
-					tcb->lss_requested[0] = false;
+					tcb->write_side_close_state[0] = WR_CLOSE_ST_OPEN;
+					tcb->lss_received[0] = tcb->lss_consumed[0] = false;
 
 					/*
 					We include all the usual payload options in this ACK
@@ -2514,7 +2534,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->next_ssn[i] = 0;
 						backlog_tcb->next_rx_ssn[0] = 1;
 						backlog_tcb->stream_fsm_timer[i] = 0;
-						backlog_tcb->lss_requested[i] = false;
+						backlog_tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
+						backlog_tcb->lss_received[i] = backlog_tcb->lss_consumed[i] = false;
 					}
 					backlog_tcb->listening_fd = s;
 
@@ -2578,7 +2599,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE;
 							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
 
-							tcb->lss_requested[sid] = false;
+							tcb->write_side_close_state[sid] = WR_CLOSE_ST_OPEN;
+							tcb->lss_received[sid] = tcb->lss_consumed[sid] = false;
 
 							// Insertion in the listening socket backlog
 							struct stream_backlog_node* cursor = &fdinfo[tcb->listening_fd].stream_backlog_head;
@@ -2771,14 +2793,18 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 		myerrno = EINVAL;
 		return -1;
 	}
-	// TODO bisognerebbe aggiungere un controllo sullo stato dello stream (?)
+	int sid = fdinfo[s].sid;
+	if(fdinfo[s].tcb->write_side_close_state[sid] > WR_CLOSE_ST_OPEN){
+		// This should never happen, because after close() the fdinfo entry should be unlinked from the TCB
+		ERROR("mywrite fd %d sid %d invalid stream state %d", s, sid, fdinfo[s].tcb->write_side_close_state[sid]);
+	}
 	if(maxlen < 0){
 		ERROR("mywrite invalid maxlen %d");
 	}
 	if(maxlen == 0){
 		return 0;
 	}
-	int sid = fdinfo[s].sid;
+	
 	int actual_len;
 	if(mywrite_mode == MYWRITE_MODE_NON_BLOCKING){
 		if(fdinfo[s].tcb->txfree[sid] == 0){
@@ -2824,6 +2850,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	if(tcb->stream_state[sid] < STREAM_STATE_OPENED){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
+	}
+	if(tcb->lss_consumed[sid]){
+		return 0;
 	}
 	disable_signal_reception(false);
 	while(tcb->stream_rx_queue[sid] == NULL || (tcb->stream_rx_queue[sid]->dummy_payload && !tcb->stream_rx_queue[sid]->lss)){
@@ -2871,7 +2900,10 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				free(dmp_node->segment);
 				free(dmp_node);
 
+				tcb->lss_consumed[sid] = true;
+
 				// Nota: potrebbero esserci altri segmenti rimasti in coda: non dovrebbero avere payload, ma potrebbero essere DMP usati per ACK o window update
+				// In realtà, se in myio si scartano tutti i segmenti con flag LSS dopo aver attivato lss_received (dopo aver considerato la loro adwin), non dovrebbero esserci più segmenti in coda dopo questo LSS
 				enable_signal_reception(false);
 				return 0;
 			}
@@ -2931,12 +2963,16 @@ int myread(int s, unsigned char *buffer, int maxlen){
 }
 
 int myclose(int s){
-	
 	int sid = fdinfo[s].sid;
 	DEBUG("myclose sid %d", sid);
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	disable_signal_reception(false);
-	tcb->lss_requested[sid] = true;
+	if(tcb->write_side_close_state[sid] > WR_CLOSE_ST_OPEN){
+		// This should never happen, because with close you should unlink the tcb from fdinfo
+		ERROR("myclose close_state %d > OPEN", tcb->write_side_close_state[sid]);
+	}
+	
+	tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_REQUESTED;
 	scheduler(s);
 	enable_signal_reception(false);
 	return 0;
@@ -3515,7 +3551,6 @@ enum client_state{
 	CLIENT_ST_REQ = 0,
 	CLIENT_ST_RESP_H,
 	CLIENT_ST_RESP_P,
-	CLIENT_ST_WAIT_CLOSE,
 	CLIENT_ST_STOPPED
 };
 
@@ -3606,20 +3641,8 @@ void single_client_app(int* client_sockets, int i /* num_client */){
 				cl_st[i] = CLIENT_ST_REQ;
 			}else{
 				myclose(client_sockets[i]);
-				cl_st[i] = CLIENT_ST_WAIT_CLOSE;
+				cl_st[i] = CLIENT_ST_STOPPED;
 			}
-		}
-	}else if(cl_st[i] == CLIENT_ST_WAIT_CLOSE){
-		int n = myread(client_sockets[i], resp_arr[i], 1);
-		if(n == -1 && myerrno == EAGAIN){
-			myerrno = 0;
-			return;
-		}
-		if(n==0){
-			DEBUG("client %d received remote close", i);
-			cl_st[i] = CLIENT_ST_STOPPED;
-		}else{
-			DEBUG("client %d st CLIENT_ST_WAIT_CLOSE myread > 0 (returned %d)", n);
 		}
 	}
 }
