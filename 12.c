@@ -42,7 +42,7 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 1
+#define NUM_CLIENTS 100
 
 #define NUM_CLIENT_REQUESTS 10
 
@@ -71,7 +71,7 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 #define TIMER_USECS 500
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
-#define MAX_FD 36 // File descriptors go from 3 (included) up to this value (excluded)
+#define MAX_FD 1024 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MIN_TIMEOUT_MSEC 300
 #define MIN_TIMEOUT (MIN_TIMEOUT_MSEC * 1000 / TIMER_USECS)
@@ -1358,7 +1358,6 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 // Just send it! Used for ACKs (in particular dupACKs)
 // Same signature as prepare_tcp but without the payload
 void fast_send_tcp(int s, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
-	LOG_MESSAGE("Fast send");
 	assert_handler_lock_acquired("send_tcp");
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
@@ -1824,7 +1823,7 @@ bool port_in_use(unsigned short port){
 	int s;
 	for (s=3; s<MAX_FD; s++){
 		if(fdinfo[s].st != FDINFO_ST_FREE && fdinfo[s].st != FDINFO_ST_UNBOUND){
-			if(fdinfo[s].l_port == port){
+			if(fdinfo[s].l_port == htons(port)){
 				return true;
 			}
 		}
@@ -2339,9 +2338,11 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			break;
 		case TCB_ST_LISTEN:
 			if(event == FSM_EVENT_PKT_RCV){
+				DEBUG("received packet in st LISTEN");
 				if(!(tcp->flags & SYN)){
 					break;
 				}
+				DEBUG("SYN!");
 
 				bool ms_received = false;
 				bool sack_perm_received = false;
@@ -2483,7 +2484,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			break;
 		case TCB_ST_SYN_RECEIVED:
+			DEBUG("event %d in st SYN_RECV", event);
 			if(event == FSM_EVENT_PKT_RCV && !(tcp->flags & SYN) && (tcp->flags & ACK)){
+				DEBUG("SYN+ACK received");
 				// It is an ACK (and it is not a SYN, that may be RETXed)
 				if(htonl(tcp->ack) == tcb->seq_offs + 1){
 					// Passive open connection establishment
@@ -2647,6 +2650,7 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	if(fdinfo[s].sid == 0){
+		DEBUG("wait for SYN+ACK");
 		while(sleep(10)){
 			// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
 			if(tcb->st == TCB_ST_ESTABLISHED){
@@ -2704,6 +2708,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		myerrno=EBADF; 
 		return -1;
 	}
+	DEBUG("myaccept st %s", fdinfo[s].tcb->st == TCB_ST_LISTEN ? "LISTEN":"SYN_RECV");
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
 	do{
@@ -3086,7 +3091,7 @@ void myio(int ignored){
 
 			int i;
 			for(i=0;i<MAX_FD;i++){
-				if((fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (fdinfo[i].l_port == tcp->d_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)){
+				if((fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (tcp->d_port == fdinfo[i].l_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)){
 					break;
 				}
 				if(
@@ -3321,6 +3326,9 @@ void myio(int ignored){
 								
 								// This unlinks the segments in cursor and links it to the new stream queue node
 								struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
+								if(newrx_stream->lss & !tcb->lss_received[sid]){
+									tcb->lss_received[sid] = true;
+								}
 
 								if(tcb->stream_rx_queue[sid] == NULL){
 									tcb->stream_rx_queue[sid] = newrx_stream;
@@ -3406,14 +3414,12 @@ void myio(int ignored){
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-							LOG_MESSAGE("DMP ACK");
 							prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
 							free(dummy_payload);
 							free(opt);
 						}
 						else{
 							// Generic ACK
-							LOG_MESSAGE("non-DMP ACK");
 							//ERROR("Inviare subito, non accodare!");
 							//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 							fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
@@ -3845,6 +3851,7 @@ int main(){
 		//addr.sin_addr.s_addr = inet_addr("93.184.215.14");
 		//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
 		addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
+		DEBUG("myconnect %d (fd %d)", 0, s);
 		if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
 			myperror("myconnect");
 			exit(EXIT_FAILURE);
@@ -3857,11 +3864,12 @@ int main(){
 				myperror("mysocket");
 				exit(EXIT_FAILURE);
 			}
-			DEBUG("loop myconnect %d (fd %d)", i, s_loop);
+			DEBUG("myconnect %d (fd %d)", i, s_loop);
 			if (-1 == myconnect(s_loop,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
 				myperror("myconnect");
 				exit(EXIT_FAILURE);
 			}
+			DEBUG("myconnect OK");
 			client_sockets[i] = s_loop;
 		}
 		full_duplex_client_app(client_sockets);
@@ -3891,11 +3899,13 @@ int main(){
 			struct sockaddr_in remote_addr;
 			remote_addr.sin_family=AF_INET;
 			int len = sizeof(struct sockaddr_in);
+			DEBUG("wait myaccept client %d", i);
 			int s = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
 			if(s<0){
 				myperror("myaccept");
 				exit(EXIT_FAILURE);
 			}
+			DEBUG("myaccept %d OK (fd %d)", i, s);
 			client_sockets[i] = s;
 		}
 		full_duplex_server_app(client_sockets);
