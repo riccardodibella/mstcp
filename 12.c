@@ -42,7 +42,7 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 100
+#define NUM_CLIENTS 1
 
 #define NUM_CLIENT_REQUESTS 10
 
@@ -60,6 +60,8 @@ il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di 
 #define MYREAD_MODE_NON_BLOCKING 2
 #define MYWRITE_MODE_BLOCKING 1
 #define MYWRITE_MODE_NON_BLOCKING 2
+#define MYACCEPT_MODE_BLOCKING 1
+#define MYACCEPT_MODE_NON_BLOCKING 2
 
 #ifdef LOCAL_SERVER
 #define SERVER_IP_STR "127.0.0.1"
@@ -396,6 +398,7 @@ struct socket_info {
 
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
 int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
+int myaccept_mode = MYACCEPT_MODE_NON_BLOCKING;
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -1189,7 +1192,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("prepare_tcp");
-	struct tcpctrlblk*tcb = fdinfo[s].tcb;
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
@@ -1243,6 +1246,21 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 		tcb->stream_fsm_timer[txcb->sid] = 0;
 	}
 
+	int sid = -1;
+	int lss = false;
+	int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+	if(ms_index>=0){
+		sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+		lss = tcp->payload[ms_index+2]>>7;
+	}
+	if(sid >= 0){
+		if(tcb->write_side_close_state[sid] >= WR_CLOSE_ST_LSS_TXED){
+			if(!lss){
+				DEBUG("prepare_tcp lss forced set");
+				tcp->payload[ms_index+2] |= 0x80; // set the 1st bit
+			}
+		}
+	}
 	/*
 	DEFERRED FIELDS
 	tcp->ack;
@@ -2720,6 +2738,10 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
 			*/
 			enable_signal_reception(false);
+			if(myaccept_mode == MYACCEPT_MODE_NON_BLOCKING){
+				myerrno = EAGAIN;
+				return -1;
+			}
 			continue;
 		}
 		
@@ -2983,6 +3005,51 @@ int myclose(int s){
 	return 0;
 }
 
+void stream_close_handler(struct tcpctrlblk* tcb, int sid){
+	if(tcb == NULL){
+		ERROR("stream_close_handler tcb NULL");
+	}
+	if(sid < 0){
+		ERROR("stream_close_handler invalid sid");
+	}
+	if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_ACKED && tcb->lss_received[sid]){
+		/*
+		We do not go throught STREAM_STATE_CLOSED. Another solution could be to go to state STREAM_STATE_UNUSED here, set a timer, and after that timer
+		elapses reset the stream and prepare it for reuse. With the current version of the program there is only the close() operation, so there is no risk
+		that if the LSS has been received the other peer is still reading or using the structures for this stream.
+		*/
+		free(tcb->stream_tx_buffer[sid]);
+		while(tcb->stream_rx_queue[sid] != NULL){
+			struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[sid];
+			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+			if(!tmp->dummy_payload){
+				ERROR("non-DMP remaining segment during stream_close_handler flush");
+			}
+			if(tmp->segment != NULL){
+				free(tmp->segment);
+			}
+			free(tmp);
+		}
+
+		tcb->stream_state[sid] = STREAM_STATE_UNUSED;
+		tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
+		tcb->radwin[sid] = 0; // This will be initialized with the reception of the SYN+ACK
+		tcb->stream_tx_buffer[sid] = NULL;
+		tcb->txfree[sid] = 0;
+		tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
+		tcb->next_ssn[sid] = 0;
+		tcb->next_rx_ssn[sid] = 0;
+		tcb->stream_fsm_timer[sid] = 0;
+		tcb->stream_rx_queue[sid] = NULL;
+
+		tcb->write_side_close_state[sid] = WR_CLOSE_ST_OPEN;
+		tcb->lss_received[sid] = tcb->lss_consumed[sid] = false;
+
+		DEBUG("Stream %d ready for reuse", sid);
+	}
+	return;
+}
+
 
 // Called only in myio, for every received packet, if after the FSM the connection is at least established
 void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
@@ -3176,6 +3243,22 @@ void myio(int ignored){
 							}
 							tcb->radwin[temp->sid] -= temp->payloadlen;
 						}
+
+						int sid = -1;
+						bool lss = false;
+						int ms_index = search_tcp_option(temp->segment, OPT_KIND_MS_TCP);
+						if(ms_index>=0){
+							sid = (temp->segment->payload[ms_index+2]>>2) & 0x1F;
+							lss = temp->segment->payload[ms_index+2]>>7;
+						}
+						if(sid >= 0){
+							// MS option is present
+							if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
+								tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
+								stream_close_handler(tcb, sid);
+							}
+						}
+
 						free(temp->segment);
 						free(temp);
 						if(tcb->txfirst	== NULL){
@@ -3223,6 +3306,7 @@ void myio(int ignored){
 
 							if(left_shifted_seq < cursor_shifted_seq && cursor_shifted_seq < right_shifted_seq){
 								// Remove the node from the tx queue
+								ERROR("TODO calcolo sid/lss e chiamata eventuale a stream_close_handler");
 								if(prev == NULL){
 									free(cursor->segment);
 									free(cursor);
@@ -3328,6 +3412,7 @@ void myio(int ignored){
 								struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
 								if(newrx_stream->lss & !tcb->lss_received[sid]){
 									tcb->lss_received[sid] = true;
+									stream_close_handler(tcb, sid);
 								}
 
 								if(tcb->stream_rx_queue[sid] == NULL){
@@ -3900,11 +3985,14 @@ int main(){
 			remote_addr.sin_family=AF_INET;
 			int len = sizeof(struct sockaddr_in);
 			DEBUG("wait myaccept client %d", i);
-			int s = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
-			if(s<0){
-				myperror("myaccept");
-				exit(EXIT_FAILURE);
-			}
+			int s;
+			do{
+				s = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
+				if(s<0 && myerrno != EAGAIN){
+					myperror("myaccept");
+					exit(EXIT_FAILURE);
+				}
+			}while(s < 0);
 			DEBUG("myaccept %d OK (fd %d)", i, s);
 			client_sockets[i] = s;
 		}
