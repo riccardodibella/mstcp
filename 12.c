@@ -2502,9 +2502,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			break;
 		case TCB_ST_SYN_RECEIVED:
-			DEBUG("event %d in st SYN_RECV", event);
 			if(event == FSM_EVENT_PKT_RCV && !(tcp->flags & SYN) && (tcp->flags & ACK)){
-				DEBUG("SYN+ACK received");
 				// It is an ACK (and it is not a SYN, that may be RETXed)
 				if(htonl(tcp->ack) == tcb->seq_offs + 1){
 					// Passive open connection establishment
@@ -2601,12 +2599,14 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			if(event == FSM_EVENT_PKT_RCV){
 				int sid = 0;
 				int ssn = 0;
+				bool lss = false;
 				if(tcb->ms_option_enabled){
 					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
 					if(ms_index >= 0){
+						lss = tcp->payload[ms_index+2]>>7;
 						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
 						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) | tcp->payload[ms_index+3];
-						if(ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){
+						if(!lss && ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
 							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
@@ -2726,7 +2726,6 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		myerrno=EBADF; 
 		return -1;
 	}
-	DEBUG("myaccept st %s", fdinfo[s].tcb->st == TCB_ST_LISTEN ? "LISTEN":"SYN_RECV");
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
 	do{
@@ -3767,81 +3766,96 @@ enum server_state{
 	SERVER_ST_STOPPED,
 };
 
-enum server_state srv_st[NUM_CLIENTS];
-char req_arr[NUM_CLIENTS][REQ_BUF_SIZE];
-int requested_payload_bytes[NUM_CLIENTS];
-int current_resp_bytes[NUM_CLIENTS];
+struct single_srv_data{
+	int s;
+	enum server_state srv_st;
+	char req_arr[REQ_BUF_SIZE];
+	int requested_payload_bytes;
+	int current_resp_bytes;
+};
 
-void single_server_app(int* client_sockets, int i /* num_client */){
-	if(srv_st[i] == SERVER_ST_REQ){
-		char* strend = req_arr[i];
-		while(*strend){
-			strend++;
-		}
-		int n = myread(client_sockets[i], strend, sizeof(req_arr[i]));
-		if(n == -1 && myerrno == EAGAIN){
-			myerrno = 0;
-			return;
-		}
-		if(n == 0){
-			DEBUG("received close from client %d", i);
-			myclose(client_sockets[i]);
-			srv_st[i] = SERVER_ST_STOPPED;
-			return;
-		}
-		strend += n;
-		*strend= '\0';
-		char* end_of_headers_substr = strstr(req_arr[i], "\r\n\r\n"); 
-		if(end_of_headers_substr != NULL){
-			DEBUG(req_arr[i]);
-
-			requested_payload_bytes[i] = atoi(strstr(req_arr[i], "/")+1);
-			current_resp_bytes[i] = 0;
-			srv_st[i] = SERVER_ST_RESP;
-		}else{
-			DEBUG("request still incomplete");
-		}
-	}else if(srv_st[i] == SERVER_ST_RESP){
-		uint8_t data[RESP_BUF_SIZE];
-		sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", requested_payload_bytes[i], i);
-		int end_index = strlen(data);
-		for(int j=0; j<requested_payload_bytes[i]; j++){
-			data[end_index++] = 'X';
-		}
-		data[end_index] = 0;
-		uint8_t* start = data+current_resp_bytes[i];
-		int missing = strlen(data) - current_resp_bytes[i];
-		int res = mywrite(client_sockets[i], start, missing);
-		if(res <= 0){
-			if(myerrno == EAGAIN){
-				myerrno = 0;
-				return;
-			}else{
-				perror("mywrite");
-				ERROR("mywrite error");
-			}
-		}
-		current_resp_bytes[i] += res;
-		if(current_resp_bytes[i] == strlen(data)){
-			srv_st[i] = SERVER_ST_REQ;
-			memset(req_arr[i], 0, sizeof(req_arr[i]));
-		}
-	}
-}
-void full_duplex_server_app(int* client_sockets){
+void full_duplex_server_app(int listening_socket){
+	struct single_srv_data* clients = NULL;
+	int num_clients = 0;
 	while(true){
-		for(int i=0; i<NUM_CLIENTS; i++){
-			single_server_app(client_sockets, i);
-		}
-		bool all_stopped = true;
-		for(int i=0; i<NUM_CLIENTS; i++){
-			if(srv_st[i] != SERVER_ST_STOPPED){
-				all_stopped = false;
-				break;
+		if(num_clients < NUM_CLIENTS){
+			struct sockaddr_in remote_addr;
+			remote_addr.sin_family=AF_INET;
+			int len = sizeof(struct sockaddr_in);
+			int new_client_socket = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
+			if(new_client_socket >= 0){
+				DEBUG("myaccept client %d", num_clients);
+				struct single_srv_data* new_arr = malloc(sizeof(struct single_srv_data)*(num_clients+1));
+				if((num_clients == 0) != (clients == NULL)){
+					ERROR("full_duplex_server_app invalid state num_clients client_sockets");
+				}
+				if(clients != NULL){
+					memcpy(new_arr, clients, sizeof(struct single_srv_data)*num_clients);
+					free(clients);
+				}
+				clients = new_arr;
+				memset(&clients[num_clients], 0, sizeof(clients[num_clients]));
+				clients[num_clients].s = new_client_socket;
+				num_clients++;
 			}
 		}
-		if(all_stopped){
-			break;
+		for(int i=0; i<num_clients; i++){
+			if(clients[i].srv_st == SERVER_ST_REQ){
+				char* strend = clients[i].req_arr;
+				while(*strend){
+					strend++;
+				}
+				int n = myread(clients[i].s, strend, sizeof(clients[i].req_arr));
+				if(n == -1 && myerrno == EAGAIN){
+					myerrno = 0;
+					goto single_app_return;
+				}
+				if(n == 0){
+					DEBUG("received close from client %d", i);
+					myclose(clients[i].s);
+					clients[i].srv_st = SERVER_ST_STOPPED;
+					goto single_app_return;
+				}
+				strend += n;
+				*strend= '\0';
+				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
+				if(end_of_headers_substr != NULL){
+					DEBUG(clients[i].req_arr);
+
+					clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
+					clients[i].current_resp_bytes = 0;
+					clients[i].srv_st = SERVER_ST_RESP;
+				}else{
+					DEBUG("request still incomplete");
+				}
+			}else if(clients[i].srv_st == SERVER_ST_RESP){
+				uint8_t data[RESP_BUF_SIZE];
+				sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
+				int end_index = strlen(data);
+				for(int j=0; j<clients[i].requested_payload_bytes; j++){
+					data[end_index++] = 'X';
+				}
+				data[end_index] = 0;
+				uint8_t* start = data+clients[i].current_resp_bytes;
+				int missing = strlen(data) - clients[i].current_resp_bytes;
+				int res = mywrite(clients[i].s, start, missing);
+				if(res <= 0){
+					if(myerrno == EAGAIN){
+						myerrno = 0;
+						goto single_app_return;
+					}else{
+						perror("mywrite");
+						ERROR("mywrite error");
+					}
+				}
+				clients[i].current_resp_bytes += res;
+				if(clients[i].current_resp_bytes == strlen(data)){
+					clients[i].srv_st = SERVER_ST_REQ;
+					memset(clients[i].req_arr, 0, sizeof(clients[i].req_arr));
+				}
+			}
+			single_app_return:
+			;
 		}
 	}
 	DEBUG("SERVER - ALL STOPPED");
@@ -3979,6 +3993,8 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mylisten OK");
+		
+		/*
 		int client_sockets[NUM_CLIENTS];
 		for(int i=0; i<NUM_CLIENTS; i++){
 			struct sockaddr_in remote_addr;
@@ -3996,7 +4012,8 @@ int main(){
 			DEBUG("myaccept %d OK (fd %d)", i, s);
 			client_sockets[i] = s;
 		}
-		full_duplex_server_app(client_sockets);
+		*/
+		full_duplex_server_app(listening_socket);
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
 	}
