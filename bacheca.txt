@@ -236,3 +236,4 @@ Problemi di MYTCP:
 - In un punto, si accumula (accumulatore tot) usando totlen invece di payloadlen
 - Gli ACK vengono inviati tutti assieme in mytimer invece che subito per ogni pacchetto, dall'altro lato sono dupACK
 - In port_in_use manca htons per il confronto della porta, il parametro è host order ma nel tcb è network order
+- L'utilizzo della sequenza del primo segmento nella tx queue come shifter sembra sbagliato, andrebbe controllato meglio

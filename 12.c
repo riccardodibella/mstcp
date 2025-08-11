@@ -29,24 +29,11 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 
-/*
-Nota del 28/06/2025
-Ipotesi: ad oggi (ultimo commit "11 test 32 streams 10K msg") vedo che, per un numero di messaggi molto alto, se aumento anche 
-il numero di client (stream) il sistema si impianta, e vedo anche che ci sono molte più ritrasmissioni. La mia ipotesi è che questo sia legato ad un bug
-nel codice che per qualche motivo non gestisce bene un evento di congestione serio (non una perdita occasionale di un singolo pacchetto, che sembra
-essere gestita correttamente e aumenta solo l'RTO in questo momento). Con pochi stream questo non si verifica, perchè non è ancora implementata l'opzione
-di window scale, e 16KB per ogni client probabilmente non saturano la capacità del canale se i client sono pochi. Aumentando il numero di client si aumenta
-il numero massimo di byte che possono essere in viaggio per tutta la connessione, considerando solo le advertised window, e questo potrebbe portare al
-superamento della capacità del canale. Non ho verificato questa ipotesi, ma se l'introduzione di un Congestion Control (possibilmente molto conservativo)
-risolve il problema per un numero elevato di client allora forse l'ipotesi potrebbe essere giusta, in particolare se il problema dovesse peggiorare quando si
-aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
-il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
-*/
-#define NUM_CLIENTS 2
+#define NUM_CLIENTS 10
 
-#define NUM_CLIENT_REQUESTS 10
+#define NUM_CLIENT_REQUESTS 1000
 
-#define RESP_PAYLOAD_BYTES 100000
+#define RESP_PAYLOAD_BYTES 100
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -1193,12 +1180,12 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("prepare_tcp");
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
+	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof(struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
 
-	txcb->txtime = -MAX_TIMEOUT ; 
+	txcb->txtime = -MAX_TIMEOUT;
 	txcb->payloadlen = payloadlen;
 	txcb->dummy_payload = flags & DMP;
 	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
@@ -3205,7 +3192,7 @@ void myio(int ignored){
 			if(tcb->txfirst !=NULL){
 				// Removal from TX queue for the cumulative ACK
 
-				int shifter = htonl(tcb->txfirst->segment->seq);
+				uint32_t shifter = tcb->seq_offs;
 
 				int sid = -1;
 				int ssn = 0;
@@ -3219,9 +3206,10 @@ void myio(int ignored){
 					}
 				}
 
-				if((htonl(tcp->ack)-shifter >= 0) && (htonl(tcp->ack)-shifter-(tcb->stream_end)?1:0 <= htonl(tcb->txlast->segment->seq) + tcb->txlast->payloadlen - shifter)){ // -1 is to compensate the FIN
+				// TODO ho tolto il controllo per il FIN, va rimesso se si sistema la chiusura delle connessioni
+				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= htonl(tcb->txlast->segment->seq) + ((uint32_t)tcb->txlast->payloadlen) - shifter)){
 					bool send_window_advanced = false;
-					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen
+					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen						
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
 						
@@ -3288,10 +3276,12 @@ void myio(int ignored){
 			if(tcb->txfirst != NULL){
 				// Removal from TX queue for SACK option
 
-				int shifter = tcb->txfirst->seq;
-
 				int sack_opt_index = search_tcp_option(tcp, OPT_KIND_SACK);
 				if(sack_opt_index > 0){
+
+					// Occhio: questo meccanismo con lo shifter per la rimozione con cumulativeack era rotto, forse va cambiato anche qui
+					int shifter = tcb->txfirst->seq;
+
 					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
 					for(int entry = 0; entry < sack_entries_count; entry++){
 						int block_left_edge_seq = ntohl(*(uint32_t*) tcp->payload + sack_opt_index + 2 + entry*8);
