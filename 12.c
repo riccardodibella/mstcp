@@ -42,11 +42,11 @@ risolve il problema per un numero elevato di client allora forse l'ipotesi potre
 aggiunge anche l'utilizzo di Window Scale. Aggiungerei anche che, dato che uno dei due endpoint è sotto WSL invece che su una rete "normale", è possibile che 
 il sistema reagisca in modo peggiore di una rete Ethernet normale a un burst di traffico.
 */
-#define NUM_CLIENTS 1
+#define NUM_CLIENTS 2
 
 #define NUM_CLIENT_REQUESTS 10
 
-#define RESP_PAYLOAD_BYTES 10000
+#define RESP_PAYLOAD_BYTES 100000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -3856,6 +3856,25 @@ void full_duplex_server_app(int listening_socket){
 			}
 			single_app_return:
 			;
+		}
+
+		// Stopped cleanup
+		int cur = 0;
+		while(cur < num_clients){
+			if(clients[cur].srv_st == SERVER_ST_STOPPED){
+				// copy clients from cur+1 to num_clients-1 (included), so num_clients-cur-1 in total
+				for(int cur2 = cur+1; cur2 < num_clients; cur2++){
+					clients[cur2-1] = clients[cur2];
+				}
+				num_clients--;
+				if(num_clients == 0){
+					clients = NULL;
+				}else{
+					clients = realloc(clients, sizeof(struct single_srv_data)*num_clients);
+				}
+			}else{
+				cur++;
+			}
 		}
 	}
 	DEBUG("SERVER - ALL STOPPED");
