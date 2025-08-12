@@ -49,6 +49,8 @@
 #define MYWRITE_MODE_NON_BLOCKING 2
 #define MYACCEPT_MODE_BLOCKING 1
 #define MYACCEPT_MODE_NON_BLOCKING 2
+#define MYCONNECT_MODE_BLOCKING 1
+#define MYCONNECT_MODE_NON_BLOCKING 2
 
 #ifdef LOCAL_SERVER
 #define SERVER_IP_STR "127.0.0.1"
@@ -386,6 +388,8 @@ struct socket_info {
 int myread_mode = MYREAD_MODE_NON_BLOCKING;
 int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
 int myaccept_mode = MYACCEPT_MODE_NON_BLOCKING;
+int myconnect_mode = MYCONNECT_MODE_NON_BLOCKING;
+
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -2644,20 +2648,17 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		return -1;
 	}
 
-	struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
-
-	disable_signal_reception(false);
-	int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
-	enable_signal_reception(false);
-	if(res < 0){
-		// Bind may fail, or other errors
-		return res;
-	}
-	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	if(fdinfo[s].sid == 0){
-		DEBUG("wait for SYN+ACK");
-		while(sleep(10)){
-			// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
+	if(myconnect_mode == MYCONNECT_MODE_BLOCKING){
+		struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
+		disable_signal_reception(false);
+		int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
+		enable_signal_reception(false);
+		if(res < 0){
+			// Bind may fail, or other errors
+			return res;
+		}
+		struct tcpctrlblk* tcb = fdinfo[s].tcb;
+		if(fdinfo[s].sid == 0){
 			if(tcb->st == TCB_ST_ESTABLISHED){
 				return 0;
 			}
@@ -2665,17 +2666,51 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 				myerrno = ECONNREFUSED; 
 				return -1;
 			}
+			myerrno = EAGAIN;
+			return -1;
+		}else{
+			/*
+			This connect call is opening a new stream in an existing connection. A segment that opens this new stream
+			will be sent with the first chunk of data, or after STREAM_OPEN_TIMEOUT ticks if no data needs to be sent.
+			*/
+			return 0; // Do nothing and return
 		}
-		// If the connection is not established within the timeout
-		myerrno=ETIMEDOUT; 
-		return -1;
-	}else{
-		/* 
-		This connect call is opening a new stream in an existing connection. A segment that opens this new stream
-		will be sent with the first chunk of data, or after STREAM_OPEN_TIMEOUT ticks if no data needs to be sent.
-		*/
-		return 0; // Do nothing and return
+	}else{ // myconnect_mode == MYCONNECT_MODE_NON_BLOCKING
+		if(fdinfo[s].st == FDINFO_ST_UNBOUND || fdinfo[s].st == FDINFO_ST_BOUND){
+			struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
+			disable_signal_reception(false);
+			int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
+			enable_signal_reception(false);
+			if(res < 0){
+				// Bind may fail, or other errors
+				return res;
+			}
+		}
+		struct tcpctrlblk* tcb = fdinfo[s].tcb;
+		if(fdinfo[s].sid == 0){
+			while(sleep(10)){
+				// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
+				if(tcb->st == TCB_ST_ESTABLISHED){
+					return 0;
+				}
+				if(tcb->st == TCB_ST_CLOSED){ 
+					myerrno = ECONNREFUSED; 
+					return -1;
+				}
+			}
+			// If the connection is not established within the timeout
+			myerrno=ETIMEDOUT; 
+			return -1;
+		}else{
+			/* 
+			This connect call is opening a new stream in an existing connection. A segment that opens this new stream
+			will be sent with the first chunk of data, or after STREAM_OPEN_TIMEOUT ticks if no data needs to be sent.
+			*/
+			return 0; // Do nothing and return
+		}
 	}
+
+
 }
 
 int mylisten(int s, int bl){
@@ -3959,10 +3994,18 @@ int main(){
 		//addr.sin_addr.s_addr = inet_addr("93.184.215.14");
 		//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
 		addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
-		DEBUG("myconnect %d (fd %d)", 0, s);
-		if (-1 == myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
-			myperror("myconnect");
-			exit(EXIT_FAILURE);
+		DEBUG("myconnect blk %d (fd %d)", 0, s);
+		while(true){
+			
+			int ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+			if(ret == -1 && myerrno == EAGAIN){
+				continue;
+			}
+			if(ret < 0){
+				myperror("myconnect");
+				exit(EXIT_FAILURE);
+			}
+			break;
 		}
 		DEBUG("myconnect OK");
 		persistent_nanosleep(1,0);
@@ -3972,9 +4015,9 @@ int main(){
 				myperror("mysocket");
 				exit(EXIT_FAILURE);
 			}
-			DEBUG("myconnect %d (fd %d)", i, s_loop);
+			DEBUG("myconnect non-blk %d (fd %d)", i, s_loop);
 			if (-1 == myconnect(s_loop,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
-				myperror("myconnect");
+				myperror("myconnect loop");
 				exit(EXIT_FAILURE);
 			}
 			DEBUG("myconnect OK");
@@ -4026,5 +4069,4 @@ int main(){
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
 	}
-	
 }
