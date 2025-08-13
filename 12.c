@@ -29,11 +29,20 @@
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 
+#define CL_MAIN_PARALLEL 1
+#define CL_MAIN_SERIAL_BLOCKING 2
+#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+
+#if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
-
 #define NUM_CLIENT_REQUESTS 1000
+#endif
 
-#define RESP_PAYLOAD_BYTES 100
+#if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
+#define NUM_CLIENT_REQUESTS 100
+#endif
+
+#define RESP_PAYLOAD_BYTES 1000000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -2097,6 +2106,18 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
 							fdinfo[s].tcb->write_side_close_state[stream] = WR_CLOSE_ST_OPEN;
 							fdinfo[s].tcb->lss_received[stream] = fdinfo[s].tcb->lss_consumed[stream] = false;
+
+							while(tcb->stream_rx_queue[stream] != NULL){
+								struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[stream];
+								tcb->stream_rx_queue[stream] = tcb->stream_rx_queue[stream]->next;
+								if(!tmp->dummy_payload){
+									ERROR("non-DMP remaining segment during fsm flush");
+								}
+								if(tmp->segment != NULL){
+									free(tmp->segment);
+								}
+								free(tmp);
+							}
 							return 0;
 						}
 					}
@@ -2531,6 +2552,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					backlog_tcb->txfree[0] = TX_BUFFER_SIZE;
 					backlog_tcb->tx_buffer_occupied_region_start[0] = backlog_tcb->tx_buffer_occupied_region_end[0] = 0;
 					backlog_tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
+
 					backlog_tcb->next_rx_ssn[0] = 1; // SSN 0 already received (SYN+ACK)
 					backlog_tcb->stream_fsm_timer[0] = 0;
 					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
@@ -2542,7 +2564,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						backlog_tcb->txfree[i] = 0;
 						backlog_tcb->tx_buffer_occupied_region_start[i] = backlog_tcb->tx_buffer_occupied_region_end[i] = 0;
 						backlog_tcb->next_ssn[i] = 0;
-						backlog_tcb->next_rx_ssn[0] = 1;
+						backlog_tcb->next_rx_ssn[i] = 0;
 						backlog_tcb->stream_fsm_timer[i] = 0;
 						backlog_tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
 						backlog_tcb->lss_received[i] = backlog_tcb->lss_consumed[i] = false;
@@ -2566,16 +2588,14 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 			if(event == FSM_EVENT_STREAM_TIMEOUT){
 				int sid = fdinfo[s].sid;
-				if(fdinfo[s].tcb->next_ssn[sid] != 0){
-					ERROR("FSM_EVENT_STREAM_TIMEOUT stream %d already opened", sid);
-				}
+				int ssn = fdinfo[s].tcb->next_ssn[sid];
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 				uint8_t* opt = malloc(optlen);
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
-				opt[2] = sid<<2;
-				opt[3] = 0; // SSN=0 for the opening segment
+				opt[2] = sid<<2 | ssn >> 8;
+				opt[3] = ssn & 0xFF;
 
 				update_next_ssn(&(fdinfo[s].tcb->next_ssn[sid]));
 
@@ -2597,7 +2617,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						lss = tcp->payload[ms_index+2]>>7;
 						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
 						ssn = ((tcp->payload[ms_index+2]&0x3) << 8) | tcp->payload[ms_index+3];
-						if(!lss && ssn == 0 && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
+						if(!lss && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
 							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
@@ -2657,16 +2677,21 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 			// Bind may fail, or other errors
 			return res;
 		}
+		//DEBUG("myconnect sid %d", fdinfo[s].sid);
 		struct tcpctrlblk* tcb = fdinfo[s].tcb;
-		if(fdinfo[s].sid == 0){
-			if(tcb->st == TCB_ST_ESTABLISHED){
-				return 0;
+		if(tcb->st != TCB_ST_ESTABLISHED){
+			while(sleep(10)){
+				// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
+				if(tcb->st == TCB_ST_ESTABLISHED){
+					return 0;
+				}
+				if(tcb->st == TCB_ST_CLOSED){ 
+					myerrno = ECONNREFUSED; 
+					return -1;
+				}
 			}
-			if(tcb->st == TCB_ST_CLOSED){ 
-				myerrno = ECONNREFUSED; 
-				return -1;
-			}
-			myerrno = EAGAIN;
+			// If the connection is not established within the timeout
+			myerrno=ETIMEDOUT;
 			return -1;
 		}else{
 			/*
@@ -2688,18 +2713,14 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		}
 		struct tcpctrlblk* tcb = fdinfo[s].tcb;
 		if(fdinfo[s].sid == 0){
-			while(sleep(10)){
-				// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
-				if(tcb->st == TCB_ST_ESTABLISHED){
-					return 0;
-				}
-				if(tcb->st == TCB_ST_CLOSED){ 
-					myerrno = ECONNREFUSED; 
-					return -1;
-				}
+			if(tcb->st == TCB_ST_ESTABLISHED){
+				return 0;
 			}
-			// If the connection is not established within the timeout
-			myerrno=ETIMEDOUT; 
+			if(tcb->st == TCB_ST_CLOSED){ 
+				myerrno = ECONNREFUSED; 
+				return -1;
+			}
+			myerrno = EAGAIN; 
 			return -1;
 		}else{
 			/* 
@@ -2886,6 +2907,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		return -1; 
 	}
 	if (maxlen==0){
+		DEBUG("myread maxlen == 0");
 		return 0;
 	}
 	if(!fdinfo[s].tcb->ms_option_enabled){
@@ -2900,6 +2922,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		ERROR("myread fd %d sid %d invalid stream state %d ", s, sid, tcb->stream_state[sid]);
 	}
 	if(tcb->lss_consumed[sid]){
+		DEBUG("LSS already consumed, return 0");
 		return 0;
 	}
 	disable_signal_reception(false);
@@ -3012,7 +3035,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 int myclose(int s){
 	int sid = fdinfo[s].sid;
-	DEBUG("myclose sid %d", sid);
+	//DEBUG("myclose sid %d", sid);
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	disable_signal_reception(false);
 	if(tcb->write_side_close_state[sid] > WR_CLOSE_ST_OPEN){
@@ -3039,7 +3062,6 @@ void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 		elapses reset the stream and prepare it for reuse. With the current version of the program there is only the close() operation, so there is no risk
 		that if the LSS has been received the other peer is still reading or using the structures for this stream.
 		*/
-		free(tcb->stream_tx_buffer[sid]);
 		while(tcb->stream_rx_queue[sid] != NULL){
 			struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
@@ -3054,19 +3076,16 @@ void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 
 		tcb->stream_state[sid] = STREAM_STATE_UNUSED;
 		tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-		tcb->radwin[sid] = 0; // This will be initialized with the reception of the SYN+ACK
-		tcb->stream_tx_buffer[sid] = NULL;
-		tcb->txfree[sid] = 0;
+		tcb->radwin[sid] = tcb->init_radwin; 
+		if(tcb->stream_tx_buffer[sid] != NULL){
+			free(tcb->stream_tx_buffer[sid]);
+			tcb->stream_tx_buffer[sid] = NULL;
+		}
+		tcb->txfree[sid] = TX_BUFFER_SIZE;
 		tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
-		tcb->next_ssn[sid] = 0;
-		tcb->next_rx_ssn[sid] = 0;
 		tcb->stream_fsm_timer[sid] = 0;
-		tcb->stream_rx_queue[sid] = NULL;
 
-		tcb->write_side_close_state[sid] = WR_CLOSE_ST_OPEN;
-		tcb->lss_received[sid] = tcb->lss_consumed[sid] = false;
-
-		DEBUG("Stream %d ready for reuse", sid);
+		//DEBUG("Stream %d ready for reuse", sid);
 	}
 	return;
 }
@@ -3434,23 +3453,31 @@ void myio(int ignored){
 								
 								// This unlinks the segments in cursor and links it to the new stream queue node
 								struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(cursor);
+								bool first_lss_segment = false;
 								if(newrx_stream->lss & !tcb->lss_received[sid]){
+									first_lss_segment = true;
 									tcb->lss_received[sid] = true;
 									stream_close_handler(tcb, sid);
 								}
 
-								if(tcb->stream_rx_queue[sid] == NULL){
-									tcb->stream_rx_queue[sid] = newrx_stream;
-								}else{
-									// Traverse the stream RX queue until you get to the end
-									// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
-									struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
-									while(last->next != NULL){
-										last = last->next;
+								if(!(tcb->lss_received[sid] && newrx_stream->lss && !first_lss_segment)){
+									if(tcb->stream_rx_queue[sid] == NULL){
+										tcb->stream_rx_queue[sid] = newrx_stream;
+									}else{
+										// Traverse the stream RX queue until you get to the end
+										// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
+										struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
+										while(last->next != NULL){
+											last = last->next;
+										}
+										last->next = newrx_stream;
 									}
-									last->next = newrx_stream;
+								}else{
+									DEBUG("Discarding subsequent LSS");
 								}
 
+								
+								
 								update_next_ssn(&(tcb->next_rx_ssn[sid]));
 								// advance to the next segment of this stream in the channel RX queue
 								cursor = cursor->next;
@@ -3662,6 +3689,90 @@ void mytimer(int ignored){
 
 
 
+#if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
+void main_client_app(){
+	myread_mode = MYREAD_MODE_BLOCKING;
+	mywrite_mode = MYWRITE_MODE_BLOCKING;
+	myconnect_mode = MYCONNECT_MODE_BLOCKING;
+	for(int num_req = 0; num_req < NUM_CLIENT_REQUESTS; num_req++){
+		int ret;
+		int s = mysocket(AF_INET,SOCK_STREAM,0);
+		if(s == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(19500);
+		addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
+		ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+		if(ret < 0){
+			myperror("myconnect");
+			exit(EXIT_FAILURE);
+		}
+		int expected_payload_bytes = RESP_PAYLOAD_BYTES;
+		char data[RESP_BUF_SIZE]; // both req and resp
+		sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", expected_payload_bytes, num_req, num_req);
+		int sent = 0, missing = strlen(data);
+		while(missing > 0){
+			ret = mywrite(s, data+sent, missing);
+			if(ret < 0){
+				myperror("mywrite");
+				exit(EXIT_FAILURE);
+			}
+			sent += ret;
+			missing -= ret;
+		}
+
+		memset(data, 0, sizeof(data));
+		int recv_bytes = 0;
+		int content_length = -1;
+		int header_portion_length = -1;
+		while(true){
+			ret = myread(s, data+recv_bytes, (content_length < 0 ? sizeof(data) : (header_portion_length+content_length)) - recv_bytes);
+			if(ret < 0){
+				myperror("myread");
+				exit(EXIT_FAILURE);
+			}
+			if(ret == 0){
+				myperror("unexpected read return 0");
+				exit(EXIT_FAILURE);
+			}
+			recv_bytes += ret;
+			if(content_length < 0){
+				char* end_of_headers_substr = strstr(data, "\r\n\r\n");
+				if(end_of_headers_substr != NULL){
+					header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - data;
+					content_length = expected_payload_bytes;
+					char* content_length_str = strcasestr(data, "Content-Length");
+					if(content_length_str != NULL){
+						while(*content_length_str != ':'){
+							content_length_str++;
+						}
+						content_length_str++; // Skip ':
+						while(*content_length_str == ' '){
+							content_length_str++;
+						}
+
+						content_length = atoi(content_length_str);
+					}
+				}
+			}
+
+			if(content_length >= 0 && recv_bytes >= header_portion_length + content_length){
+				myclose(s);
+				break;
+			}
+		}
+	}
+	DEBUG("all request completed :)");
+	DEBUG("wait...");
+	persistent_nanosleep(2, 0);
+	DEBUG("main_client_app end");
+}
+#endif
+
+#if CL_MAIN == CL_MAIN_PARALLEL
 enum client_state{
 	CLIENT_ST_REQ = 0,
 	CLIENT_ST_RESP_H,
@@ -3762,7 +3873,53 @@ void single_client_app(int* client_sockets, int i /* num_client */){
 	}
 }
 
-void full_duplex_client_app(int* client_sockets){
+void main_client_app(){
+	int client_sockets[NUM_CLIENTS];
+	// Client code to connect to a server
+	int s = mysocket(AF_INET,SOCK_STREAM,0);
+	if(s == -1){
+		myperror("mysocket");
+		exit(EXIT_FAILURE);
+	}
+	DEBUG("mysocket OK");
+	client_sockets[0] = s;
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(19500);
+	addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
+	DEBUG("myconnect blk %d (fd %d)", 0, s);
+	while(true){
+		
+		int ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+		if(ret == -1 && myerrno == EAGAIN){
+			continue;
+		}
+		if(ret < 0){
+			myperror("myconnect");
+			exit(EXIT_FAILURE);
+		}
+		break;
+	}
+	DEBUG("myconnect OK");
+	persistent_nanosleep(1,0);
+	for(int i=1; i<NUM_CLIENTS; i++){
+		int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
+		if(s_loop == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("myconnect non-blk %d (fd %d)", i, s_loop);
+		int ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+		if(ret == -1 && myerrno == EAGAIN){
+			continue;
+		}
+		if(ret < 0){
+			myperror("myconnect loop");
+			exit(EXIT_FAILURE);
+		}
+		DEBUG("myconnect OK");
+		client_sockets[i] = s_loop;
+	}
 	while(true){
 		for(int i=0; i<NUM_CLIENTS; i++){
 			single_client_app(client_sockets, i);
@@ -3781,9 +3938,9 @@ void full_duplex_client_app(int* client_sockets){
 	DEBUG("CLIENT - ALL STOPPED");
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
-	DEBUG("full_duplex_client_app end");
+	DEBUG("main_client_app end");
 }
-
+#endif
 
 enum server_state{
 	SERVER_ST_REQ = 0,
@@ -3803,27 +3960,27 @@ void full_duplex_server_app(int listening_socket){
 	struct single_srv_data* clients = NULL;
 	int num_clients = 0;
 	while(true){
-		if(num_clients < NUM_CLIENTS){
-			struct sockaddr_in remote_addr;
-			remote_addr.sin_family=AF_INET;
-			int len = sizeof(struct sockaddr_in);
-			int new_client_socket = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
-			if(new_client_socket >= 0){
-				DEBUG("myaccept client %d", num_clients);
-				struct single_srv_data* new_arr = malloc(sizeof(struct single_srv_data)*(num_clients+1));
-				if((num_clients == 0) != (clients == NULL)){
-					ERROR("full_duplex_server_app invalid state num_clients client_sockets");
-				}
-				if(clients != NULL){
-					memcpy(new_arr, clients, sizeof(struct single_srv_data)*num_clients);
-					free(clients);
-				}
-				clients = new_arr;
-				memset(&clients[num_clients], 0, sizeof(clients[num_clients]));
-				clients[num_clients].s = new_client_socket;
-				num_clients++;
+
+		struct sockaddr_in remote_addr;
+		remote_addr.sin_family=AF_INET;
+		int len = sizeof(struct sockaddr_in);
+		int new_client_socket = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
+		if(new_client_socket >= 0){
+			//DEBUG("myaccept client %d", num_clients);
+			struct single_srv_data* new_arr = malloc(sizeof(struct single_srv_data)*(num_clients+1));
+			if((num_clients == 0) != (clients == NULL)){
+				ERROR("full_duplex_server_app invalid state num_clients client_sockets");
 			}
+			if(clients != NULL){
+				memcpy(new_arr, clients, sizeof(struct single_srv_data)*num_clients);
+				free(clients);
+			}
+			clients = new_arr;
+			memset(&clients[num_clients], 0, sizeof(clients[num_clients]));
+			clients[num_clients].s = new_client_socket;
+			num_clients++;
 		}
+
 		for(int i=0; i<num_clients; i++){
 			if(clients[i].srv_st == SERVER_ST_REQ){
 				char* strend = clients[i].req_arr;
@@ -3964,66 +4121,7 @@ int main(){
 	DEBUG("Startup OK");
 
 	if(MAIN_MODE == CLIENT){
-		int client_sockets[NUM_CLIENTS];
-		int current_msg_num[NUM_CLIENTS] = {0};
-		int current_msg_sent_bytes[NUM_CLIENTS] = {0};
-		// Client code to connect to a server
-		int s = mysocket(AF_INET,SOCK_STREAM,0);
-		if(s == -1){
-			myperror("mysocket");
-			exit(EXIT_FAILURE);
-		}
-		DEBUG("mysocket OK");
-		client_sockets[0] = s;
-		/*
-		struct sockaddr_in loc_addr;
-		loc_addr.sin_family = AF_INET;
-		loc_addr.sin_port = 0; // Automatic port 
-		loc_addr.sin_addr.s_addr = 0; // Automatic addr (myip)
-		if( -1 == mybind(s,(struct sockaddr *) &loc_addr, sizeof(struct sockaddr_in))){
-			myperror("mybind"); 
-			exit(EXIT_FAILURE);
-		}
-		DEBUG("mybind OK");
-		*/
-		struct sockaddr_in addr;
-		addr.sin_family = AF_INET;
-		addr.sin_port = htons(19500);
-		//addr.sin_addr.s_addr = *(uint32_t*)myip;
-		//addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-		//addr.sin_addr.s_addr = inet_addr("93.184.215.14");
-		//addr.sin_addr.s_addr = inet_addr("199.231.164.68"); //faq
-		addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
-		DEBUG("myconnect blk %d (fd %d)", 0, s);
-		while(true){
-			
-			int ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
-			if(ret == -1 && myerrno == EAGAIN){
-				continue;
-			}
-			if(ret < 0){
-				myperror("myconnect");
-				exit(EXIT_FAILURE);
-			}
-			break;
-		}
-		DEBUG("myconnect OK");
-		persistent_nanosleep(1,0);
-		for(int i=1; i<NUM_CLIENTS; i++){
-			int s_loop = mysocket(AF_INET,SOCK_STREAM,0);
-			if(s_loop == -1){
-				myperror("mysocket");
-				exit(EXIT_FAILURE);
-			}
-			DEBUG("myconnect non-blk %d (fd %d)", i, s_loop);
-			if (-1 == myconnect(s_loop,(struct sockaddr * )&addr,sizeof(struct sockaddr_in))){
-				myperror("myconnect loop");
-				exit(EXIT_FAILURE);
-			}
-			DEBUG("myconnect OK");
-			client_sockets[i] = s_loop;
-		}
-		full_duplex_client_app(client_sockets);
+		main_client_app();
 	}else if(MAIN_MODE == SERVER){
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
