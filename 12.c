@@ -35,16 +35,21 @@
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
-#define NUM_CLIENT_REQUESTS 1000
-#endif
-
-#if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
 #define NUM_CLIENT_REQUESTS 100
 #endif
 
-#define RESP_PAYLOAD_BYTES 1000000
+#if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
+#define NUM_CLIENT_REQUESTS 1000
+#endif
+
+
+#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
+
+
+#define UPLINK_DROP_PROB 1E-3
+#define DOWNLINK_DROP_PROB 1E-3
 
 #define MS_ENABLED true
 #define CLIENT 0
@@ -1122,6 +1127,36 @@ void forge_ethernet(struct ethernet_frame* eth, unsigned char * dest, unsigned s
 	eth->type=htons(type);
 };
 
+
+/* https://claude.ai/share/f7371349-a8ae-4f55-be35-ee61579db202 */
+
+// 0 value is not acceptable, so we know that the PRNG has not been initialized
+static uint32_t prng_state = 0;
+
+// Optional: seed the generator
+void seed_prng(uint32_t seed) {
+    prng_state = seed ? seed : 1;  // Ensure non-zero
+}
+
+// Returns a double drawn uniformly in the range [0,1)
+double sample_uniform_0_1(){
+	if(prng_state == 0){
+		seed_prng(time(NULL));
+	}
+    // LCG: next = (a * current + c) mod m
+    // Using constants from Numerical Recipes
+    prng_state = prng_state * 1664525U + 1013904223U;
+    
+    // Convert to [0,1] range
+    // Divide by 2^32 to get [0,1)
+    return (double)prng_state / 4294967296.0;
+}
+bool drop_packet(){
+	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
+	double sample = sample_uniform_0_1();
+	return sample < relevant_drop_prob;
+}
+
 void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, unsigned char proto){
 	int i,t,len ;
 	struct sockaddr_ll sll;
@@ -1130,8 +1165,11 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	struct ethernet_frame * eth = (struct ethernet_frame *) packet;
 	struct ip_datagram * ip = (struct ip_datagram *) eth->payload; 
 
-	// if(!(rand()%INV_LOSS_RATE) && g_argv[4][0]=='S') {printf("==========TX LOST ===============\n");return 1;}
-	// if((losscounter++ == 25)  &&(g_argv[4][0]=='S')){printf("==========TX LOST ===============\n");return 1;}
+	if(drop_packet()){
+		DEBUG("Packet dropped! <======================");
+		LOG_TCP_SEGMENT("DROP", payload, payloadlen);
+		return;
+	}
 
 	/**** HOST ROUTING */
 	if( ((*(unsigned int*)targetip) & (*(unsigned int*) mask)) == ((*(unsigned int*)myip) & (*(unsigned int*) mask)))
@@ -1158,7 +1196,6 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	int attempts = 0;
 	st:
 	;
-	// Why would this call block?
 	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
 	if (t == -1) {
 		if(errno == EMSGSIZE){
@@ -1256,7 +1293,6 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	if(sid >= 0){
 		if(tcb->write_side_close_state[sid] >= WR_CLOSE_ST_LSS_TXED){
 			if(!lss){
-				DEBUG("prepare_tcp lss forced set");
 				tcp->payload[ms_index+2] |= 0x80; // set the 1st bit
 			}
 		}
@@ -1364,7 +1400,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			ssn_wrap_warning[txctrl->sid] = true;
 		}
 		if(txctrl->ssn == 0 && ssn_wrap_warning[txctrl->sid]){
-			DEBUG("update_tcp_header sid %d wrapped\n", txctrl->sid);
+			//DEBUG("update_tcp_header sid %d wrapped\n", txctrl->sid);
 			ssn_wrap_warning[txctrl->sid] = false;
 		}
 	}else{
@@ -3473,7 +3509,7 @@ void myio(int ignored){
 										last->next = newrx_stream;
 									}
 								}else{
-									DEBUG("Discarding subsequent LSS");
+									//DEBUG("Discarding subsequent LSS");
 								}
 
 								
@@ -3993,7 +4029,7 @@ void full_duplex_server_app(int listening_socket){
 					goto single_app_return;
 				}
 				if(n == 0){
-					DEBUG("received close from client %d", i);
+					//DEBUG("received close from client %d", i);
 					myclose(clients[i].s);
 					clients[i].srv_st = SERVER_ST_STOPPED;
 					goto single_app_return;
