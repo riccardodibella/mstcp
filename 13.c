@@ -54,8 +54,8 @@
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
 
-#define UPLINK_DROP_PROB 0
-#define DOWNLINK_DROP_PROB 0
+#define UPLINK_DROP_PROB 1E-3
+#define DOWNLINK_DROP_PROB 1E-3
 
 #define MS_ENABLED true
 #define CLIENT 0
@@ -1328,6 +1328,59 @@ int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payl
 	*/
 }
 
+
+void update_SACK_option(struct tcpctrlblk* tcb, uint8_t* opt_bytes){
+	if(tcb == NULL || opt_bytes == NULL){
+		ERROR("update_SACK_option NULL param");
+	}
+	if(opt_bytes[0] != OPT_KIND_SACK){
+		ERROR("update_SACK_option non-sack pointer");
+	}
+	if(tcb->unack_tail == NULL){
+		return;
+	}
+
+	const int max_blocks = 3;
+	int used_blocks = 0;
+
+	uint32_t sack_blocks[max_blocks][2];
+
+
+	// Fill sack_blocks and incease used_blocks accordingly, up to max_blocks
+	// Loop powered by Gemini
+	struct channel_rx_queue_node* cursor = tcb->unack_tail;
+	while (cursor != NULL && used_blocks < max_blocks) {
+		// This cursor is the highest-sequence segment of a new block.
+		// The Right Edge of the block is the sequence number AFTER this segment.
+		uint32_t right_edge = cursor->channel_offset + cursor->payload_length;
+		uint32_t left_edge = cursor->channel_offset;
+
+		// Now, walk backwards from the cursor to find the start of this contiguous block.
+		while (cursor->prev != NULL && (cursor->prev->channel_offset + cursor->prev->payload_length == left_edge)) {
+			cursor = cursor->prev;
+			left_edge = cursor->channel_offset;
+		}
+
+		// We have found the full block. Store it.
+		sack_blocks[used_blocks][0] = left_edge;
+		sack_blocks[used_blocks][1] = right_edge;
+		used_blocks++;
+
+		// Move the cursor to the start of the next potential block.
+		cursor = cursor->prev;
+	}
+
+
+	opt_bytes[1] = 2 + used_blocks*8;
+
+	for(int num_block = 0; num_block < used_blocks; num_block++){
+		uint8_t* start_ptr = opt_bytes + 2 + num_block*8;
+		*((uint32_t*)(start_ptr + 0)) = htonl(sack_blocks[num_block][0]+tcb->ack_offs);
+		*((uint32_t*)(start_ptr + 4)) = htonl(sack_blocks[num_block][1]+tcb->ack_offs);
+	}
+}
+
+
 uint16_t compl1(uint8_t* b, int len){
 	uint16_t total = 0;
 	uint16_t prev = 0;
@@ -1393,7 +1446,7 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
 		}
 		if(tcp->payload[i] == OPT_KIND_SACK){
-			// DEBUG("TODO SACK update");
+			update_SACK_option(tcb, tcp->payload + i);
 		}
 		int length = tcp->payload[i+1];
 		i += length - 1; // with the i++ we go to the start of the next option
@@ -1528,7 +1581,7 @@ void fast_send_tcp(int s, uint16_t flags /*Host order*/, uint8_t* options, int o
 			*(uint32_t*) (tcp->payload+i+6) = htonl(tcb->ts_recent); // ts_recent is 0 if this is a SYN (not SYN+ACK) packet
 		}
 		if(tcp->payload[i] == OPT_KIND_SACK){
-			// DEBUG("TODO SACK update");
+			update_SACK_option(tcb, tcp->payload + i);
 		}
 		int length = tcp->payload[i+1];
 		i += length - 1; // with the i++ we go to the start of the next option
@@ -3395,7 +3448,8 @@ void myio(int ignored){
 				if(sack_opt_index > 0){
 
 					// Occhio: questo meccanismo con lo shifter per la rimozione con cumulativeack era rotto, forse va cambiato anche qui
-					int shifter = tcb->txfirst->seq;
+					//int shifter = tcb->txfirst->seq;
+					uint32_t shifter = tcb->seq_offs;
 
 					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
 					for(int entry = 0; entry < sack_entries_count; entry++){
@@ -3404,27 +3458,55 @@ void myio(int ignored){
 
 						struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
 						while(cursor != NULL){
-							int cursor_shifted_seq = cursor->seq - shifter;
-							int left_shifted_seq = block_left_edge_seq - shifter;
-							int right_shifted_seq = block_right_edge_seq - shifter;
+							uint32_t cursor_shifted_seq = cursor->seq - shifter;
+							uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
+							uint32_t left_shifted_seq = block_left_edge_seq - shifter;
+							uint32_t right_shifted_seq = block_right_edge_seq - shifter;
 
-							if(left_shifted_seq < cursor_shifted_seq && cursor_shifted_seq < right_shifted_seq){
+							if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
+								DEBUG("something removed!");
 								// Remove the node from the tx queue
-								ERROR("TODO calcolo sid/lss e chiamata eventuale a stream_close_handler");
+
+								int sid = -1;
+								bool lss = false;
+								int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+								if(ms_index>=0){
+									sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
+									lss = cursor->segment->payload[ms_index+2]>>7;
+								}
+								if(sid >= 0){
+									// MS option is present in cursor segment
+									if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
+										tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
+										stream_close_handler(tcb, sid);
+									}
+								}
+
+
 								if(prev == NULL){
+									tcb->txfirst = cursor->next;
+									if(tcb->txfirst == NULL){
+										tcb->txlast = NULL; // The list is now empty
+									}
 									free(cursor->segment);
 									free(cursor);
-									tcb->txfirst = tcb->txlast = NULL;
-									break;
+									cursor = tcb->txfirst;
+									if(tcb->txfirst == NULL){
+										break;
+									}
 								}else{
 									prev->next = cursor->next;
+									if(tcb->txlast == cursor){
+										tcb->txlast = prev;
+									}
 									free(cursor->segment);
 									free(cursor);
-									cursor = prev;
+									cursor = prev->next;
 								}
+							}else{
+								prev = cursor;
+								cursor = cursor->next;
 							}
-							prev = cursor;
-							cursor = cursor->next;
 						}
 					}
 				}
@@ -3480,7 +3562,7 @@ void myio(int ignored){
 								newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, prev, cursor);
 								
 								cursor->prev = newrx;
-								
+
 								if(prev == NULL){
 									// Insertion at the beginning of the queue
 									tcb->unack = newrx;
@@ -4367,13 +4449,11 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					DEBUG(clients[i].req_arr);
+					//DEBUG(clients[i].req_arr);
 
 					clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
 					clients[i].current_resp_bytes = 0;
 					clients[i].srv_st = SERVER_ST_RESP;
-				}else{
-					DEBUG("request still incomplete");
 				}
 			}else if(clients[i].srv_st == SERVER_ST_RESP){
 				uint8_t data[RESP_BUF_SIZE];
