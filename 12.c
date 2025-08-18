@@ -46,10 +46,10 @@
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 6
-#define NUM_CLIENT_REQUESTS 100
+#define NUM_CLIENT_REQUESTS 6000
 #endif
 
-#define RESP_PAYLOAD_BYTES 100000
+#define RESP_PAYLOAD_BYTES 5000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -1137,11 +1137,22 @@ void forge_ethernet(struct ethernet_frame* eth, unsigned char * dest, unsigned s
 /* https://claude.ai/share/f7371349-a8ae-4f55-be35-ee61579db202 */
 
 // 0 value is not acceptable, so we know that the PRNG has not been initialized
-static uint32_t prng_state = 0;
+uint32_t prng_state = 0;
 
 // Optional: seed the generator
 void seed_prng(uint32_t seed) {
     prng_state = seed ? seed : 1;  // Ensure non-zero
+}
+
+// Doesn't really sample the whole space of uint32_t because 0 is missing AFAIK
+uint32_t sample_uint32(){
+	if(prng_state == 0){
+		seed_prng(time(NULL));
+	}
+	// LCG: next = (a * current + c) mod m
+	// Using constants from Numerical Recipes
+	prng_state = prng_state * 1664525U + 1013904223U;
+	return prng_state;
 }
 
 // Returns a double drawn uniformly in the range [0,1)
@@ -1149,13 +1160,13 @@ double sample_uniform_0_1(){
 	if(prng_state == 0){
 		seed_prng(time(NULL));
 	}
-    // LCG: next = (a * current + c) mod m
-    // Using constants from Numerical Recipes
-    prng_state = prng_state * 1664525U + 1013904223U;
-    
-    // Convert to [0,1] range
-    // Divide by 2^32 to get [0,1)
-    return (double)prng_state / 4294967296.0;
+	// LCG: next = (a * current + c) mod m
+	// Using constants from Numerical Recipes
+	prng_state = prng_state * 1664525U + 1013904223U;
+
+	// Convert to [0,1] range
+	// Divide by 2^32 to get [0,1)
+	return (double)prng_state / 4294967296.0;
 }
 bool drop_packet(){
 	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
@@ -1774,7 +1785,8 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 }
 
 
-void unfair_congestion_scheduler(int s){
+int circular_starting_sid = 0;
+void circular_start_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
 		ERROR("unfair_congestion_scheduler invalid fd %d", s);
 	}
@@ -1784,7 +1796,8 @@ void unfair_congestion_scheduler(int s){
 	}
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
 	uint8_t* temp_payload_buf = malloc(max_payload_length);
-	for(int sid = 0; sid < TOT_SID; sid++){
+	for(int sid_counter = 0; sid_counter < TOT_SID; sid_counter++){
+		int sid = (sid_counter + circular_starting_sid) % TOT_SID;
 		if(tcb->stream_state[sid] == STREAM_STATE_OPENED){
 			// We can transmit some more data on the stream
 			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
@@ -1865,13 +1878,14 @@ void unfair_congestion_scheduler(int s){
 		}
 	}
 	free(temp_payload_buf);
+	circular_starting_sid = (circular_starting_sid+1) % TOT_SID;
 }
 
 
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
-	unfair_congestion_scheduler(s);
+	circular_start_scheduler(s);
 }
 
 
@@ -3883,8 +3897,11 @@ void main_client_app(){
 			client_buffer[i] = malloc(RESP_BUF_SIZE);
 		}
 
+		uint32_t rand_i_base = sample_uint32() % NUM_CLIENTS;
+
 		// Assign new requests to idle clients
-		for(int i=0; i<NUM_CLIENTS && started_requests < NUM_CLIENT_REQUESTS; i++){
+		for(int i_offs=0; i_offs<NUM_CLIENTS && started_requests < NUM_CLIENT_REQUESTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 				current_request_number[i] = started_requests;
 				started_requests++;
@@ -3894,7 +3911,8 @@ void main_client_app(){
 		}
 
 		// Continue sending pending requests
-		for(int i=0; i<NUM_CLIENTS; i++){
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
 				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_request_number[i]);
 				uint8_t* start = client_buffer[i]+cur_bytes[i];
@@ -3920,7 +3938,8 @@ void main_client_app(){
 		}
 
 		// Read HTTP Headers
-		for(int i=0; i<NUM_CLIENTS; i++){
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_H){
 				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], RESP_BUF_SIZE);
 				if(ret == -1 && myerrno == EAGAIN){
@@ -3956,7 +3975,8 @@ void main_client_app(){
 		}
 
 		// Read HTTP Payload
-		for(int i=0; i<NUM_CLIENTS; i++){
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_P){
 				int missing =  response_tot_bytes[i] - cur_bytes[i];
 				if(missing == 0){
