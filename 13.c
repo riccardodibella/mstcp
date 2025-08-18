@@ -270,6 +270,7 @@ struct txcontrolbuf{ // mytcp: txcontrolbuf
 
 struct channel_rx_queue_node{
 	struct channel_rx_queue_node* next;
+	struct channel_rx_queue_node* prev;
 	uint32_t channel_offset; // sequence number - tcb->ack_offs
 	int total_segment_length;
 	int payload_length;
@@ -330,6 +331,7 @@ struct tcpctrlblk{
 	unsigned short r_port; // Channel property
 	unsigned int r_addr; // Channel property
 	struct channel_rx_queue_node* unack; // mytcp: struct rxcontrol* unack ; Channel queue of RXed packets yet to be acked
+	struct channel_rx_queue_node* unack_tail;
 	unsigned int cumulativeack; // Channel property
 	unsigned int ack_offs; // Channel property
     unsigned int seq_offs; // Channel property
@@ -1695,15 +1697,19 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 
 
 
-struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offset, struct ip_datagram* ip, struct tcp_segment* tcp, struct channel_rx_queue_node* next){
+struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offset, struct ip_datagram* ip, struct tcp_segment* tcp, struct channel_rx_queue_node* prev, struct channel_rx_queue_node* next){
 	// IP datagram is needed for segment and payload lengths
 	// Instead of channel_offset we could pass the tcb as a parameter and calculate the channel_offset again here
 	/*
 	struct channel_rx_queue_node{
 		struct channel_rx_queue_node* next;
+		struct channel_rx_queue_node* prev;
 		uint32_t channel_offset; // sequence number - tcb->ack_offs
 		int total_segment_length;
 		int payload_length;
+		int sid;
+		bool lss;
+		bool dummy_payload;
 		struct tcp_segment* segment;
 	};
 	*/
@@ -1719,6 +1725,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	}
 
 	struct channel_rx_queue_node* to_return = malloc(sizeof(struct channel_rx_queue_node));
+	to_return->prev = prev;
 	to_return->next = next;
 	to_return->channel_offset = channel_offset;
 	to_return->total_segment_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4;
@@ -2036,7 +2043,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->r_port = active_open_remote_addr->sin_port;
 			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
 
-			tcb->unack = NULL;
+			tcb->unack = tcb->unack_tail = NULL;
 
 			// Initialization of stream-specific fields
 			for(int i=0; i<TOT_SID; i++){
@@ -2228,7 +2235,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->r_port = active_open_remote_addr->sin_port;
 			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
 
-			tcb->unack = NULL;
+			tcb->unack = tcb->unack_tail = NULL;
 
 			// Initialization of stream-specific fields
 			for(int i=0; i<TOT_SID; i++){
@@ -3450,7 +3457,7 @@ void myio(int ignored){
 					struct channel_rx_queue_node* newrx = NULL;
 					if(tcb->unack == NULL){
 						// The RX queue is empty and this packet is not a duplicate of an already ACKed one: this packet becomes the only one in the RX queue
-						tcb->unack = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
+						tcb->unack = tcb->unack_tail = newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL, NULL);
 					}else{
 						// There is already at least one packet in the RX queue: traverse the queue until you get to the end or you find a node with higher channel offset
 						struct channel_rx_queue_node *prev = NULL, *cursor = tcb->unack;
@@ -3460,8 +3467,8 @@ void myio(int ignored){
 						}
 						if(cursor == NULL){
 							// We traversed the whole queue without finding any segment with a higher channel offset: insert the new one at the end of the queue
-							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, NULL);
-							prev->next = newrx;
+							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, prev, NULL);
+							tcb->unack_tail = prev->next = newrx;
 
 							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
 
@@ -3470,7 +3477,10 @@ void myio(int ignored){
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
 								// using "cursor" as next handles correctly both the cases for end of the queue and for middle of the queue
-								newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, cursor);
+								newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, prev, cursor);
+								
+								cursor->prev = newrx;
+								
 								if(prev == NULL){
 									// Insertion at the beginning of the queue
 									tcb->unack = newrx;
@@ -3567,15 +3577,22 @@ void myio(int ignored){
 								ERROR("in-order segment not consumed from channel queue");
 							}
 
-							if(tcb->unack == newrx){
-								//DEBUG("free unack newrx");
-							}
-
 							tcb->cumulativeack += tcb->unack->payload_length;
 							if(!tcb->unack->dummy_payload){
 								tcb->adwin[tcb->unack->sid] -= tcb->unack->payload_length;
 							}
+
+							if(tcb->unack->prev != NULL){
+								// at the beginning of the RX queue, prev should always be NULL
+								ERROR("unack.prev != NULL");
+							}
 							struct channel_rx_queue_node* next = tcb->unack->next;
+							if(next != NULL){
+								next->prev = NULL;
+							}else{
+								// We are deleting the last element in the unack queue: clear unack_tail accordingly
+								tcb->unack_tail = NULL;
+							}
 							free(tcb->unack);
 							tcb->unack = next;
 						}
@@ -4021,7 +4038,7 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
-	DEBUG("all request completed :)");
+	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	long ul_sum = 0, dl_sum = 0;
 	for(int i=0; i<NUM_CLIENTS; i++){
@@ -4113,7 +4130,7 @@ void main_client_app(){
 			}
 		}
 	}
-	DEBUG("all request completed :)");
+	DEBUG("all requests completed :)");
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
