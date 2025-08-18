@@ -31,7 +31,9 @@
 
 #define CL_MAIN_PARALLEL 1
 #define CL_MAIN_SERIAL_BLOCKING 2
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN_AGGREGATE 3
+
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -42,14 +44,18 @@
 #define NUM_CLIENT_REQUESTS 1000
 #endif
 
+#if CL_MAIN == CL_MAIN_AGGREGATE
+#define NUM_CLIENTS 6
+#define NUM_CLIENT_REQUESTS 100
+#endif
 
-#define RESP_PAYLOAD_BYTES 10000
+#define RESP_PAYLOAD_BYTES 100000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
 
-#define UPLINK_DROP_PROB 1E-3
-#define DOWNLINK_DROP_PROB 1E-3
+#define UPLINK_DROP_PROB 0
+#define DOWNLINK_DROP_PROB 0
 
 #define MS_ENABLED true
 #define CLIENT 0
@@ -110,7 +116,7 @@
 
 #define FDINFO_ST_FREE 0 // mytcp: FREE
 #define FDINFO_ST_UNBOUND 1 // mytcp: TCP_UNBOUND
-#define FDINFO_ST_BOUND 2 // mytcp: TCP_BOUND 
+#define FDINFO_ST_BOUND 2 // mytcp: TCP_BOUND
 #define FDINFO_ST_TCB_CREATED 3 // mytcp: TCB_CREATED
 
 #define FSM_EVENT_APP_ACTIVE_OPEN 1
@@ -1570,7 +1576,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				1.   On the first and second duplicate ACKs received at a sender, a
 					TCP SHOULD send a segment of previously unsent data per [RFC3042] provided that the receiver's advertised window allows, the total
 					FlightSize would remain less than or equal to cwnd plus 2*SMSS, and that new data is available for transmission.  Further, the
-					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042]. 
+					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
 				*/
 				tcb->lta = 0;
 				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
@@ -1749,7 +1755,6 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 	int sid = (ch_node->segment->payload[ms_index+2]>>2) & 0x1F;
 	int ssn = ((ch_node->segment->payload[ms_index+2]&0x3) << 8) | ch_node->segment->payload[ms_index+3];
 	bool lss  = ch_node->segment->payload[ms_index+2]>>7;
-	// Last stream segment bit currently ignored
 
 	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) malloc(sizeof(struct stream_rx_queue_node));
 
@@ -2404,7 +2409,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			break;
 		case TCB_ST_LISTEN:
 			if(event == FSM_EVENT_PKT_RCV){
-				DEBUG("received packet in st LISTEN");
 				if(!(tcp->flags & SYN)){
 					break;
 				}
@@ -3724,6 +3728,294 @@ void mytimer(int ignored){
 }
 
 
+
+#if CL_MAIN == CL_MAIN_AGGREGATE
+enum client_state{
+	CLIENT_ST_IDLE = 0,
+	CLIENT_ST_REQ,
+	CLIENT_ST_RESP_H,
+	CLIENT_ST_RESP_P,
+	
+};
+void main_client_app(){
+	myread_mode = MYREAD_MODE_BLOCKING;
+	mywrite_mode = MYWRITE_MODE_BLOCKING;
+	myconnect_mode = MYCONNECT_MODE_BLOCKING;
+
+	int ret, s;
+
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(19500);
+	addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
+
+	s = mysocket(AF_INET,SOCK_STREAM,0);
+	if(s == -1){
+		myperror("mysocket");
+		exit(EXIT_FAILURE);
+	}
+
+	ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+	if(ret < 0){
+		myperror("myconnect");
+		exit(EXIT_FAILURE);
+	}
+	char* data = malloc(RESP_BUF_SIZE); // both req and resp
+	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, 0, -1);
+	int sent = 0, missing = strlen(data);
+	while(missing > 0){
+		ret = mywrite(s, data+sent, missing);
+		if(ret < 0){
+			myperror("mywrite");
+			exit(EXIT_FAILURE);
+		}
+		sent += ret;
+		missing -= ret;
+	}
+	memset(data, 0, RESP_BUF_SIZE);
+	int recv_bytes = 0;
+	int content_length = -1;
+	int header_portion_length = -1;
+	while(true){
+		ret = myread(s, data+recv_bytes, (content_length < 0 ? RESP_BUF_SIZE : (header_portion_length+content_length)) - recv_bytes);
+		if(ret < 0){
+			myperror("myread");
+			exit(EXIT_FAILURE);
+		}
+		if(ret == 0){
+			myperror("unexpected read return 0");
+			exit(EXIT_FAILURE);
+		}
+		recv_bytes += ret;
+		if(content_length < 0){
+			char* end_of_headers_substr = strstr(data, "\r\n\r\n");
+			if(end_of_headers_substr != NULL){
+				header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - data;
+				content_length = RESP_PAYLOAD_BYTES;
+				char* content_length_str = strcasestr(data, "Content-Length");
+				if(content_length_str != NULL){
+					while(*content_length_str != ':'){
+						content_length_str++;
+					}
+					content_length_str++; // Skip ':
+					while(*content_length_str == ' '){
+						content_length_str++;
+					}
+
+					content_length = atoi(content_length_str);
+				}
+			}
+		}
+
+		if(content_length >= 0 && recv_bytes >= header_portion_length + content_length){
+			break;
+		}
+	}
+	free(data);
+	DEBUG("Starting the measurement");
+	int64_t meas_start = get_timestamp_ms();
+
+
+
+	myread_mode = MYREAD_MODE_NON_BLOCKING;
+	mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
+	myconnect_mode = MYCONNECT_MODE_NON_BLOCKING;
+
+
+	int client_sockets[NUM_CLIENTS];
+	int completed_requests[NUM_CLIENTS] = {0};
+	int started_requests = 0;
+	bool client_connected[NUM_CLIENTS] = {false};
+	bool client_active[NUM_CLIENTS] = {false};
+	enum client_state cl_st[NUM_CLIENTS];
+	int current_request_number[NUM_CLIENTS];
+	int cur_bytes[NUM_CLIENTS]; // both for write and for read
+	char* client_buffer[NUM_CLIENTS];
+	long ul_bytes[NUM_CLIENTS] = {0};
+	long dl_bytes[NUM_CLIENTS] = {0};
+	int response_tot_bytes[NUM_CLIENTS];
+	
+	client_sockets[0] = s;
+	client_connected[0] = true;
+	client_active[0] = true;
+	cl_st[0] = CLIENT_ST_IDLE;
+	client_buffer[0] = malloc(RESP_BUF_SIZE);
+	
+	for(int i=1; i<NUM_CLIENTS; i++){
+		s = mysocket(AF_INET,SOCK_STREAM,0);
+		if(s == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		client_sockets[i] = s;
+	}
+
+	while(true){
+
+		// End main if all the clients are stopped
+		bool all_stopped = true;
+		for(int i=0; i<NUM_CLIENTS && all_stopped; i++){
+			if(!client_connected[i] || client_active[i]){
+				all_stopped = false;
+			}
+		}
+		if(all_stopped){
+			break;
+		}
+		
+		// Attempt connection for all non-connected clients
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(client_connected[i]){
+				continue;
+			}
+			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+			if(ret == -1 && myerrno == EAGAIN){
+				myerrno = 0;
+				continue;
+			}
+			if(ret < 0){
+				myperror("myconnect");
+				exit(EXIT_FAILURE);
+			}
+			client_connected[i] = true;
+			client_active[i] = true;
+			cl_st[i] = CLIENT_ST_IDLE;
+			client_buffer[i] = malloc(RESP_BUF_SIZE);
+		}
+
+		// Assign new requests to idle clients
+		for(int i=0; i<NUM_CLIENTS && started_requests < NUM_CLIENT_REQUESTS; i++){
+			if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
+				current_request_number[i] = started_requests;
+				started_requests++;
+				cl_st[i] = CLIENT_ST_REQ;
+				cur_bytes[i] = 0;
+			}
+		}
+
+		// Continue sending pending requests
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
+				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_request_number[i]);
+				uint8_t* start = client_buffer[i]+cur_bytes[i];
+				int missing = strlen(client_buffer[i]) - cur_bytes[i];
+				int res = mywrite(client_sockets[i], start, missing);
+				if(res <= 0){
+					if(myerrno == EAGAIN){
+						myerrno = 0;
+						return;
+					}else{
+						myperror("mywrite");
+						ERROR("mywrite error");
+					}
+				}
+				cur_bytes[i] += res;
+				ul_bytes[i] += res;
+				if(cur_bytes[i] == strlen(client_buffer[i])){
+					cl_st[i] = CLIENT_ST_RESP_H;
+					cur_bytes[i] = 0;
+					// ...
+				}
+			}
+		}
+
+		// Read HTTP Headers
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_H){
+				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], RESP_BUF_SIZE);
+				if(ret == -1 && myerrno == EAGAIN){
+					myerrno = 0;
+					continue;
+				}
+				cur_bytes[i] += ret;
+				dl_bytes[i] += ret;
+				client_buffer[i][cur_bytes[i]] = '\0';
+
+				char* end_of_headers_substr = strstr(client_buffer[i], "\r\n\r\n"); 
+				if(end_of_headers_substr != NULL){
+					int header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - client_buffer[i];
+
+					int content_length = RESP_PAYLOAD_BYTES; // Assume the expected payload length by default
+
+					char* content_length_str = strcasestr(client_buffer[i], "Content-Length");
+					if(content_length_str != NULL){
+						while(*content_length_str != ':'){
+							content_length_str++;
+						}
+						content_length_str++; // Skip ':
+						while(*content_length_str == ' '){
+							content_length_str++;
+						}
+
+						content_length = atoi(content_length_str);
+					}
+					response_tot_bytes[i] = header_portion_length + content_length;
+					cl_st[i] = CLIENT_ST_RESP_P;
+				}
+			}
+		}
+
+		// Read HTTP Payload
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_P){
+				int missing =  response_tot_bytes[i] - cur_bytes[i];
+				if(missing == 0){
+					goto after_read;
+				}
+				if(missing < 0){
+					ERROR(".");
+				}
+				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], missing);
+				if(ret == -1 && myerrno == EAGAIN){
+					myerrno = 0;
+					continue;
+				}
+				cur_bytes[i] += ret;
+				dl_bytes[i] += ret;
+
+				after_read:
+				if(cur_bytes[i] == response_tot_bytes[i]){
+					//client_buffer[i][cur_bytes[i]] = 0;
+					//DEBUG(client_buffer[i]);
+					cur_bytes[i] = 0;
+					cl_st[i] = CLIENT_ST_IDLE;
+					completed_requests[i]++;
+				}
+			}
+		}
+
+
+
+
+		// Close all idle clients if there are no more requests to do
+		if(started_requests >= NUM_CLIENT_REQUESTS){
+			for(int i=0; i<NUM_CLIENTS; i++){
+				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
+					myclose(client_sockets[i]);
+					client_active[i] = false;
+					free(client_buffer[i]);
+				}
+			}
+		}
+	}
+	int64_t meas_end = get_timestamp_ms();
+	int64_t meas_dur = meas_end - meas_start;
+
+	DEBUG("all request completed :)");
+	DEBUG("########################### Statitics ###########################");
+	long ul_sum = 0, dl_sum = 0;
+	for(int i=0; i<NUM_CLIENTS; i++){
+		ul_sum += ul_bytes[i];
+		dl_sum += dl_bytes[i];
+		DEBUG("Client %d: %d requests (ul %ld dl %ld)", i, completed_requests[i], ul_bytes[i], dl_bytes[i]);
+	}
+	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur);
+	DEBUG("#################################################################");
+	DEBUG("wait...");
+	persistent_nanosleep(2, 0);
+	DEBUG("main_client_app end");
+}
+#endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
 void main_client_app(){
