@@ -46,7 +46,7 @@
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 10
-#define NUM_CLIENT_REQUESTS 10000
+#define NUM_CLIENT_REQUESTS 1000
 #endif
 
 #define RESP_PAYLOAD_BYTES 10000
@@ -56,6 +56,15 @@
 
 #define UPLINK_DROP_PROB 0
 #define DOWNLINK_DROP_PROB 0
+
+
+//#define STREAM_DROP_ENABLED
+#ifdef STREAM_DROP_ENABLED
+const int DROP_TARGET_STREAMS[] = {1, 5};
+#define UPLINK_STREAM_DROP_PROB 0
+#define DOWNLINK_STREAM_DROP_PROB 1E-1
+#endif
+
 
 #define MS_ENABLED true
 #define CLIENT 0
@@ -1170,10 +1179,34 @@ double sample_uniform_0_1(){
 	// Divide by 2^32 to get [0,1)
 	return (double)prng_state / 4294967296.0;
 }
-bool drop_packet(){
+bool drop_packet(struct tcp_segment* tcp){
 	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
 	double sample = sample_uniform_0_1();
-	return sample < relevant_drop_prob;
+	if(sample < relevant_drop_prob){
+		return true;
+	}
+
+	#ifdef STREAM_DROP_ENABLED
+	if(sizeof(DROP_TARGET_STREAMS) > 0){
+		int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
+		if(ms_index>=0){
+			int sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
+			for(int i=0; i<sizeof(DROP_TARGET_STREAMS)/sizeof(DROP_TARGET_STREAMS[0]);i++){
+				if(sid == DROP_TARGET_STREAMS[i]){
+					relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_STREAM_DROP_PROB : DOWNLINK_STREAM_DROP_PROB;
+					sample = sample_uniform_0_1();
+					if(sample < relevant_drop_prob){
+						DEBUG("drop sid %d", sid);
+						return true;
+					}
+					// We do not break here! we could have the same sid multiple times, to increase its drop probability
+				}
+			}
+		}
+	}
+	#endif
+
+	return false;
 }
 
 void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, unsigned char proto){
@@ -1184,10 +1217,12 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	struct ethernet_frame * eth = (struct ethernet_frame *) packet;
 	struct ip_datagram * ip = (struct ip_datagram *) eth->payload; 
 
-	if(drop_packet()){
-		DEBUG("Packet dropped! <======================");
-		LOG_TCP_SEGMENT("DROP", payload, payloadlen);
-		return;
+	if(proto == TCP_PROTO){
+		if(drop_packet((struct tcp_segment*)payload)){
+			DEBUG("Packet dropped! <======================");
+			LOG_TCP_SEGMENT("DROP", payload, payloadlen);
+			return;
+		}
 	}
 
 	/**** HOST ROUTING */
@@ -2491,7 +2526,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				if(!(tcp->flags & SYN)){
 					break;
 				}
-				DEBUG("SYN!");
 
 				bool ms_received = false;
 				bool sack_perm_received = false;
@@ -4149,7 +4183,7 @@ void main_client_app(){
 		dl_sum += dl_bytes[i];
 		DEBUG("Client %d: %d requests (ul %ld dl %ld)", i, completed_requests[i], ul_bytes[i], dl_bytes[i]);
 	}
-	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur);
+	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
