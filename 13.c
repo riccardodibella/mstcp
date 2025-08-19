@@ -45,17 +45,17 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS 6
-#define NUM_CLIENT_REQUESTS 6000
+#define NUM_CLIENTS 10
+#define NUM_CLIENT_REQUESTS 10000
 #endif
 
-#define RESP_PAYLOAD_BYTES 5000
+#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
 
-#define UPLINK_DROP_PROB 1E-3
-#define DOWNLINK_DROP_PROB 1E-3
+#define UPLINK_DROP_PROB 0
+#define DOWNLINK_DROP_PROB 0
 
 #define MS_ENABLED true
 #define CLIENT 0
@@ -1373,8 +1373,13 @@ void update_SACK_option(struct tcpctrlblk* tcb, uint8_t* opt_bytes){
 
 	opt_bytes[1] = 2 + used_blocks*8;
 
+	if(used_blocks > 0){
+		//DEBUG("%d used_blocks! offs=%u", used_blocks, tcb->ack_offs);
+	}
+
 	for(int num_block = 0; num_block < used_blocks; num_block++){
 		uint8_t* start_ptr = opt_bytes + 2 + num_block*8;
+		//DEBUG("%u - %u", sack_blocks[num_block][0], sack_blocks[num_block][1]);
 		*((uint32_t*)(start_ptr + 0)) = htonl(sack_blocks[num_block][0]+tcb->ack_offs);
 		*((uint32_t*)(start_ptr + 4)) = htonl(sack_blocks[num_block][1]+tcb->ack_offs);
 	}
@@ -3452,20 +3457,36 @@ void myio(int ignored){
 					uint32_t shifter = tcb->seq_offs;
 
 					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
+					if(sack_entries_count > 0){
+						//DEBUG("%d SACK entries! shifter=%u", sack_entries_count, shifter);
+					}
 					for(int entry = 0; entry < sack_entries_count; entry++){
-						int block_left_edge_seq = ntohl(*(uint32_t*) tcp->payload + sack_opt_index + 2 + entry*8);
-						int block_right_edge_seq = ntohl(*(uint32_t*) tcp->payload + sack_opt_index + 2 + entry*8 + 4);
+						int block_left_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8)));
+						int block_right_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8 + 4)));
+
+						uint32_t left_shifted_seq = block_left_edge_seq - shifter;
+						uint32_t right_shifted_seq = block_right_edge_seq - shifter;
+
+						//DEBUG("%u - %u (src %u - %u)", left_shifted_seq, right_shifted_seq, block_left_edge_seq,block_right_edge_seq);
 
 						struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
 						while(cursor != NULL){
 							uint32_t cursor_shifted_seq = cursor->seq - shifter;
 							uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
-							uint32_t left_shifted_seq = block_left_edge_seq - shifter;
-							uint32_t right_shifted_seq = block_right_edge_seq - shifter;
 
 							if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
-								DEBUG("something removed!");
+								//DEBUG("Something removed");
 								// Remove the node from the tx queue
+
+								if(!cursor->dummy_payload && cursor->payloadlen > 0){
+									// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
+									fdinfo[i].tcb->flightsize-=cursor->payloadlen;
+
+									if(tcb->radwin[cursor->sid] < cursor->payloadlen){
+										ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
+									}
+									tcb->radwin[cursor->sid] -= cursor->payloadlen;
+								}
 
 								int sid = -1;
 								bool lss = false;

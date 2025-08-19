@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib
 matplotlib.use('TkAgg')  # Ensures GUI backend
+import signal
+signal.signal(signal.SIGINT, signal.SIG_DFL) # https://stackoverflow.com/a/75864329
 
 #FILENAME = "log_client.json"
 FILENAME = "log_server.json"

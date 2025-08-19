@@ -14,6 +14,12 @@ segmenti e viene persa, non viene triggerato il fast retransmit, perchè non ci 
 per uno stream il traffico sugli altri stream genera abbastanza dupACK da triggerare la ritrasmissione... è giusto come ragionamento? Questo dovrebbe
 essere utile soprattutto in Uplink se gran parte del traffico è in downlink, e si potrebbe vedere bene mettendo una drop probability più alta in ricezione
 quando si è nel server
+- Per capire cosa scrivere nella tesi riguardo all'utilità di SACK, e in generale riguardo alla mitigazione dell'HoL Blocking: il problema dell'HoL blocking
+che c'era con HTTP/2 è già in gran parte risolto da MS-TCP senza SACK, perchè se arrivano segmenti per stream diversi e solo uno è perso quelli degli altri
+stream possono essere consumati come se niente fosse. Il vantaggio di SACK si potrebbe vedere nell'RTT successivo, in cui se la richiesta è finita potrebbe
+arrivare la risposta (o viceversa, se il pacchetto perso era in DL, se la risposta è finita può partire un'altra richiesta), e invece se la richiesta/risposta
+non era finita e il fattore limitante era il flow control si libererà spazio aggiuntivo per ritrasmettere dati su quello stream. In entrambi questi casi
+si risparmia 1 RTT rispetto al caso senza SACK, in cui si sarebbe dovuto aspettare che il Fast Retransmit "riempisse il buco" prima di continuare. Giusto?
 
 
 - myclose è facile: metto un flag che dice "accoda il LSS", chiamo lo scheduler per sicurezza, e poi lo scheduler deciderà quando accodare il LSS
