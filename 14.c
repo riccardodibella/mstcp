@@ -45,11 +45,11 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS 10
+#define NUM_CLIENTS 1
 #define NUM_CLIENT_REQUESTS 1000
 #endif
 
-#define RESP_PAYLOAD_BYTES 10000
+#define RESP_PAYLOAD_BYTES 100000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -107,12 +107,12 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define TX_BUFFER_SIZE (1024*1024)
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
-#define MIN_PORT 19050
+#define MIN_PORT 19000
 #define MAX_PORT 19999
 
 #define TCP_PROTO 6 // protocol field inside IP header
 
-#define TCP_MSS 1400
+#define TCP_MSS 1460
 //#define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
@@ -3523,8 +3523,6 @@ void myio(int ignored){
 				int sack_opt_index = search_tcp_option(tcp, OPT_KIND_SACK);
 				if(sack_opt_index > 0){
 
-					// Occhio: questo meccanismo con lo shifter per la rimozione con cumulativeack era rotto, forse va cambiato anche qui
-					//int shifter = tcb->txfirst->seq;
 					uint32_t shifter = tcb->seq_offs;
 
 					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
@@ -4423,7 +4421,7 @@ void single_client_app(int* client_sockets, int i /* num_client */){
 
 		after_read:
 		if(resp_recv_bytes[i] == resp_tot_bytes[i]){
-			resp_arr[i][resp_recv_bytes[i]] = 0;
+			//resp_arr[i][resp_recv_bytes[i]] = 0;
 			//DEBUG(resp_arr[i]);
 			resp_recv_bytes[i] = 0;
 			resp_tot_bytes[i] = 0;
@@ -4522,7 +4520,7 @@ struct single_srv_data{
 	int requested_payload_bytes;
 	int current_resp_bytes;
 };
-
+uint8_t data[RESP_BUF_SIZE];
 void full_duplex_server_app(int listening_socket){
 	struct single_srv_data* clients = NULL;
 	int num_clients = 0;
@@ -4576,7 +4574,6 @@ void full_duplex_server_app(int listening_socket){
 					clients[i].srv_st = SERVER_ST_RESP;
 				}
 			}else if(clients[i].srv_st == SERVER_ST_RESP){
-				uint8_t data[RESP_BUF_SIZE];
 				sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
 				int end_index = strlen(data);
 				for(int j=0; j<clients[i].requested_payload_bytes; j++){
