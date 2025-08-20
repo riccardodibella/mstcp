@@ -319,6 +319,7 @@ struct tcpctrlblk{
 	uint16_t next_rx_ssn[TOT_SID]; // SSN of the next segment that has to be inserted in the buffer
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 	struct stream_rx_queue_node* stream_rx_queue[TOT_SID]; // Contains only in-order segments for each stream, ready to be consumed by myread()
+	struct stream_rx_queue_node* stream_rx_queue_tail[TOT_SID];
 
 	// "write" direction
 	int write_side_close_state[TOT_SID];
@@ -2172,7 +2173,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->next_ssn[i] = 0;
 				tcb->next_rx_ssn[i] = 0;
 				tcb->stream_fsm_timer[i] = 0;
-				tcb->stream_rx_queue[i] = NULL;
+				tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 
 				tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
 				tcb->lss_received[i] = tcb->lss_consumed[i] = false;
@@ -2268,7 +2269,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 								ERROR("stream_tx_buffer != NULL before malloc");
 							}
 							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TX_BUFFER_SIZE);
-							fdinfo[s].tcb->stream_rx_queue[stream] = NULL;
 							fdinfo[s].tcb->adwin[stream] = RX_VIRTUAL_BUFFER_SIZE;
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
 							fdinfo[s].tcb->write_side_close_state[stream] = WR_CLOSE_ST_OPEN;
@@ -2285,6 +2285,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 								}
 								free(tmp);
 							}
+							
+							fdinfo[s].tcb->stream_rx_queue[stream] = fdinfo[s].tcb->stream_rx_queue_tail[stream] = NULL;
+
 							return 0;
 						}
 					}
@@ -2356,7 +2359,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				*/
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->stream_tx_buffer[i] = NULL;
-				tcb->stream_rx_queue[i] = NULL;
+				tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
 				tcb->txfree[i] = 0;
@@ -2711,7 +2714,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 					backlog_tcb->stream_state[0] = STREAM_STATE_READY;
 					backlog_tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
-					backlog_tcb->stream_rx_queue[0] = NULL;
+					backlog_tcb->stream_rx_queue[0] = backlog_tcb->stream_rx_queue_tail[0] = NULL;
 					//backlog_tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
 					backlog_tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					backlog_tcb->txfree[0] = TX_BUFFER_SIZE;
@@ -2723,7 +2726,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
 						backlog_tcb->stream_state[i] = STREAM_STATE_UNUSED;
 						backlog_tcb->stream_tx_buffer[i] = NULL;
-						backlog_tcb->stream_rx_queue[i] = NULL;
+						backlog_tcb->stream_rx_queue[i] = backlog_tcb->stream_rx_queue_tail[i] = NULL;
 						backlog_tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
 						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
 						backlog_tcb->txfree[i] = 0;
@@ -2792,7 +2795,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 								ERROR("stream_tx_buffer != NULL before malloc");
 							}
 							tcb->stream_tx_buffer[sid] = malloc(TX_BUFFER_SIZE);
-							tcb->stream_rx_queue[sid] = NULL;
+							tcb->stream_rx_queue[sid] = tcb->stream_rx_queue_tail[sid] = NULL;
 							tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE;
 							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
 
@@ -3103,6 +3106,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			// condition "tcb->stream_rx_queue[sid]->dummy_payload" is true
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+			if(tcb->stream_rx_queue[sid] == NULL){
+				tcb->stream_rx_queue_tail[sid] = NULL;
+			}
 			// tcb->adwin[sid] does not account for dmp segments
 			free(dmp_node->segment);
 			free(dmp_node);
@@ -3146,6 +3152,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				// Remove the LSS segment from the queue
 				struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 				tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+				if(tcb->stream_rx_queue[sid] == NULL){
+					tcb->stream_rx_queue_tail[sid] = NULL;
+				}
 				free(dmp_node->segment);
 				free(dmp_node);
 
@@ -3164,6 +3173,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			}
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+			if(tcb->stream_rx_queue[sid] == NULL){
+				tcb->stream_rx_queue_tail[sid] = NULL;
+			}
 			// tcb->adwin[sid] does not account for dmp segments
 			// free dmp_node and its segment
 			free(dmp_node->segment);
@@ -3185,6 +3197,10 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			// Segment fully consumed: remove it from the stream rx queue
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
 			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+
+			if(tcb->stream_rx_queue[sid] == NULL){
+				tcb->stream_rx_queue_tail[sid] = NULL;
+			}
 
 			// free dmp_node and its segment
 			free(dmp_node->segment);
@@ -3695,16 +3711,15 @@ void myio(int ignored){
 									}
 
 									if(!(tcb->lss_received[sid] && newrx_stream->lss && !first_lss_segment)){
-										if(tcb->stream_rx_queue[sid] == NULL){
-											tcb->stream_rx_queue[sid] = newrx_stream;
+										if((tcb->stream_rx_queue[sid] == NULL) != (tcb->stream_rx_queue_tail[sid] == NULL)){
+											ERROR("invalid stream tail state (1)");
+										}
+										if(tcb->stream_rx_queue_tail[sid] == NULL){
+											tcb->stream_rx_queue[sid] = tcb->stream_rx_queue_tail[sid] = newrx_stream;
 										}else{
-											// Traverse the stream RX queue until you get to the end
-											// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
-											struct stream_rx_queue_node* last = tcb->stream_rx_queue[sid];
-											while(last->next != NULL){
-												last = last->next;
-											}
+											struct stream_rx_queue_node* last = tcb->stream_rx_queue_tail[sid];
 											last->next = newrx_stream;
+											tcb->stream_rx_queue_tail[sid] = newrx_stream;
 										}
 									}else{
 										//DEBUG("Discarding subsequent LSS");
@@ -3761,16 +3776,15 @@ void myio(int ignored){
 								}
 								struct stream_rx_queue_node* newrx_stream = create_stream_rx_queue_node(tcb->unack); // tcb->unack->segment is set to NULL in the function
 
+								if((tcb->stream_rx_queue[0] == NULL) != (tcb->stream_rx_queue_tail[0] == NULL)){
+									ERROR("invalid stream tail state (2)");
+								}
 								if(tcb->stream_rx_queue[0] == NULL){
-									tcb->stream_rx_queue[0] = newrx_stream;
+									tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = newrx_stream;
 								}else{
-									// Traverse the stream RX queue until you get to the end
-									// This could be done much faster by keeping a pointer to the last element, but doing it in this way I am more confident in not doing errors, this can be improved later
-									struct stream_rx_queue_node* last = tcb->stream_rx_queue[0];
-									while(last->next != NULL){
-										last = last->next;
-									}
+									struct stream_rx_queue_node* last = tcb->stream_rx_queue_tail[0];
 									last->next = newrx_stream;
+									tcb->stream_rx_queue_tail[0] = newrx_stream;
 								}
 							}
 
@@ -4567,7 +4581,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					DEBUG(clients[i].req_arr);
+					//DEBUG(clients[i].req_arr);
 
 					clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
 					clients[i].current_resp_bytes = 0;
