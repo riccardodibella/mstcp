@@ -33,7 +33,7 @@
 #define CL_MAIN_SERIAL_BLOCKING 2
 #define CL_MAIN_AGGREGATE 3
 
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -66,7 +66,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #endif
 
 
-#define MS_ENABLED false
+#define MS_ENABLED true
 #define CLIENT 0
 #define SERVER 1
 #ifndef MAIN_MODE // Compile with -DMAIN_MODE=CLIENT or -DMAIN_MODE=SERVER
@@ -107,12 +107,12 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define TX_BUFFER_SIZE (1024*1024)
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
-#define MIN_PORT 19000
+#define MIN_PORT 19050
 #define MAX_PORT 19999
 
 #define TCP_PROTO 6 // protocol field inside IP header
 
-#define TCP_MSS 960
+#define TCP_MSS 1400
 //#define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
@@ -3159,7 +3159,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			
 		}
 		if(tcb->stream_rx_queue[sid]->dummy_payload){
-			if(tcb->ms_option_enabled){
+			if(!tcb->ms_option_enabled){
 				ERROR("DMP segment in myread non-MS");
 			}
 			struct stream_rx_queue_node* dmp_node = tcb->stream_rx_queue[sid];
