@@ -2,7 +2,7 @@
 echo "$(date '+%d/%m/%Y %H:%M:%S')"
 # https://chatgpt.com/share/67e8062d-fd34-8007-8492-0853ae27c423
 if [[ "$1" == "--local" ]]; then
-    gcc 14.c -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out
+    gcc 14.c -O3 -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out
 else
     gcc 14.c -g -DMAIN_MODE=CLIENT -o client.out
 fi
@@ -12,7 +12,7 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 if [[ "$1" == "--local" ]]; then
-    gcc 14.c -g -DMAIN_MODE=SERVER -DLOCAL_SERVER -o server.out
+    gcc 14.c -O3 -g -DMAIN_MODE=SERVER -DLOCAL_SERVER -o server.out
 else
     scp 14.c dibella@172.104.237.69:/home/dibella
     ssh dibella@172.104.237.69 'gcc 14.c -g -DMAIN_MODE=SERVER -o server.out'

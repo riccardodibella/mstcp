@@ -25,6 +25,8 @@
 
 /* DEFINE MACROS */
 
+#define NOLOGS
+
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
@@ -46,10 +48,10 @@
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_REQUESTS 1000
+#define NUM_CLIENT_REQUESTS 10
 #endif
 
-#define RESP_PAYLOAD_BYTES 100000
+#define RESP_PAYLOAD_BYTES 1000000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -568,9 +570,15 @@ uint16_t deflate_window_scale(uint32_t big_window, uint8_t factor){
 }
 
 void LOG_TEXT(const char *text) {
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
     fwrite(text, 1, strlen(text), log_file);
 }
 void LOG_FIELD(char* field_name, char* c, ...){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	if(current_field_num > 0){
 		LOG_TEXT(", ");
 	}
@@ -587,6 +595,9 @@ void LOG_FIELD(char* field_name, char* c, ...){
 	current_field_num++;
 }
 void LOG_OBJ_START(){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	if(log_array_items > 0){
 		LOG_TEXT(",\n");
 	}
@@ -598,10 +609,16 @@ void LOG_OBJ_START(){
 	LOG_FIELD("timestamp_us", "%"PRId64, get_timestamp_us());
 }
 void LOG_OBJ_END(){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	LOG_TEXT("}");
 }
 
 void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	struct tcp_segment* tcp = (struct tcp_segment*) segment_buf;
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"PKT\"");
@@ -634,7 +651,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		char* str = malloc(payload_length + 1);
 		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
 		str[payload_length] = 0;
-		for(int i=0; i<strlen(str); i++){
+		for(int i=0; i<payload_length; i++){
 			if(( !(str[i] >= 'A' && str[i] <= 'Z') && !(str[i] >= 'a' && str[i] <= 'z') && !(str[i] >= '0' && str[i] <= '9') && !(str[i] == '/'||str[i] == '.'||str[i] == ':'))){
 				str[i] = ' ';
 			}
@@ -654,12 +671,18 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 	LOG_OBJ_END();
 }
 void LOG_RTT(double rtt_sec){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"RTT\"");
 	LOG_FIELD("value_s", "%f", rtt_sec);
 	LOG_OBJ_END();
 }
 void LOG_RTO(long long rto_ticks){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"RTO\"");
 	LOG_FIELD("value_ticks", "%lld", rto_ticks);
@@ -667,6 +690,9 @@ void LOG_RTO(long long rto_ticks){
 	LOG_OBJ_END();
 }
 void LOG_CONGCTRL(struct tcpctrlblk* tcb){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"CNG\"");
 	LOG_FIELD("state", "%u", tcb->cong_st);
@@ -677,6 +703,9 @@ void LOG_CONGCTRL(struct tcpctrlblk* tcb){
 	LOG_OBJ_END();
 }
 void LOG_SCHEDULER_BYTES(int sid, int available, int flow, int congestion){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	congestion = MAX(0, congestion);
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"SCB\"");
@@ -705,6 +734,9 @@ void LOG_SCHEDULER_BYTES(int sid, int available, int flow, int congestion){
 	LOG_OBJ_END();
 }
 void LOG_MESSAGE(char* msg){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	LOG_OBJ_START();
 	LOG_FIELD("type", "\"MSG\"");
 	LOG_FIELD("text", "\"%s\"", msg);
@@ -712,6 +744,9 @@ void LOG_MESSAGE(char* msg){
 }
 
 void LOG_START(){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	char* filename;
 	char* text;
 	if(MAIN_MODE == CLIENT){
@@ -730,6 +765,9 @@ void LOG_START(){
 	LOG_MESSAGE("Program start");
 }
 void LOG_END(){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	if(log_file == NULL){
 		// Prevents issues when the end function is called more than one time
 		return;
@@ -1181,11 +1219,13 @@ double sample_uniform_0_1(){
 	return (double)prng_state / 4294967296.0;
 }
 bool drop_packet(struct tcp_segment* tcp){
+	#if UPLINK_DROP_PROB > 0 || DOWNLINK_DROP_PROB > 0
 	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
 	double sample = sample_uniform_0_1();
 	if(sample < relevant_drop_prob){
 		return true;
 	}
+	#endif
 
 	#ifdef STREAM_DROP_ENABLED
 	if(sizeof(DROP_TARGET_STREAMS) > 0){
@@ -1252,6 +1292,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	st:
 	;
 	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
+	/*
 	if (t == -1) {
 		if(errno == EMSGSIZE){
 			ERROR("EMSGSIZE");
@@ -1273,6 +1314,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	if(attempts > 0){
 		DEBUG("sendto ok after EAGAIN!");
 	}
+	*/
 }
 #pragma endregion RAW_SOCKET_ACCESS
 
@@ -2031,8 +2073,12 @@ unsigned short get_free_port(){
 }
 
 int mybind(int s, struct sockaddr * addr, int addrlen){
-	if((addr->sa_family != AF_INET)){
-		myerrno = EINVAL; 
+	if (addrlen < sizeof(struct sockaddr_in)) {
+		myerrno = EINVAL;
+		return -1;
+	}
+	if(addr->sa_family != AF_INET){
+		myerrno = EINVAL;
 		return -1;
 	}
 	if(s < 3 || s >= MAX_FD){
@@ -2053,7 +2099,7 @@ int mybind(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EADDRINUSE; // mytcp: ENOMEM 
 		return -1;
 	}
-	fdinfo[s].l_addr = (a->sin_addr.s_addr) ? a->sin_addr.s_addr : *(unsigned int*)myip;
+	memcpy(&fdinfo[s].l_addr, myip, sizeof(fdinfo[s].l_addr));
 	fdinfo[s].st = FDINFO_ST_BOUND;
 	myerrno = 0;
 	return 0;
@@ -2102,12 +2148,12 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 		*/
 		if(!MS_ENABLED){
 			if(fdinfo[s].st == FDINFO_ST_UNBOUND){
-				struct sockaddr_in local;
+				struct sockaddr_in local = {0};
 				local.sin_port=htons(0);
 				local.sin_addr.s_addr = htonl(0);
 				local.sin_family = AF_INET;
 				if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
-					myperror("implicit binding failed\n"); 
+					myperror("implicit binding failed"); 
 					return -1;
 				}
 			}
@@ -2294,12 +2340,12 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				}
 
 				// No such connection exists: bind to a new port and open a new connection
-				struct sockaddr_in local;
+				struct sockaddr_in local = {0};
 				local.sin_port=htons(0);
 				local.sin_addr.s_addr = htonl(0);
 				local.sin_family = AF_INET;
 				if(-1 == mybind(s,(struct sockaddr *) &local, sizeof(struct sockaddr_in)))	{
-					myperror("implicit binding failed\n"); 
+					myperror("implicit binding failed"); 
 					return -1;
 				}
 			}
@@ -2921,6 +2967,8 @@ int mylisten(int s, int bl){
 	fdinfo[s].stream_backlog_head.tcb = NULL;
 	fdinfo[s].stream_backlog_head.sid = -1;
 	fdinfo[s].stream_backlog_head.next = NULL;
+	myerrno = 0;
+	return 0;
 }
 
 int myaccept(int s, struct sockaddr* addr, int * len){
