@@ -93,7 +93,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define TIMER_USECS 500
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
-#define MAX_FD 1024 // File descriptors go from 3 (included) up to this value (excluded)
+#define MAX_FD 10 // File descriptors go from 3 (included) up to this value (excluded)
 #define L2_RX_BUF_SIZE 30000
 #define MIN_TIMEOUT_MSEC 300
 #define MIN_TIMEOUT (MIN_TIMEOUT_MSEC * 1000 / TIMER_USECS)
@@ -3105,11 +3105,28 @@ int mywrite(int s, uint8_t * buffer, int maxlen){
 	}
 	
 	disable_signal_reception(false);
+
+	/*
 	for(int byte_num = 0; byte_num < actual_len; byte_num++){
 		fdinfo[s].tcb->stream_tx_buffer[sid][fdinfo[s].tcb->tx_buffer_occupied_region_end[sid]] = buffer[byte_num];
 		fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] = (fdinfo[s].tcb->tx_buffer_occupied_region_end[sid] + 1) % TX_BUFFER_SIZE;
 		fdinfo[s].tcb->txfree[sid]--;
 	}
+	*/
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	int write_pos = tcb->tx_buffer_occupied_region_end[sid];
+	unsigned int bytes_to_end = TX_BUFFER_SIZE - write_pos;
+	int first_chunk = actual_len;
+	int second_chunk = 0;
+	if(first_chunk > bytes_to_end){
+		second_chunk = first_chunk - bytes_to_end;
+		first_chunk -= second_chunk;
+	}
+	memcpy(tcb->stream_tx_buffer[sid] + write_pos, buffer, first_chunk);
+	memcpy(tcb->stream_tx_buffer[sid], buffer + first_chunk, second_chunk);
+	tcb->tx_buffer_occupied_region_end[sid] = (write_pos + actual_len) % TX_BUFFER_SIZE;
+	fdinfo[s].tcb->txfree[sid] -= actual_len;
+
 	scheduler(s);
 	enable_signal_reception(false);
 	return actual_len;
