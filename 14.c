@@ -424,6 +424,7 @@ int mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
 int myaccept_mode = MYACCEPT_MODE_NON_BLOCKING;
 int myconnect_mode = MYCONNECT_MODE_NON_BLOCKING;
 
+struct timespec short_sleep = {0, 1000}; // 0 seconds, 1000 nanoseconds (1 microsecond)
 
 unsigned char myip[4];
 unsigned char mymac[6];
@@ -1464,6 +1465,8 @@ void update_SACK_option(struct tcpctrlblk* tcb, uint8_t* opt_bytes){
 }
 
 
+/*
+// Original version
 uint16_t compl1(uint8_t* b, int len){
 	uint16_t total = 0;
 	uint16_t prev = 0;
@@ -1482,6 +1485,53 @@ uint16_t compl1(uint8_t* b, int len){
 	} 
 	return total;
 }
+*/
+// https://claude.ai/share/b75539fb-d961-49ea-8ac8-b84ba0bac2fe
+// Optimization 4: Combined optimizations with alignment check
+uint16_t compl1(uint8_t* b, int len) {
+    uint32_t total = 0;
+    
+    // Check if buffer is aligned for 16-bit access
+    if ((uintptr_t)b & 1) {
+        // Unaligned - process byte by byte
+        for (int i = 0; i < len - 1; i += 2) {
+            total += (b[i] << 8) + b[i+1];
+        }
+        if (len & 1) {
+            total += b[len-1] << 8;
+        }
+    } else {
+        // Aligned - can safely cast to uint16_t*
+        uint16_t *p = (uint16_t*)b;
+        int words = len / 2;
+        
+        // Unrolled loop for better performance
+        int i;
+        for (i = 0; i < words - 3; i += 4) {
+            total += ntohs(p[i]);
+            total += ntohs(p[i+1]);
+            total += ntohs(p[i+2]);
+            total += ntohs(p[i+3]);
+        }
+        
+        for (; i < words; i++) {
+            total += ntohs(p[i]);
+        }
+        
+        // Handle odd byte
+        if (len & 1) {
+            total += b[len-1] << 8;
+        }
+    }
+    
+    // Fold all carries
+    while (total >> 16) {
+        total = (total & 0xFFFF) + (total >> 16);
+    }
+    
+    return (uint16_t)total;
+}
+
 unsigned short int tcp_checksum(uint8_t* b1, int len1, uint8_t* b2, int len2){
 	uint16_t prev, total;
 	prev = compl1(b1,len1); 
@@ -1953,6 +2003,13 @@ void circular_start_scheduler(int s){
 			// We can transmit some more data on the stream
 			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
 
+			int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
+			if((available_bytes == 0 || cong_control_allowed_bytes == 0) && tcb->write_side_close_state[sid] != WR_CLOSE_ST_LSS_REQUESTED){
+				// We can do nothing for this stream
+				// we cannot send data, and we cannot enqueue the LSS(/FIN), so we skip it
+				continue;
+			}
+
 			/* FLOW CONTROL START */
 			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
 			bool small_in_flight = false;
@@ -1970,7 +2027,6 @@ void circular_start_scheduler(int s){
 			if(flow_control_allowed_bytes < 0){
 				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
 			}
-			int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
 
 			int allowed_bytes = MIN(flow_control_allowed_bytes, cong_control_allowed_bytes);
 			int current_transfer_bytes = MIN(available_bytes, allowed_bytes);
@@ -1982,12 +2038,26 @@ void circular_start_scheduler(int s){
 				if(payload_length < max_payload_length && small_in_flight){
 					break;
 				}
+
+				/*
 				for(int i=0; i<payload_length; i++){
 					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
 					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
 					tcb->txfree[sid]++;
 					current_transfer_bytes--;
 				}
+				*/
+				int first_chunk = payload_length, second_chunk = 0;
+				if(first_chunk > (TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid])){
+					second_chunk = first_chunk -(TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid]);
+					first_chunk -= second_chunk;
+				}
+				memcpy(temp_payload_buf, tcb->stream_tx_buffer[sid] + tcb->tx_buffer_occupied_region_start[sid], first_chunk);
+				memcpy(temp_payload_buf + first_chunk, tcb->stream_tx_buffer[sid], second_chunk);
+				tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid] + payload_length) % TX_BUFFER_SIZE;
+				tcb->txfree[sid] += payload_length;
+				current_transfer_bytes -= payload_length;
+
 				if(!tcb->ms_option_enabled){
 					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 				}else{
@@ -2987,19 +3057,27 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 	}
 	struct sockaddr_in * a = (struct sockaddr_in *) addr;
   	*len = sizeof(struct sockaddr_in);
+	if(myaccept_mode == MYACCEPT_MODE_NON_BLOCKING && fdinfo[s].ready_streams == 0){
+		// Early return to avoid useless signal lock in while(true) polling loop
+		// Hopefully this doesn't cause race condition issues...
+		myerrno = EAGAIN;
+		return -1;
+	}
 	do{
 		disable_signal_reception(false);
 	
 		if(fdinfo[s].ready_streams == 0){
-			/*
-			"Within a do or a while statement, the next iteration starts by reevaluating the expression of the do or while statement."
-			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
-			*/
 			enable_signal_reception(false);
+
 			if(myaccept_mode == MYACCEPT_MODE_NON_BLOCKING){
 				myerrno = EAGAIN;
 				return -1;
 			}
+
+			/*
+			"Within a do or a while statement, the next iteration starts by reevaluating the expression of the do or while statement."
+			https://learn.microsoft.com/en-us/cpp/c-language/continue-statement-c?view=msvc-170
+			*/
 			continue;
 		}
 		
@@ -3163,6 +3241,12 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	if(tcb->lss_consumed[sid]){
 		DEBUG("LSS already consumed, return 0");
 		return 0;
+	}
+	if(myread_mode == MYREAD_MODE_NON_BLOCKING && tcb->stream_rx_queue[sid] == NULL){
+		// Early return to avoid the signal locks
+		// Hopefully this doesn't cause any race condition issues...
+		myerrno = EAGAIN;
+		return -1;
 	}
 	disable_signal_reception(false);
 	while(tcb->stream_rx_queue[sid] == NULL || (tcb->stream_rx_queue[sid]->dummy_payload && !tcb->stream_rx_queue[sid]->lss)){
@@ -4120,6 +4204,7 @@ void main_client_app(){
 			//DEBUG(data);
 			break;
 		}
+		nanosleep(&short_sleep, NULL); 
 	}
 	free(data);
 	DEBUG("Starting the measurement");
@@ -4313,6 +4398,7 @@ void main_client_app(){
 				}
 			}
 		}
+		nanosleep(&short_sleep, NULL);
 	}
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
@@ -4699,6 +4785,7 @@ void full_duplex_server_app(int listening_socket){
 				cur++;
 			}
 		}
+		nanosleep(&short_sleep, NULL); 
 	}
 	DEBUG("SERVER - ALL STOPPED");
 	DEBUG("wait...");
