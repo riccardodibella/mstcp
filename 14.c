@@ -25,7 +25,8 @@
 
 /* DEFINE MACROS */
 
-#define NOLOGS
+//#define NOLOGS
+#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -48,7 +49,7 @@
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_REQUESTS 10
+#define NUM_CLIENT_REQUESTS 2
 #endif
 
 #define RESP_PAYLOAD_BYTES 1000000
@@ -93,7 +94,13 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define TIMER_USECS 500
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
+
+#ifdef NUM_CLIENTS
+#define MAX_FD 4 + NUM_CLIENTS // File descriptors go from 3 (included) up to this value (excluded)
+#else
 #define MAX_FD 10 // File descriptors go from 3 (included) up to this value (excluded)
+#endif
+
 #define L2_RX_BUF_SIZE 30000
 #define MIN_TIMEOUT_MSEC 300
 #define MIN_TIMEOUT (MIN_TIMEOUT_MSEC * 1000 / TIMER_USECS)
@@ -648,6 +655,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		LOG_FIELD("sid", "%d", (tcp->payload[ms_index+2]>>2) & 0x1F);
 		LOG_FIELD("ssn", "%d", (( tcp->payload[ms_index+2] & 0x3) << 8 ) | (tcp->payload[ms_index+3]));
 	}
+	#ifndef SHORTLOGS
 	if(payload_length > 0 && !dmp){
 		char* str = malloc(payload_length + 1);
 		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
@@ -660,6 +668,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		LOG_FIELD("payload_str", "\"%s\"", str);
 		free(str);
 	}
+	#endif
 	int ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
 	if(ts_index>=0){
 		uint32_t ts_val = ntohl(*(uint32_t*) (tcp->payload+ts_index+2));
@@ -4204,7 +4213,7 @@ void main_client_app(){
 			//DEBUG(data);
 			break;
 		}
-		nanosleep(&short_sleep, NULL); 
+		//nanosleep(&short_sleep, NULL); 
 	}
 	free(data);
 	DEBUG("Starting the measurement");
@@ -4398,7 +4407,7 @@ void main_client_app(){
 				}
 			}
 		}
-		nanosleep(&short_sleep, NULL);
+		//nanosleep(&short_sleep, NULL);
 	}
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
@@ -4785,7 +4794,7 @@ void full_duplex_server_app(int listening_socket){
 				cur++;
 			}
 		}
-		nanosleep(&short_sleep, NULL); 
+		//nanosleep(&short_sleep, NULL); 
 	}
 	DEBUG("SERVER - ALL STOPPED");
 	DEBUG("wait...");
