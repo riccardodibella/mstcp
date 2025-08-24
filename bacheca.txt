@@ -244,3 +244,4 @@ Problemi di MYTCP:
 - In port_in_use manca htons per il confronto della porta, il parametro è host order ma nel tcb è network order
 - L'utilizzo della sequenza del primo segmento nella tx queue come shifter sembra sbagliato, andrebbe controllato meglio
 - Quando si attiva Fast Retransmit, non vengono azzerati i timeout da quel segmento in poi
+- In congctrl_fsm non viene azzerato repeated_acks se il segmento non è un dupACK

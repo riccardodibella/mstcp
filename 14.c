@@ -48,17 +48,17 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS 1
-#define NUM_CLIENT_REQUESTS 100
+#define NUM_CLIENTS 32
+#define NUM_CLIENT_REQUESTS 1000
 #endif
 
-#define RESP_PAYLOAD_BYTES 1000000
+#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
 
 #define UPLINK_DROP_PROB 0
-#define DOWNLINK_DROP_PROB 1E-5
+#define DOWNLINK_DROP_PROB 0
 
 
 //#define STREAM_DROP_ENABLED
@@ -1793,6 +1793,8 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				tcb->lta = 0;
 				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
 					tcb->repeated_acks++;
+				}else{
+					tcb->repeated_acks = 0;
 				}
 				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
 				if((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2)){
@@ -3798,7 +3800,7 @@ void myio(int ignored){
 					}
 				}
 
-				bool in_order_for_channel = false; // Updated later in the code
+				bool in_order_for_channel = true; // Updated later in the code
 
 				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
 				if(channel_offset >= tcb->cumulativeack){
@@ -3851,6 +3853,8 @@ void myio(int ignored){
 					// if newrx == NULL the packet was a duplicate of an out-of-order packet
 					if(newrx != NULL){
 						// new node has been inserted in the channel queue
+
+						//in_order_for_channel = false;
 
 						if(tcb->ms_option_enabled){
 							bool newrx_in_order_for_stream = true;
@@ -4139,6 +4143,26 @@ void mytimer(int ignored){
 }
 
 
+void* safe_malloc(size_t sz){
+	disable_signal_reception(false);
+	void* ret = malloc(sz);
+	if(ret == NULL){
+		perror("malloc");
+		ERROR("safe_malloc %u failed", sz);
+	}
+	enable_signal_reception(false);
+	return ret;
+}
+
+void safe_free(void* ptr){
+	disable_signal_reception(false);
+	if(ptr == NULL){
+		ERROR("safe_free NULL param");
+	}
+	free(ptr);
+	enable_signal_reception(false);
+}
+
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 enum client_state{
@@ -4171,7 +4195,7 @@ void main_client_app(){
 		myperror("myconnect");
 		exit(EXIT_FAILURE);
 	}
-	char* data = malloc(RESP_BUF_SIZE); // both req and resp
+	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
 	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
@@ -4225,7 +4249,7 @@ void main_client_app(){
 		}
 		//nanosleep(&short_sleep, NULL); 
 	}
-	free(data);
+	safe_free(data);
 	DEBUG("Starting the measurement");
 	int64_t meas_start = get_timestamp_ms();
 
@@ -4253,7 +4277,7 @@ void main_client_app(){
 	client_connected[0] = true;
 	client_active[0] = true;
 	cl_st[0] = CLIENT_ST_IDLE;
-	client_buffer[0] = malloc(RESP_BUF_SIZE);
+	client_buffer[0] = safe_malloc(RESP_BUF_SIZE);
 	
 	for(int i=1; i<NUM_CLIENTS; i++){
 		s = mysocket(AF_INET,SOCK_STREAM,0);
@@ -4294,7 +4318,7 @@ void main_client_app(){
 			client_connected[i] = true;
 			client_active[i] = true;
 			cl_st[i] = CLIENT_ST_IDLE;
-			client_buffer[i] = malloc(RESP_BUF_SIZE);
+			client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
 		}
 
 		uint32_t rand_i_base = sample_uint32() % NUM_CLIENTS;
@@ -4413,7 +4437,7 @@ void main_client_app(){
 				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 					myclose(client_sockets[i]);
 					client_active[i] = false;
-					free(client_buffer[i]);
+					safe_free(client_buffer[i]);
 				}
 			}
 		}
@@ -4716,13 +4740,13 @@ void full_duplex_server_app(int listening_socket){
 		int new_client_socket = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
 		if(new_client_socket >= 0){
 			//DEBUG("myaccept client %d", num_clients);
-			struct single_srv_data* new_arr = malloc(sizeof(struct single_srv_data)*(num_clients+1));
+			struct single_srv_data* new_arr = safe_malloc(sizeof(struct single_srv_data)*(num_clients+1));
 			if((num_clients == 0) != (clients == NULL)){
 				ERROR("full_duplex_server_app invalid state num_clients client_sockets");
 			}
 			if(clients != NULL){
 				memcpy(new_arr, clients, sizeof(struct single_srv_data)*num_clients);
-				free(clients);
+				safe_free(clients);
 			}
 			clients = new_arr;
 			memset(&clients[num_clients], 0, sizeof(clients[num_clients]));
