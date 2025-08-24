@@ -49,7 +49,7 @@
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 1
-#define NUM_CLIENT_REQUESTS 2
+#define NUM_CLIENT_REQUESTS 100
 #endif
 
 #define RESP_PAYLOAD_BYTES 1000000
@@ -58,7 +58,7 @@
 
 
 #define UPLINK_DROP_PROB 0
-#define DOWNLINK_DROP_PROB 0
+#define DOWNLINK_DROP_PROB 1E-5
 
 
 //#define STREAM_DROP_ENABLED
@@ -1229,7 +1229,7 @@ double sample_uniform_0_1(){
 	return (double)prng_state / 4294967296.0;
 }
 bool drop_packet(struct tcp_segment* tcp){
-	#if UPLINK_DROP_PROB > 0 || DOWNLINK_DROP_PROB > 0
+	#if defined(UPLINK_DROP_PROB) || defined(DOWNLINK_DROP_PROB)
 	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
 	double sample = sample_uniform_0_1();
 	if(sample < relevant_drop_prob){
@@ -1827,6 +1827,13 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						unsigned int shifter = MIN(htonl(tcb->txfirst->segment->seq),htonl(tcb->txfirst->segment->ack));
 						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
 							tcb->txfirst->txtime = 0; //immediate retransmission
+
+							// We avoid having timeouts for segments that are not retransmitted
+							struct txcontrolbuf* cursor = tcb->txfirst->next;
+							while(cursor != NULL){
+								cursor->txtime = tick;
+								cursor = cursor->next;
+							}
 						}
 						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
@@ -3791,6 +3798,8 @@ void myio(int ignored){
 					}
 				}
 
+				bool in_order_for_channel = false; // Updated later in the code
+
 				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
@@ -3905,14 +3914,13 @@ void myio(int ignored){
 									// Now cursor is the next node in the channel RX queue referring to this stream, or NULL if there are no more segments for this stream
 								}
 							}
-						}/*else{
-							// Insertion in stream queue for non-MS connections
-							ERROR("TODO insert in RX stream buffer non-MS");
-						}*/
+						}
 
 						// Removal of in-order segments at the beginning of the channel RX queue
 						while((tcb->unack != NULL) && (tcb->unack->channel_offset == tcb->cumulativeack)){
-							//DEBUG("while channel_offset %u", newrx->channel_offset);
+							
+							in_order_for_channel = true; // I am removing something from the tx queue, so the incoming segment was in order for the channel
+
 							if(tcb->ms_option_enabled){
 								if(tcb->unack->segment != NULL){
 									DEBUG("Last received packet before error:");
@@ -3969,15 +3977,17 @@ void myio(int ignored){
 				}
 
 				if(!tcb->ms_option_enabled){
-					if(tcb->txfirst==NULL){
-						// Generate an ACK without MS Option
-						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-						fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-					}
+					//if(tcb->txfirst==NULL){
+					
+					// Generate an ACK without MS Option
+					//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+
+					//}
 				}else{
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-						if(!dummy_payload){
+						if(!dummy_payload && in_order_for_channel){
 							// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
 							int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -4080,7 +4090,7 @@ void mytimer(int ignored){
 				if(!txcb->dummy_payload){
 					tcb->flightsize += txcb->payloadlen;
 				}
-			} else if(txcb->txtime+tcb->timeout > tick){
+			} else if(txcb->txtime != 0 && txcb->txtime+tcb->timeout > tick){
 				acc += txcb->payloadlen;
 				txcb = txcb->next;
 				continue;
