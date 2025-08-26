@@ -26,17 +26,19 @@
 /* DEFINE MACROS */
 
 //#define NOLOGS
-#define SHORTLOGS
+//#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
 
+#define RESP_PAYLOAD_BYTES 100000
+
 #define CL_MAIN_PARALLEL 1
 #define CL_MAIN_SERIAL_BLOCKING 2
 #define CL_MAIN_AGGREGATE 3
 
-#define CL_MAIN CL_MAIN_AGGREGATE
+#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -44,7 +46,9 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
-#define NUM_CLIENT_REQUESTS 10
+#define NUM_CLIENT_REQUESTS 100
+int num_req_arr[] = {1, 2, 3, 4, 5, 10, 20, 30, 40, 50};
+int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
@@ -52,7 +56,6 @@
 #define NUM_CLIENT_REQUESTS 1000
 #endif
 
-#define RESP_PAYLOAD_BYTES 10000
 #define REQ_BUF_SIZE 100
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
@@ -69,12 +72,20 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #endif
 
 
-#define MS_ENABLED true
+
 #define CLIENT 0
 #define SERVER 1
 #ifndef MAIN_MODE // Compile with -DMAIN_MODE=CLIENT or -DMAIN_MODE=SERVER
 #define MAIN_MODE CLIENT
 #endif
+
+#define MS_ENABLED true
+
+#if MAIN_MODE == SERVER
+#undef MS_ENABLED
+#define MS_ENABLED true
+#endif
+
 #define MYREAD_MODE_BLOCKING 1
 #define MYREAD_MODE_NON_BLOCKING 2
 #define MYWRITE_MODE_BLOCKING 1
@@ -95,11 +106,23 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
 
+
 #ifdef NUM_CLIENTS
+
 #define MAX_FD 4 + NUM_CLIENTS // File descriptors go from 3 (included) up to this value (excluded)
+
 #else
+#if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
+
+#define MAX_FD 10 + NUM_CLIENT_REQUESTS
+
+#else
+
 #define MAX_FD 10 // File descriptors go from 3 (included) up to this value (excluded)
+
 #endif
+#endif
+
 
 #define L2_RX_BUF_SIZE 30000
 #define MIN_TIMEOUT_MSEC 300
@@ -444,7 +467,7 @@ unsigned char gateway[4];
 
 int unique_raw_socket_fd = -1; // mytcp: unique_s
 
-int last_port=MIN_PORT; // Last assigned port during bind()
+int last_port = MIN_PORT; // Last assigned port during bind()
 
 int myerrno;
 
@@ -2151,10 +2174,12 @@ unsigned short get_free_port(){
 	unsigned short p;
 	for(p = last_port; p<MAX_PORT && port_in_use(p); p++);
 	if(p<MAX_PORT){
+		//DEBUG("get_free_port %d", p);
 		return last_port=p;
 	}
 	for( p = MIN_PORT; p<last_port && port_in_use(p); p++);
 	if (p<last_port){
+		//DEBUG("get_free_port %d", p);
 		return last_port=p;
 	}
 	return 0;
@@ -4467,7 +4492,16 @@ void main_client_app(){
 	myread_mode = MYREAD_MODE_BLOCKING;
 	mywrite_mode = MYWRITE_MODE_BLOCKING;
 	myconnect_mode = MYCONNECT_MODE_BLOCKING;
-	for(int num_req = 0; num_req < NUM_CLIENT_REQUESTS; num_req++){
+
+	int test_num_requests = num_req_arr[sample_uint32() % (sizeof(num_req_arr)/sizeof(num_req_arr[0]))];
+	int test_num_bytes = payload_size_arr[sample_uint32() % (sizeof(payload_size_arr)/sizeof(payload_size_arr[0]))];
+
+	long ul_sum = 0, dl_sum = 0;
+	DEBUG("Starting the measurement");
+	int64_t meas_start = get_timestamp_ms();
+
+
+	for(int num_req = 0; num_req < test_num_requests; num_req++){
 		int ret;
 		int s = mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){
@@ -4483,7 +4517,7 @@ void main_client_app(){
 			myperror("myconnect");
 			exit(EXIT_FAILURE);
 		}
-		int expected_payload_bytes = RESP_PAYLOAD_BYTES;
+		int expected_payload_bytes = test_num_bytes;
 		char data[RESP_BUF_SIZE]; // both req and resp
 		sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", expected_payload_bytes, num_req, num_req);
 		int sent = 0, missing = strlen(data);
@@ -4495,6 +4529,8 @@ void main_client_app(){
 			}
 			sent += ret;
 			missing -= ret;
+
+			ul_sum += ret;
 		}
 
 		memset(data, 0, sizeof(data));
@@ -4512,6 +4548,7 @@ void main_client_app(){
 				exit(EXIT_FAILURE);
 			}
 			recv_bytes += ret;
+			dl_sum += ret;
 			if(content_length < 0){
 				char* end_of_headers_substr = strstr(data, "\r\n\r\n");
 				if(end_of_headers_substr != NULL){
@@ -4538,7 +4575,13 @@ void main_client_app(){
 			}
 		}
 	}
+	int64_t meas_end = get_timestamp_ms();
+	int64_t meas_dur = meas_end - meas_start;
+
 	DEBUG("all requests completed :)");
+	DEBUG("########################### Statitics ###########################");
+	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
+	DEBUG("#################################################################");
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
@@ -4775,7 +4818,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					//DEBUG(clients[i].req_arr);
+					DEBUG(clients[i].req_arr);
 
 					clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
 					clients[i].current_resp_bytes = 0;
@@ -4888,6 +4931,9 @@ int main(){
 		perror("setitimer"); 
 		return EXIT_FAILURE;
 	}
+
+	last_port = MIN_PORT + sample_uint32() % (MAX_PORT - MIN_PORT);
+	//DEBUG("last_port %d", last_port);
 	
 	DEBUG("Startup OK");
 
