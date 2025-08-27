@@ -4,7 +4,12 @@ echo "$(date '+%d/%m/%Y %H:%M:%S')"
 if [[ "$1" == "--local" ]]; then
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out
 else
+    if [[ "$1" == "--serial_test" ]]; then
+    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=true -o client_ms.out
+    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=false -o client_tcp.out
+    else
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -o client.out
+    fi
 fi
 # https://chatgpt.com/share/68971012-0f38-8007-afae-7fdf7c85a6a2
 if [[ $? -ne 0 ]]; then

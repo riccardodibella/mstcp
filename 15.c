@@ -46,9 +46,15 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
-#define NUM_CLIENT_REQUESTS 100
-int num_req_arr[] = {1, 2, 3, 4, 5, 10, 20, 30, 40, 50};
+#define NUM_CLIENT_REQUESTS 10
+/*
+int num_req_arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
+*/
+int num_req_arr[] = {1, 2, 4, 6, 8, 10};
+int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
+#undef RESP_PAYLOAD_BYTES
+#define RESP_PAYLOAD_BYTES 20000
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
@@ -79,7 +85,9 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define MAIN_MODE CLIENT
 #endif
 
+#ifndef MS_ENABLED
 #define MS_ENABLED true
+#endif
 
 #if MAIN_MODE == SERVER
 #undef MS_ENABLED
@@ -144,7 +152,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 
 #define TCP_PROTO 6 // protocol field inside IP header
 
-#define TCP_MSS 1460
+#define TCP_MSS 1260
 //#define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
@@ -2170,6 +2178,7 @@ bool port_in_use(unsigned short port){
 	return false;
 }
 
+/*
 unsigned short get_free_port(){
 	unsigned short p;
 	for(p = last_port; p<MAX_PORT && port_in_use(p); p++);
@@ -2183,6 +2192,57 @@ unsigned short get_free_port(){
 		return last_port=p;
 	}
 	return 0;
+}
+*/
+
+// https://claude.ai/share/a071ff4c-b4ba-4443-9a5b-5bf0a334de18
+unsigned short get_free_port(){
+    unsigned short p;
+    FILE *file;
+    
+    // Try to read from last_port.txt
+    file = fopen("last_port.txt", "r");
+    if (file != NULL) {
+        // File exists, read the value
+        if (fscanf(file, "%hu", &p) == 1) {
+            fclose(file);
+            
+            // Increment the port number
+			if(p < MIN_PORT){
+				p = MIN_PORT + sample_uint32() % (MAX_PORT - MIN_PORT);
+			}
+            p++;
+			if(p >= MAX_PORT){
+				p = MIN_PORT;
+			}
+            
+            // Write the incremented value back to the file
+            file = fopen("last_port.txt", "w");
+            if (file != NULL) {
+                fprintf(file, "%hu", p);
+                fclose(file);
+				//DEBUG("file %d", p);
+                return p;
+            }
+            // If we can't write back, fall through to legacy behavior
+        } else {
+            fclose(file);
+            // File exists but couldn't read valid data, fall through to legacy
+        }
+    }
+    
+    // File doesn't exist or couldn't be read/written - use legacy behavior
+    for(p = last_port; p < MAX_PORT && port_in_use(p); p++);
+    if(p < MAX_PORT){
+        //DEBUG("global %d", p);
+        return last_port = p;
+    }
+    for(p = MIN_PORT; p < last_port && port_in_use(p); p++);
+    if (p < last_port){
+        //DEBUG("global %d", p);
+        return last_port = p;
+    }
+    return 0;
 }
 
 int mybind(int s, struct sockaddr * addr, int addrlen){
@@ -4495,9 +4555,10 @@ void main_client_app(){
 
 	int test_num_requests = num_req_arr[sample_uint32() % (sizeof(num_req_arr)/sizeof(num_req_arr[0]))];
 	int test_num_bytes = payload_size_arr[sample_uint32() % (sizeof(payload_size_arr)/sizeof(payload_size_arr[0]))];
+	//DEBUG("%d %d", test_num_requests, test_num_bytes);
 
 	long ul_sum = 0, dl_sum = 0;
-	DEBUG("Starting the measurement");
+	//DEBUG("Starting the measurement");
 	int64_t meas_start = get_timestamp_ms();
 
 
@@ -4578,13 +4639,16 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
+	/*
 	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	DEBUG("wait...");
-	persistent_nanosleep(2, 0);
-	DEBUG("main_client_app end");
+	*/
+	printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
+	//persistent_nanosleep(2, 0);
+	//DEBUG("main_client_app end");
 }
 #endif
 
@@ -4933,9 +4997,6 @@ int main(){
 	}
 
 	last_port = MIN_PORT + sample_uint32() % (MAX_PORT - MIN_PORT);
-	//DEBUG("last_port %d", last_port);
-	
-	DEBUG("Startup OK");
 
 	if(MAIN_MODE == CLIENT){
 		main_client_app();
