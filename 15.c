@@ -25,7 +25,7 @@
 
 /* DEFINE MACROS */
 
-//#define NOLOGS
+#define NOLOGS
 //#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
@@ -51,10 +51,14 @@
 int num_req_arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
 */
+/*
 int num_req_arr[] = {1, 2, 4, 6, 8, 10};
 int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
+*/
+int num_req_arr[] = {1, 2, 4, 6, 8, 10};
+int payload_size_arr[] = {10/*,10000*/};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 20000
+#define RESP_PAYLOAD_BYTES 10
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE

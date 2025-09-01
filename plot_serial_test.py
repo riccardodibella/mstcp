@@ -8,6 +8,31 @@ matplotlib.use('TkAgg')  # Ensures GUI backend
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL) # https://stackoverflow.com/a/75864329
 
+
+def filter_outliers(values: pd.Series) -> pd.Series:
+   return values
+   """Remove outliers using IQR method, only if outliers are detected."""
+   if len(values) < 4:
+       return values
+   
+   Q1 = values.quantile(0.25)
+   Q3 = values.quantile(0.75)
+   IQR = Q3 - Q1
+   
+   # If IQR is 0 (all values very similar), no outliers to remove
+   if IQR == 0:
+       return values
+   
+   lower_bound = Q1 - 1.5 * IQR
+   upper_bound = Q3 + 1.5 * IQR
+   
+   # Only filter if there are actual outliers
+   outliers_exist = (values < lower_bound).any() or (values > upper_bound).any()
+   if not outliers_exist:
+       return values
+   
+   return values[(values >= lower_bound) & (values <= upper_bound)]
+
 def create_dynamic_performance_plot():
     """
     Allows user to select a CSV, then dynamically plots performance data
@@ -47,7 +72,8 @@ def create_dynamic_performance_plot():
         return
 
     # Group and aggregate data
-    processed_df = df.groupby(['MS_ENABLED', 'payload_size', 'requests'])['time_ms'].agg(['mean', 'count']).reset_index()
+    filtered_groups = df.groupby(['MS_ENABLED', 'payload_size', 'requests'])['time_ms'].apply(filter_outliers)
+    processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'requests']).agg(['mean', 'count']).reset_index()
     processed_df.rename(columns={'mean': 'avg_time_ms'}, inplace=True)
 
     print("\n--- Data Summary ---")
