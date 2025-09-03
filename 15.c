@@ -37,8 +37,9 @@
 #define CL_MAIN_PARALLEL 1
 #define CL_MAIN_SERIAL_BLOCKING 2
 #define CL_MAIN_AGGREGATE 3
+#define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN CL_MAIN_HTML
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -64,6 +65,10 @@ int payload_size_arr[] = {10/*,10000*/};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS 32
 #define NUM_CLIENT_REQUESTS 1000
+#endif
+
+#if CL_MAIN == CL_MAIN_HTML
+#define NUM_CLIENTS 1
 #endif
 
 #define REQ_BUF_SIZE 100
@@ -4252,6 +4257,335 @@ void safe_free(void* ptr){
 	enable_signal_reception(false);
 }
 
+#if CL_MAIN == CL_MAIN_HTML
+enum client_state{
+	CLIENT_ST_IDLE = 0,
+	CLIENT_ST_REQ,
+	CLIENT_ST_RESP_H,
+	CLIENT_ST_RESP_P,
+	
+};
+int num_images;
+char** img_list = NULL;
+void parse_html(char* html, int length){
+	num_images = 0;
+	char* start_ptr = html;
+	char* found;
+	const char* const img_tag_seq = "<img ";
+	const char* const img_src_seq = "src=";
+	while((found = strcasestr(start_ptr, img_tag_seq)) != NULL){
+		num_images++;
+		start_ptr = found + strlen(img_tag_seq);
+	}
+
+	img_list = safe_malloc(num_images * sizeof(char*));
+
+	start_ptr = html;
+	int cur_img = 0;
+	while((found = strcasestr(start_ptr, img_tag_seq)) != NULL){
+		start_ptr = found + strlen(img_tag_seq);
+		found = strcasestr(start_ptr, img_src_seq);
+		found += strlen(img_src_seq);
+
+		while((*found != '\"') && (*found != '\'')){
+			found++;
+		}
+		found++; // skip first quote
+		char* img_name_start = found;
+
+		while((*found != '\"') && (*found != '\'')){
+			found++;
+		}
+		char* img_name_end = found;
+
+		int img_name_len = img_name_end - img_name_start;
+
+		img_list[cur_img] = safe_malloc(img_name_len + 1);
+		memcpy(img_list[cur_img], img_name_start, img_name_len);
+		img_list[cur_img][img_name_len] = 0;
+
+		cur_img ++;
+	}
+	
+	if(cur_img != num_images){
+		ERROR("cur_img %d != num_images %d", cur_img, num_images);
+	}
+}
+void main_client_app(){
+	myread_mode = MYREAD_MODE_BLOCKING;
+	mywrite_mode = MYWRITE_MODE_BLOCKING;
+	myconnect_mode = MYCONNECT_MODE_BLOCKING;
+
+	int ret, s;
+
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(19500);
+	addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
+
+	s = mysocket(AF_INET,SOCK_STREAM,0);
+	if(s == -1){
+		myperror("mysocket");
+		exit(EXIT_FAILURE);
+	}
+
+	ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+	if(ret < 0){
+		myperror("myconnect");
+		exit(EXIT_FAILURE);
+	}
+	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
+	sprintf(data, "GET /index.html HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
+	int sent = 0, missing = strlen(data);
+	while(missing > 0){
+		ret = mywrite(s, data+sent, missing);
+		if(ret < 0){
+			myperror("mywrite");
+			exit(EXIT_FAILURE);
+		}
+		sent += ret;
+		missing -= ret;
+	}
+	memset(data, 0, RESP_BUF_SIZE);
+	int recv_bytes = 0;
+	int content_length = -1;
+	int header_portion_length = -1;
+	while(true){
+		ret = myread(s, data+recv_bytes, (content_length < 0 ? RESP_BUF_SIZE : (header_portion_length+content_length)) - recv_bytes);
+		if(ret < 0){
+			myperror("myread");
+			exit(EXIT_FAILURE);
+		}
+		if(ret == 0){
+			myperror("unexpected read return 0");
+			exit(EXIT_FAILURE);
+		}
+		recv_bytes += ret;
+		if(content_length < 0){
+			char* end_of_headers_substr = strstr(data, "\r\n\r\n");
+			if(end_of_headers_substr != NULL){
+				header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - data;
+				content_length = RESP_PAYLOAD_BYTES;
+				char* content_length_str = strcasestr(data, "Content-Length");
+				if(content_length_str != NULL){
+					while(*content_length_str != ':'){
+						content_length_str++;
+					}
+					content_length_str++; // Skip ':
+					while(*content_length_str == ' '){
+						content_length_str++;
+					}
+
+					content_length = atoi(content_length_str);
+				}
+			}
+		}
+
+		if(content_length >= 0 && recv_bytes >= header_portion_length + content_length){
+			data[recv_bytes] = 0;
+			break;
+		}
+	}
+	parse_html(data, content_length);
+	safe_free(data);
+
+
+
+
+	myread_mode = MYREAD_MODE_NON_BLOCKING;
+	mywrite_mode = MYWRITE_MODE_NON_BLOCKING;
+	myconnect_mode = MYCONNECT_MODE_NON_BLOCKING;
+
+
+	int client_sockets[NUM_CLIENTS];
+	int completed_requests[NUM_CLIENTS] = {0};
+	int started_requests = 0;
+	bool client_connected[NUM_CLIENTS] = {false};
+	bool client_active[NUM_CLIENTS] = {false};
+	enum client_state cl_st[NUM_CLIENTS];
+	int current_request_number[NUM_CLIENTS];
+	int cur_bytes[NUM_CLIENTS]; // both for write and for read
+	char* client_buffer[NUM_CLIENTS];
+	long ul_bytes[NUM_CLIENTS] = {0};
+	long dl_bytes[NUM_CLIENTS] = {0};
+	int response_tot_bytes[NUM_CLIENTS];
+	
+	client_sockets[0] = s;
+	client_connected[0] = true;
+	client_active[0] = true;
+	cl_st[0] = CLIENT_ST_IDLE;
+	client_buffer[0] = safe_malloc(RESP_BUF_SIZE);
+	
+	for(int i=1; i<NUM_CLIENTS; i++){
+		s = mysocket(AF_INET,SOCK_STREAM,0);
+		if(s == -1){
+			myperror("mysocket");
+			exit(EXIT_FAILURE);
+		}
+		client_sockets[i] = s;
+	}
+
+	while(true){
+
+		// End main if all the clients are stopped
+		bool all_stopped = true;
+		for(int i=0; i<NUM_CLIENTS && all_stopped; i++){
+			if(!client_connected[i] || client_active[i]){
+				all_stopped = false;
+			}
+		}
+		if(all_stopped){
+			break;
+		}
+		
+		// Attempt connection for all non-connected clients
+		for(int i=0; i<NUM_CLIENTS; i++){
+			if(client_connected[i]){
+				continue;
+			}
+			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
+			if(ret == -1 && myerrno == EAGAIN){
+				myerrno = 0;
+				continue;
+			}
+			if(ret < 0){
+				myperror("myconnect");
+				exit(EXIT_FAILURE);
+			}
+			client_connected[i] = true;
+			client_active[i] = true;
+			cl_st[i] = CLIENT_ST_IDLE;
+			client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+		}
+
+		uint32_t rand_i_base = sample_uint32() % NUM_CLIENTS;
+
+		// Assign new requests to idle clients
+		for(int i_offs=0; i_offs<NUM_CLIENTS && started_requests < num_images; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+			if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
+				current_request_number[i] = started_requests;
+				started_requests++;
+				cl_st[i] = CLIENT_ST_REQ;
+				cur_bytes[i] = 0;
+			}
+		}
+
+		// Continue sending pending requests
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
+				sprintf(client_buffer[i], "GET /%s HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", img_list[current_request_number[i]], i, current_request_number[i]);
+				uint8_t* start = client_buffer[i]+cur_bytes[i];
+				int missing = strlen(client_buffer[i]) - cur_bytes[i];
+				int res = mywrite(client_sockets[i], start, missing);
+				if(res <= 0){
+					if(myerrno == EAGAIN){
+						myerrno = 0;
+						return;
+					}else{
+						myperror("mywrite");
+						ERROR("mywrite error");
+					}
+				}
+				cur_bytes[i] += res;
+				ul_bytes[i] += res;
+				if(cur_bytes[i] == strlen(client_buffer[i])){
+					cl_st[i] = CLIENT_ST_RESP_H;
+					cur_bytes[i] = 0;
+					// ...
+				}
+			}
+		}
+
+		// Read HTTP Headers
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_H){
+				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], RESP_BUF_SIZE);
+				if(ret == -1 && myerrno == EAGAIN){
+					myerrno = 0;
+					continue;
+				}
+				cur_bytes[i] += ret;
+				dl_bytes[i] += ret;
+				client_buffer[i][cur_bytes[i]] = '\0';
+
+				char* end_of_headers_substr = strstr(client_buffer[i], "\r\n\r\n"); 
+				if(end_of_headers_substr != NULL){
+					int header_portion_length = (end_of_headers_substr + strlen("\r\n\r\n")) - client_buffer[i];
+
+					int content_length = RESP_PAYLOAD_BYTES; // Assume the expected payload length by default
+
+					char* content_length_str = strcasestr(client_buffer[i], "Content-Length");
+					if(content_length_str != NULL){
+						while(*content_length_str != ':'){
+							content_length_str++;
+						}
+						content_length_str++; // Skip ':
+						while(*content_length_str == ' '){
+							content_length_str++;
+						}
+
+						content_length = atoi(content_length_str);
+					}
+					response_tot_bytes[i] = header_portion_length + content_length;
+					cl_st[i] = CLIENT_ST_RESP_P;
+				}
+			}
+		}
+
+		// Read HTTP Payload
+		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
+			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_P){
+				int missing =  response_tot_bytes[i] - cur_bytes[i];
+				if(missing == 0){
+					goto after_read;
+				}
+				if(missing < 0){
+					ERROR(".");
+				}
+				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], missing);
+				if(ret == -1 && myerrno == EAGAIN){
+					myerrno = 0;
+					continue;
+				}
+				cur_bytes[i] += ret;
+				dl_bytes[i] += ret;
+
+				after_read:
+				if(cur_bytes[i] == response_tot_bytes[i]){
+					//client_buffer[i][cur_bytes[i]] = 0;
+					//DEBUG(client_buffer[i]);
+					cur_bytes[i] = 0;
+					cl_st[i] = CLIENT_ST_IDLE;
+					completed_requests[i]++;
+				}
+			}
+		}
+
+
+
+
+		// Close all idle clients if there are no more requests to do
+		if(started_requests >= num_images){
+			for(int i=0; i<NUM_CLIENTS; i++){
+				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
+					myclose(client_sockets[i]);
+					client_active[i] = false;
+					safe_free(client_buffer[i]);
+				}
+			}
+		}
+	}
+
+	DEBUG("all requests completed :)");
+	DEBUG("wait...");
+	persistent_nanosleep(2, 0);
+	DEBUG("main_client_app end");
+}
+#endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 enum client_state{
@@ -4838,6 +5172,7 @@ struct single_srv_data{
 	char req_arr[REQ_BUF_SIZE];
 	int requested_payload_bytes;
 	int current_resp_bytes;
+	FILE* fp;
 };
 uint8_t data[RESP_BUF_SIZE];
 void full_duplex_server_app(int listening_socket){
@@ -4888,19 +5223,72 @@ void full_duplex_server_app(int listening_socket){
 				if(end_of_headers_substr != NULL){
 					DEBUG(clients[i].req_arr);
 
-					clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
+					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
+					char* str_end = requested_ptr;
+					bool all_digits = true;
+					while(*str_end != ' ' && *str_end != '?' && *str_end != '\r' && *str_end != '\n'){
+						if(*str_end < '0' || *str_end > '9'){
+							all_digits = false;
+						}
+						str_end++;
+					}
+
+					if(all_digits){
+						clients[i].requested_payload_bytes = atoi(strstr(clients[i].req_arr, "/")+1);
+						clients[i].fp = NULL;
+					}else{
+						*str_end = 0;
+						char file_path[50];
+						sprintf(file_path, "website_folder/%s", (str_end != requested_ptr) ? requested_ptr : "index.html");
+
+						clients[i].requested_payload_bytes = 0;
+
+						clients[i].fp = fopen(file_path, "r");
+						if(clients[i].fp != NULL){
+							fseek(clients[i].fp, 0, SEEK_END); // seek to end of file
+							clients[i].requested_payload_bytes = (int) ftell(clients[i].fp); // get current file pointer
+						}
+					}
+
 					clients[i].current_resp_bytes = 0;
 					clients[i].srv_st = SERVER_ST_RESP;
 				}
 			}else if(clients[i].srv_st == SERVER_ST_RESP){
 				sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
 				int end_index = strlen(data);
-				for(int j=0; j<clients[i].requested_payload_bytes; j++){
-					data[end_index++] = 'X';
+				uint8_t* start;
+				int missing;
+				if(clients[i].fp == NULL){
+					for(int j=0; j<clients[i].requested_payload_bytes; j++){
+						data[end_index++] = 'X';
+					}
+					data[end_index] = 0;
+					start = data+clients[i].current_resp_bytes;
+					missing = strlen(data) - clients[i].current_resp_bytes;
+				}else{
+					if(clients[i].current_resp_bytes < end_index){
+						// Read the whole file from the beginning
+						fseek(clients[i].fp, 0, SEEK_SET); // seek back to beginning of file
+						int res = fread(data+end_index, clients[i].requested_payload_bytes, 1, clients[i].fp);
+						if(res < 0){
+							perror("fread");
+							ERROR("fread if");
+						}
+						start = data;
+						missing = end_index + res;
+					}else{
+						int start_position = clients[i].current_resp_bytes - end_index; // How many bytes we already have sent through mywrite
+						fseek(clients[i].fp, start_position, SEEK_SET); // seek to the first byte that was not sent through mywrite
+						int missing_from_file = clients[i].requested_payload_bytes - start_position;
+						int res = fread(data, missing_from_file, 1, clients[i].fp);
+						if(res < 0){
+							perror("fread");
+							ERROR("fread else");
+						}
+						start = data;
+						missing = res;
+					}
 				}
-				data[end_index] = 0;
-				uint8_t* start = data+clients[i].current_resp_bytes;
-				int missing = strlen(data) - clients[i].current_resp_bytes;
 				int res = mywrite(clients[i].s, start, missing);
 				if(res <= 0){
 					if(myerrno == EAGAIN){
@@ -4912,9 +5300,14 @@ void full_duplex_server_app(int listening_socket){
 					}
 				}
 				clients[i].current_resp_bytes += res;
-				if(clients[i].current_resp_bytes == strlen(data)){
+				if(clients[i].current_resp_bytes == end_index + clients[i].requested_payload_bytes){
 					clients[i].srv_st = SERVER_ST_REQ;
 					memset(clients[i].req_arr, 0, sizeof(clients[i].req_arr));
+
+					if(clients[i].fp != NULL){
+						fclose(clients[i].fp);
+						clients[i].fp = NULL;
+					}
 				}
 			}
 			single_app_return:
