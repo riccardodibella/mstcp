@@ -4,5 +4,6 @@ log_*
 canc*
 callgrind.*
 serial_test_*.csv
+aggregate_test_*.csv
 last_port.txt
 website_folder/*

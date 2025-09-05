@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_HTML
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -63,8 +63,16 @@ int payload_size_arr[] = {10/*,10000*/};
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS 32
-#define NUM_CLIENT_REQUESTS 1000
+#define NUM_CLIENTS_MAX 32
+#define NUM_CLIENT_REQUESTS_MAX 100
+int num_client_requests_test = 100;
+
+int num_clients_arr[] = {6, 32};
+
+int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000};
+#undef RESP_PAYLOAD_BYTES
+#define RESP_PAYLOAD_BYTES 500000 // This is the maximum
+
 #endif
 
 #if CL_MAIN == CL_MAIN_HTML
@@ -129,6 +137,10 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define MAX_FD 4 + NUM_CLIENTS // File descriptors go from 3 (included) up to this value (excluded)
 
 #else
+#ifdef NUM_CLIENTS_MAX
+#define MAX_FD 4 + NUM_CLIENTS_MAX // File descriptors go from 3 (included) up to this value (excluded)
+
+#else
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
 
 #define MAX_FD 10 + NUM_CLIENT_REQUESTS
@@ -139,7 +151,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 
 #endif
 #endif
-
+#endif
 
 #define L2_RX_BUF_SIZE 30000
 #define MIN_TIMEOUT_MSEC 300
@@ -4479,7 +4491,7 @@ void main_client_app(){
 				uint8_t* start = client_buffer[i]+cur_bytes[i];
 				int missing = strlen(client_buffer[i]) - cur_bytes[i];
 				int res = mywrite(client_sockets[i], start, missing);
-				if(res <= 0){
+				if(res < 0){
 					if(myerrno == EAGAIN){
 						myerrno = 0;
 						return;
@@ -4619,7 +4631,7 @@ void main_client_app(){
 		exit(EXIT_FAILURE);
 	}
 	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
-	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, 0, -1);
+	sprintf(data, "GET /1000 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
 		ret = mywrite(s, data+sent, missing);
@@ -4673,7 +4685,16 @@ void main_client_app(){
 		//nanosleep(&short_sleep, NULL); 
 	}
 	safe_free(data);
-	DEBUG("Starting the measurement");
+
+
+	int test_num_bytes = payload_size_arr[sample_uint32() % (sizeof(payload_size_arr)/sizeof(payload_size_arr[0]))];
+	int num_clients_test = num_clients_arr[sample_uint32() % (sizeof(num_clients_arr)/sizeof(num_clients_arr[0]))];
+
+	if(!MS_ENABLED && num_clients_test > 6){
+		num_clients_test = 6;
+	}
+	
+	//DEBUG("Starting the measurement");
 	int64_t meas_start = get_timestamp_ms();
 
 
@@ -4683,18 +4704,18 @@ void main_client_app(){
 	myconnect_mode = MYCONNECT_MODE_NON_BLOCKING;
 
 
-	int client_sockets[NUM_CLIENTS];
-	int completed_requests[NUM_CLIENTS] = {0};
+	int client_sockets[NUM_CLIENTS_MAX];
+	int completed_requests[NUM_CLIENTS_MAX] = {0};
 	int started_requests = 0;
-	bool client_connected[NUM_CLIENTS] = {false};
-	bool client_active[NUM_CLIENTS] = {false};
-	enum client_state cl_st[NUM_CLIENTS];
-	int current_request_number[NUM_CLIENTS];
-	int cur_bytes[NUM_CLIENTS]; // both for write and for read
-	char* client_buffer[NUM_CLIENTS];
-	long ul_bytes[NUM_CLIENTS] = {0};
-	long dl_bytes[NUM_CLIENTS] = {0};
-	int response_tot_bytes[NUM_CLIENTS];
+	bool client_connected[NUM_CLIENTS_MAX] = {false};
+	bool client_active[NUM_CLIENTS_MAX] = {false};
+	enum client_state cl_st[NUM_CLIENTS_MAX];
+	int current_request_number[NUM_CLIENTS_MAX];
+	int cur_bytes[NUM_CLIENTS_MAX]; // both for write and for read
+	char* client_buffer[NUM_CLIENTS_MAX];
+	long ul_bytes[NUM_CLIENTS_MAX] = {0};
+	long dl_bytes[NUM_CLIENTS_MAX] = {0};
+	int response_tot_bytes[NUM_CLIENTS_MAX];
 	
 	client_sockets[0] = s;
 	client_connected[0] = true;
@@ -4702,7 +4723,7 @@ void main_client_app(){
 	cl_st[0] = CLIENT_ST_IDLE;
 	client_buffer[0] = safe_malloc(RESP_BUF_SIZE);
 	
-	for(int i=1; i<NUM_CLIENTS; i++){
+	for(int i=1; i<num_clients_test; i++){
 		s = mysocket(AF_INET,SOCK_STREAM,0);
 		if(s == -1){
 			myperror("mysocket");
@@ -4715,7 +4736,7 @@ void main_client_app(){
 
 		// End main if all the clients are stopped
 		bool all_stopped = true;
-		for(int i=0; i<NUM_CLIENTS && all_stopped; i++){
+		for(int i=0; i<num_clients_test && all_stopped; i++){
 			if(!client_connected[i] || client_active[i]){
 				all_stopped = false;
 			}
@@ -4725,7 +4746,7 @@ void main_client_app(){
 		}
 		
 		// Attempt connection for all non-connected clients
-		for(int i=0; i<NUM_CLIENTS; i++){
+		for(int i=0; i<num_clients_test; i++){
 			if(client_connected[i]){
 				continue;
 			}
@@ -4744,11 +4765,11 @@ void main_client_app(){
 			client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
 		}
 
-		uint32_t rand_i_base = sample_uint32() % NUM_CLIENTS;
+		uint32_t rand_i_base = sample_uint32() % num_clients_test;
 
 		// Assign new requests to idle clients
-		for(int i_offs=0; i_offs<NUM_CLIENTS && started_requests < NUM_CLIENT_REQUESTS; i_offs++){
-			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+		for(int i_offs=0; i_offs<num_clients_test && started_requests < num_client_requests_test; i_offs++){
+			int i = (rand_i_base + i_offs) % num_clients_test;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 				current_request_number[i] = started_requests;
 				started_requests++;
@@ -4758,14 +4779,14 @@ void main_client_app(){
 		}
 
 		// Continue sending pending requests
-		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
-			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+		for(int i_offs=0; i_offs<num_clients_test; i_offs++){
+			int i = (rand_i_base + i_offs) % num_clients_test;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
-				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, i, current_request_number[i]);
+				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", test_num_bytes, i, current_request_number[i]);
 				uint8_t* start = client_buffer[i]+cur_bytes[i];
 				int missing = strlen(client_buffer[i]) - cur_bytes[i];
 				int res = mywrite(client_sockets[i], start, missing);
-				if(res <= 0){
+				if(res < 0){
 					if(myerrno == EAGAIN){
 						myerrno = 0;
 						return;
@@ -4785,8 +4806,8 @@ void main_client_app(){
 		}
 
 		// Read HTTP Headers
-		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
-			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+		for(int i_offs=0; i_offs<num_clients_test; i_offs++){
+			int i = (rand_i_base + i_offs) % num_clients_test;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_H){
 				ret = myread(client_sockets[i], client_buffer[i]+cur_bytes[i], RESP_BUF_SIZE);
 				if(ret == -1 && myerrno == EAGAIN){
@@ -4822,8 +4843,8 @@ void main_client_app(){
 		}
 
 		// Read HTTP Payload
-		for(int i_offs=0; i_offs<NUM_CLIENTS; i_offs++){
-			int i = (rand_i_base + i_offs) % NUM_CLIENTS;
+		for(int i_offs=0; i_offs<num_clients_test; i_offs++){
+			int i = (rand_i_base + i_offs) % num_clients_test;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_RESP_P){
 				int missing =  response_tot_bytes[i] - cur_bytes[i];
 				if(missing == 0){
@@ -4855,8 +4876,8 @@ void main_client_app(){
 
 
 		// Close all idle clients if there are no more requests to do
-		if(started_requests >= NUM_CLIENT_REQUESTS){
-			for(int i=0; i<NUM_CLIENTS; i++){
+		if(started_requests >= num_client_requests_test){
+			for(int i=0; i<num_clients_test; i++){
 				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 					myclose(client_sockets[i]);
 					client_active[i] = false;
@@ -4869,10 +4890,16 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
+	long ul_sum = 0, dl_sum = 0;
+	for(int i=0; i<num_clients_test; i++){
+		ul_sum += ul_bytes[i];
+		dl_sum += dl_bytes[i];
+	}
+	/*
 	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	long ul_sum = 0, dl_sum = 0;
-	for(int i=0; i<NUM_CLIENTS; i++){
+	for(int i=0; i<num_clients_test; i++){
 		ul_sum += ul_bytes[i];
 		dl_sum += dl_bytes[i];
 		DEBUG("Client %d: %d requests (ul %ld dl %ld)", i, completed_requests[i], ul_bytes[i], dl_bytes[i]);
@@ -4882,6 +4909,9 @@ void main_client_app(){
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
+	*/
+
+	printf("%d;%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,num_clients_test, num_client_requests_test, test_num_bytes, meas_dur, dl_sum, ul_sum);
 }
 #endif
 
@@ -5013,7 +5043,7 @@ void single_client_app(int* client_sockets, int i /* num_client */){
 		uint8_t* start = data+current_req_bytes[i];
 		int missing = strlen(data) - current_req_bytes[i];
 		int res = mywrite(client_sockets[i], start, missing);
-		if(res <= 0){
+		if(res < 0){
 			if(myerrno == EAGAIN){
 				myerrno = 0;
 				return;
@@ -5221,7 +5251,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					DEBUG(clients[i].req_arr);
+					//DEBUG(clients[i].req_arr);
 
 					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
 					char* str_end = requested_ptr;
@@ -5260,9 +5290,9 @@ void full_duplex_server_app(int listening_socket){
 				int missing;
 				if(clients[i].fp == NULL){
 					for(int j=0; j<clients[i].requested_payload_bytes; j++){
-						data[end_index++] = 'X';
+						data[end_index + j] = 'X';
 					}
-					data[end_index] = 0;
+					data[end_index + clients[i].requested_payload_bytes] = 0;
 					start = data+clients[i].current_resp_bytes;
 					missing = strlen(data) - clients[i].current_resp_bytes;
 				}else{
@@ -5290,12 +5320,12 @@ void full_duplex_server_app(int listening_socket){
 					}
 				}
 				int res = mywrite(clients[i].s, start, missing);
-				if(res <= 0){
+				if(res < 0){
 					if(myerrno == EAGAIN){
 						myerrno = 0;
 						goto single_app_return;
 					}else{
-						perror("mywrite");
+						myperror("mywrite");
 						ERROR("mywrite error");
 					}
 				}

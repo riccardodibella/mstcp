@@ -4,7 +4,7 @@ echo "$(date '+%d/%m/%Y %H:%M:%S')"
 if [[ "$1" == "--local" ]]; then
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out
 else
-    if [[ "$1" == "--serial_test" ]]; then
+    if [[ "$1" == "--ms_test" ]]; then
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=true -o client_ms.out
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=false -o client_tcp.out
     else
