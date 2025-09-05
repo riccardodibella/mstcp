@@ -5,8 +5,8 @@ if [[ "$1" == "--local" ]]; then
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out
 else
     if [[ "$1" == "--ms_test" ]]; then
-    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=true -o client_ms.out
-    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=false -o client_tcp.out
+    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=true -DNO_DEBUG -o client_ms.out
+    gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -DMS_ENABLED=false -DNO_DEBUG -o client_tcp.out
     else
     gcc 15.c -O3 -g -DMAIN_MODE=CLIENT -o client.out
     fi

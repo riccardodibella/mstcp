@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_AGGREGATE
+#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -57,9 +57,9 @@ int num_req_arr[] = {1, 2, 4, 6, 8, 10};
 int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
 */
 int num_req_arr[] = {1, 2, 4, 6, 8, 10};
-int payload_size_arr[] = {10/*,10000*/};
+int payload_size_arr[] = {/*200, 2000, 20000,*/ 200000};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 10
+#define RESP_PAYLOAD_BYTES 200000
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
@@ -545,22 +545,26 @@ int current_field_num = 0;
 
 // In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
+	#ifndef NO_DEBUG
 	printf("ERROR %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
 	vprintf(c, args);
 	va_end(args);
 	printf("\n");
+	#endif
 	exit(EXIT_FAILURE);
 }
 
 void DEBUG(char* c, ...){
+	#ifndef NO_DEBUG
 	printf("DEBUG %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
 	vprintf(c, args);
 	va_end(args);
 	printf("\n");
+	#endif
 }
 
 int64_t get_timestamp_ns(){

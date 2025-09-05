@@ -4,7 +4,7 @@
 # https://claude.ai/share/4c277657-7db4-4e37-befb-afbeba84705f
 
 # Configuration
-TIMEOUT_DURATION=30  # Timeout in seconds for each operation
+TIMEOUT_DURATION=60  # Timeout in seconds for each operation
 
 # Read password securely at the beginning
 echo -n "Enter password (for SSH and sudo): "

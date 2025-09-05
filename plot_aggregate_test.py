@@ -60,6 +60,8 @@ def create_dynamic_performance_plot():
         print(f"An error occurred while reading the file: {e}")
         return
 
+    df = df[df['payload_size'] <= 200000]
+
     # 2. Process the data
     # Check for essential columns (now including dl_bytes for throughput calculation)
     required_cols = {'MS_ENABLED', 'payload_size', 'num_clients', 'time_ms', 'dl_bytes'}
