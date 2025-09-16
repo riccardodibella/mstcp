@@ -10,7 +10,7 @@ signal.signal(signal.SIGINT, signal.SIG_DFL) # https://stackoverflow.com/a/75864
 
 
 def filter_outliers(values: pd.Series) -> pd.Series:
-   return values
+   # return values
    """Remove outliers using IQR method, only if outliers are detected."""
    if len(values) < 4:
        return values
@@ -73,8 +73,8 @@ def create_dynamic_performance_plot():
 
     # Group and aggregate data
     filtered_groups = df.groupby(['MS_ENABLED', 'payload_size', 'requests'])['time_ms'].apply(filter_outliers)
-    processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'requests']).agg(['mean', 'count']).reset_index()
-    processed_df.rename(columns={'mean': 'avg_time_ms'}, inplace=True)
+    processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'requests']).agg(['min', 'count']).reset_index()
+    processed_df.rename(columns={'min': 'avg_time_ms'}, inplace=True)
 
     print("\n--- Data Summary ---")
     print(processed_df)

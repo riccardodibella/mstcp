@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -47,7 +47,7 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
-#define NUM_CLIENT_REQUESTS 10
+#define NUM_CLIENT_REQUESTS 1
 /*
 int num_req_arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
@@ -56,22 +56,22 @@ int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
 int num_req_arr[] = {1, 2, 4, 6, 8, 10};
 int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
 */
-int num_req_arr[] = {1, 2, 4, 6, 8, 10};
-int payload_size_arr[] = {/*200, 2000, 20000,*/ 200000};
+int num_req_arr[] = {2/*, 2, 4, 6, 8, 10*/};
+int payload_size_arr[] = {/*200, 2000, 20000,*/ 100000000};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 200000
+#define RESP_PAYLOAD_BYTES 100000000
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS_MAX 32
+#define NUM_CLIENTS_MAX 20
 #define NUM_CLIENT_REQUESTS_MAX 100
 int num_client_requests_test = 100;
 
 int num_clients_arr[] = {6, 32};
 
-int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000};
+int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000/*, 500000, 1000000*/};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 500000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 200000 // This is the maximum
 
 #endif
 
@@ -212,6 +212,8 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define STREAM_STATE_READY 1 // only for passive open before accept
 #define STREAM_STATE_OPENED 2
 
+
+// The following is not true! State CLOSED is never used, instead it returns to UNUSED when these conditions are true
 // Transitions to state CLOSED must be managed in 2 points: when write_side_close_state becomes LSS_ACKED, and where the flag lss_received is set, during myio
 #define STREAM_STATE_CLOSED 3
 // Transition back to state UNUSED may be done after a timeout, but this is TBD; After coming back to state unused, an endpoint must still discard segments with LSS flag set, because they are window updates of the old stream
@@ -4920,6 +4922,7 @@ void main_client_app(){
 #endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
+char data[RESP_BUF_SIZE]; // both req and resp
 void main_client_app(){
 	myread_mode = MYREAD_MODE_BLOCKING;
 	mywrite_mode = MYWRITE_MODE_BLOCKING;
@@ -4951,7 +4954,7 @@ void main_client_app(){
 			exit(EXIT_FAILURE);
 		}
 		int expected_payload_bytes = test_num_bytes;
-		char data[RESP_BUF_SIZE]; // both req and resp
+		//char data[RESP_BUF_SIZE]; // both req and resp
 		sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", expected_payload_bytes, num_req, num_req);
 		int sent = 0, missing = strlen(data);
 		while(missing > 0){
@@ -5011,14 +5014,14 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
-	/*
+	
 	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	DEBUG("wait...");
-	*/
-	printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
+	
+	//printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
 	//persistent_nanosleep(2, 0);
 	//DEBUG("main_client_app end");
 }
@@ -5208,7 +5211,7 @@ struct single_srv_data{
 	int current_resp_bytes;
 	FILE* fp;
 };
-uint8_t data[RESP_BUF_SIZE];
+uint8_t srv_data[RESP_BUF_SIZE];
 void full_duplex_server_app(int listening_socket){
 	struct single_srv_data* clients = NULL;
 	int num_clients = 0;
@@ -5255,7 +5258,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					//DEBUG(clients[i].req_arr);
+					DEBUG(clients[i].req_arr);
 
 					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
 					char* str_end = requested_ptr;
@@ -5288,38 +5291,38 @@ void full_duplex_server_app(int listening_socket){
 					clients[i].srv_st = SERVER_ST_RESP;
 				}
 			}else if(clients[i].srv_st == SERVER_ST_RESP){
-				sprintf(data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
-				int end_index = strlen(data);
+				sprintf(srv_data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
+				int end_index = strlen(srv_data);
 				uint8_t* start;
 				int missing;
 				if(clients[i].fp == NULL){
 					for(int j=0; j<clients[i].requested_payload_bytes; j++){
-						data[end_index + j] = 'X';
+						srv_data[end_index + j] = 'X';
 					}
-					data[end_index + clients[i].requested_payload_bytes] = 0;
-					start = data+clients[i].current_resp_bytes;
-					missing = strlen(data) - clients[i].current_resp_bytes;
+					srv_data[end_index + clients[i].requested_payload_bytes] = 0;
+					start = srv_data+clients[i].current_resp_bytes;
+					missing = strlen(srv_data) - clients[i].current_resp_bytes;
 				}else{
 					if(clients[i].current_resp_bytes < end_index){
 						// Read the whole file from the beginning
 						fseek(clients[i].fp, 0, SEEK_SET); // seek back to beginning of file
-						int res = fread(data+end_index, clients[i].requested_payload_bytes, 1, clients[i].fp);
+						int res = fread(srv_data+end_index, clients[i].requested_payload_bytes, 1, clients[i].fp);
 						if(res < 0){
 							perror("fread");
 							ERROR("fread if");
 						}
-						start = data;
+						start = srv_data;
 						missing = end_index + res;
 					}else{
 						int start_position = clients[i].current_resp_bytes - end_index; // How many bytes we already have sent through mywrite
 						fseek(clients[i].fp, start_position, SEEK_SET); // seek to the first byte that was not sent through mywrite
 						int missing_from_file = clients[i].requested_payload_bytes - start_position;
-						int res = fread(data, missing_from_file, 1, clients[i].fp);
+						int res = fread(srv_data, missing_from_file, 1, clients[i].fp);
 						if(res < 0){
 							perror("fread");
 							ERROR("fread else");
 						}
-						start = data;
+						start = srv_data;
 						missing = res;
 					}
 				}

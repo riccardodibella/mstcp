@@ -60,7 +60,7 @@ def create_dynamic_performance_plot():
         print(f"An error occurred while reading the file: {e}")
         return
 
-    df = df[df['payload_size'] <= 200000]
+    # df = df[df['payload_size'] <= 200000]
 
     # 2. Process the data
     # Check for essential columns (now including dl_bytes for throughput calculation)
@@ -78,8 +78,8 @@ def create_dynamic_performance_plot():
 
     # Group and aggregate data using throughput instead of time_ms
     filtered_groups = df.groupby(['MS_ENABLED', 'payload_size', 'num_clients'])['throughput_kbps'].apply(filter_outliers)
-    processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'num_clients']).agg(['mean', 'count']).reset_index()
-    processed_df.rename(columns={'mean': 'avg_throughput_kbps'}, inplace=True)
+    processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'num_clients']).agg(['max', 'count']).reset_index()
+    processed_df.rename(columns={'max': 'avg_throughput_kbps'}, inplace=True)
 
     print("\n--- Data Summary ---")
     print(processed_df)
