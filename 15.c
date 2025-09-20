@@ -25,7 +25,7 @@
 
 /* DEFINE MACROS */
 
-#define NOLOGS
+//#define NOLOGS
 //#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
@@ -47,7 +47,7 @@
 #endif
 
 #if CL_MAIN == CL_MAIN_SERIAL_BLOCKING
-#define NUM_CLIENT_REQUESTS 1
+#define NUM_CLIENT_REQUESTS 100
 /*
 int num_req_arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
@@ -56,22 +56,30 @@ int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
 int num_req_arr[] = {1, 2, 4, 6, 8, 10};
 int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
 */
-int num_req_arr[] = {2/*, 2, 4, 6, 8, 10*/};
-int payload_size_arr[] = {/*200, 2000, 20000,*/ 100000000};
+//int num_req_arr[] = {2/*, 2, 4, 6, 8, 10*/};
+//int payload_size_arr[] = {/*200, 2000, 20000,*/ 100000000};
+
+int num_req_arr[] = {1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+int payload_size_arr[] = {2000};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 100000000
+#define RESP_PAYLOAD_BYTES 2000
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS_MAX 20
+#define NUM_CLIENTS_MAX 32
 #define NUM_CLIENT_REQUESTS_MAX 100
 int num_client_requests_test = 100;
 
-int num_clients_arr[] = {6, 32};
+int num_clients_arr[] = {6, 12, 18};
 
-int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000/*, 500000, 1000000*/};
+//int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000}; // OK WITH NO LOGS
+//int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 300000, 400000, 500000, 600000};
+//int payload_size_arr[] = {100000, 150000, 200000, 300000, 400000, 500000, 600000};
+
+int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000};
+
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 200000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 650000 // This is the maximum
 
 #endif
 
@@ -852,6 +860,9 @@ void exit_handler(int sig) {
 }
 
 void print_tcp_segment(struct tcp_segment* tcp){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
 	printf("SEQ %u ACK %u\n", htonl(tcp->seq), htonl(tcp->ack));
@@ -922,6 +933,9 @@ void print_ip(uint8_t* ip){
 	}
 }
 void print_ip_datagram(struct ip_datagram* ip){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	printf("----IP DATAGRAM----\n");
 	printf("VER_IHL: 0x%.2x\n", ip->ver_ihl);
 	printf("Source IP: ");
@@ -965,6 +979,9 @@ void print_arp_packet(struct arp_packet* arp){
 	printf("-------------------\n");
 }
 void print_l2_packet(uint8_t* packet){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	printf("---- L2 PACKET ----\n");
 	printf("SRC MAC: ");
 	print_mac(packet + 8);
@@ -981,6 +998,9 @@ void print_l2_packet(uint8_t* packet){
 }
 
 void myperror(char* message) {
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
 	printf("MYPERROR %s: %s\n", message, strerror(myerrno));
 }
 
@@ -1225,7 +1245,7 @@ unsigned short int ip_checksum(char * b, int len){
 		total += htons(p[len/2])&0xFF00;
 		if (total < prev ) total++;
 		prev = total;
-		} 
+	}
 	return (0xFFFF-total);
 }
 
@@ -1270,7 +1290,7 @@ uint32_t sample_uint32(){
 	// LCG: next = (a * current + c) mod m
 	// Using constants from Numerical Recipes
 	prng_state = prng_state * 1664525U + 1013904223U;
-	return prng_state;
+	return htonl(prng_state);
 }
 
 // Returns a double drawn uniformly in the range [0,1)
@@ -3846,10 +3866,12 @@ void myio(int ignored){
 									// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
 									fdinfo[i].tcb->flightsize-=cursor->payloadlen;
 
+									/*
 									if(tcb->radwin[cursor->sid] < cursor->payloadlen){
 										ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
 									}
 									tcb->radwin[cursor->sid] -= cursor->payloadlen;
+									*/
 								}
 
 								int sid = -1;
