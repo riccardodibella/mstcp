@@ -1,0 +1,26 @@
+int num_client_requests_test = 1000;
+int num_clients_arr[] = {10};
+int payload_size_arr[] = {10000};
+
+#define STREAM_DROP_ENABLED
+#ifdef STREAM_DROP_ENABLED
+const int DROP_TARGET_STREAMS[] = {1};
+#define UPLINK_STREAM_DROP_PROB 2E-1
+#define DOWNLINK_STREAM_DROP_PROB 2E-1
+#endif
+
+
+
+DEBUG 028467: ########################### Statitics ###########################
+DEBUG 028467: Client 0: 111 requests (ul 6093 dl 1116438)
+DEBUG 028467: Client 1: 13 requests (ul 712 dl 130754)
+DEBUG 028467: Client 2: 114 requests (ul 6258 dl 1146612)
+DEBUG 028467: Client 3: 112 requests (ul 6148 dl 1126496)
+DEBUG 028467: Client 4: 111 requests (ul 6093 dl 1116438)
+DEBUG 028467: Client 5: 107 requests (ul 5874 dl 1076206)
+DEBUG 028468: Client 6: 109 requests (ul 5983 dl 1096322)
+DEBUG 028468: Client 7: 110 requests (ul 6038 dl 1106380)
+DEBUG 028468: Client 8: 109 requests (ul 5983 dl 1096322)
+DEBUG 028468: Client 9: 104 requests (ul 5708 dl 1046032)
+DEBUG 028468: Total: 761.05 KB/s DL 4.15 KB/s UL (13216 ms, 13.22 s)
+DEBUG 028468: #################################################################
