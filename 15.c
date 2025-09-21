@@ -26,7 +26,7 @@
 /* DEFINE MACROS */
 
 //#define NOLOGS
-//#define SHORTLOGS
+#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -70,16 +70,17 @@ int payload_size_arr[] = {2000};
 #define NUM_CLIENT_REQUESTS_MAX 100
 int num_client_requests_test = 100;
 
-int num_clients_arr[] = {6, 12, 18};
+int num_clients_arr[] = {6, 12/*, 18*/};
 
 //int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000}; // OK WITH NO LOGS
 //int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 300000, 400000, 500000, 600000};
 //int payload_size_arr[] = {100000, 150000, 200000, 300000, 400000, 500000, 600000};
 
-int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000};
+//int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000};
+int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000/*, 700000, 800000*/};
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 650000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 800000 // This is the maximum
 
 #endif
 

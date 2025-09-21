@@ -91,7 +91,7 @@ while true; do
     # Start server
     if start_server; then
         
-        if [ $((RANDOM % 4)) -eq 0 ]; then
+        if [ $((RANDOM % 3)) -eq 0 ]; then
             run_client "tcp"
         else
             run_client "ms"
