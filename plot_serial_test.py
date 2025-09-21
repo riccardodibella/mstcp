@@ -74,7 +74,7 @@ def create_dynamic_performance_plot():
     # Group and aggregate data
     filtered_groups = df.groupby(['MS_ENABLED', 'payload_size', 'requests'])['time_ms'].apply(filter_outliers)
     processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'requests']).agg(['min', 'count']).reset_index()
-    processed_df.rename(columns={'min': 'avg_time_ms'}, inplace=True)
+    processed_df.rename(columns={'min': 'min_time_ms'}, inplace=True)
 
     print("\n--- Data Summary ---")
     print(processed_df)
@@ -119,7 +119,7 @@ def create_dynamic_performance_plot():
         for payload_value, line_group in family_group.groupby('payload_size'):
             line_group = line_group.sort_values('requests')
             
-            ax.plot(line_group['requests'], line_group['avg_time_ms'],
+            ax.plot(line_group['requests'], line_group['min_time_ms'],
                     label=f'MS_ENABLED={ms_enabled_value}, payload={payload_value}',
                     color=colors.get(ms_enabled_value, 'gray'), # Default to gray if value is not 0 or 1
                     linestyle=payload_to_linestyle[payload_value],
@@ -133,8 +133,8 @@ def create_dynamic_performance_plot():
     
     # Configure the plot's appearance
     ax.set_xlabel("Number of Requests")
-    ax.set_ylabel("Average time_ms")
-    ax.set_title("Average Time vs. Requests by Payload Size")
+    ax.set_ylabel("Minimum time [ms]")
+    ax.set_title("Time vs. Requests")
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
     ax.legend(title="Configuration")
 

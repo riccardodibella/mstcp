@@ -26,7 +26,7 @@
 /* DEFINE MACROS */
 
 //#define NOLOGS
-#define SHORTLOGS
+//#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_AGGREGATE
+#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -5037,14 +5037,16 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
-	
+
+	/*
 	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	DEBUG("wait...");
+	*/
 	
-	//printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
+	printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
 	//persistent_nanosleep(2, 0);
 	//DEBUG("main_client_app end");
 }
