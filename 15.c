@@ -79,7 +79,7 @@ int payload_size_arr[] = {2000};
 //int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000/*, 700000, 800000*/};
 
 int num_client_requests_test = 1000;
-int num_clients_arr[] = {10};
+int num_clients_arr[] = {1};
 int payload_size_arr[] = {10000};
 
 #undef RESP_PAYLOAD_BYTES
@@ -99,13 +99,15 @@ int payload_size_arr[] = {10000};
 #define DOWNLINK_DROP_PROB 0
 
 
-#define STREAM_DROP_ENABLED
+//#define STREAM_DROP_ENABLED
 #ifdef STREAM_DROP_ENABLED
 const int DROP_TARGET_STREAMS[] = {1};
 #define UPLINK_STREAM_DROP_PROB 2E-1
 #define DOWNLINK_STREAM_DROP_PROB 2E-1
 #endif
 
+#define DELAY_REQ_PROB 1E-1
+#define DELAY_DURATION_MS 1000
 
 
 #define CLIENT 0
@@ -4814,7 +4816,13 @@ void main_client_app(){
 		for(int i_offs=0; i_offs<num_clients_test; i_offs++){
 			int i = (rand_i_base + i_offs) % num_clients_test;
 			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
+				#ifdef DELAY_REQ_PROB
+				double sample = sample_uniform_0_1();
+				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\nX-Delay: %d\r\n\r\n", test_num_bytes, i, current_request_number[i], sample < DELAY_REQ_PROB);
+				#else
 				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", test_num_bytes, i, current_request_number[i]);
+				#endif
+				
 				uint8_t* start = client_buffer[i]+cur_bytes[i];
 				int missing = strlen(client_buffer[i]) - cur_bytes[i];
 				int res = mywrite(client_sockets[i], start, missing);
@@ -5239,6 +5247,7 @@ struct single_srv_data{
 	char req_arr[REQ_BUF_SIZE];
 	int requested_payload_bytes;
 	int current_resp_bytes;
+	int64_t delay_timer;
 	FILE* fp;
 };
 uint8_t srv_data[RESP_BUF_SIZE];
@@ -5317,10 +5326,22 @@ void full_duplex_server_app(int listening_socket){
 						}
 					}
 
+					char* delay_header = strcasestr(clients[i].req_arr, "X-Delay: ");
+					if(delay_header != NULL){
+						char* delay_payload = delay_header + strlen("X-Delay: ");
+						if(*delay_payload == '1'){
+							clients[i].delay_timer = get_timestamp_ms() + DELAY_DURATION_MS;
+						}
+					}
+
 					clients[i].current_resp_bytes = 0;
 					clients[i].srv_st = SERVER_ST_RESP;
 				}
 			}else if(clients[i].srv_st == SERVER_ST_RESP){
+				if(clients[i].delay_timer != 0 && get_timestamp_ms() < clients[i].delay_timer){
+					// Timer not elapsed
+					goto single_app_return;
+				}
 				sprintf(srv_data, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nX-Server-ID: %d\r\n\r\n", clients[i].requested_payload_bytes, i);
 				int end_index = strlen(srv_data);
 				uint8_t* start;
@@ -5370,6 +5391,7 @@ void full_duplex_server_app(int listening_socket){
 				if(clients[i].current_resp_bytes == end_index + clients[i].requested_payload_bytes){
 					clients[i].srv_st = SERVER_ST_REQ;
 					memset(clients[i].req_arr, 0, sizeof(clients[i].req_arr));
+					clients[i].delay_timer = 0;
 
 					if(clients[i].fp != NULL){
 						fclose(clients[i].fp);
