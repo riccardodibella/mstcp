@@ -33,10 +33,99 @@ def filter_outliers(values: pd.Series) -> pd.Series:
    
    return values[(values >= lower_bound) & (values <= upper_bound)]
 
+def plot_data(processed_df, title_suffix="", x_scale="log", payload_lower_bound=None):
+    """
+    Create a plot with the specified configuration.
+    
+    Args:
+        processed_df: DataFrame with processed data
+        title_suffix: Additional text for plot title
+        x_scale: 'log' or 'linear' for x-axis scale
+        payload_lower_bound: Minimum payload size to include (None for no filtering)
+    """
+    # Filter data based on lower bound if specified
+    plot_df = processed_df.copy()
+    if payload_lower_bound is not None:
+        plot_df = plot_df[plot_df['payload_size'] >= payload_lower_bound]
+        if plot_df.empty:
+            print(f"No data points with payload_size >= {payload_lower_bound}")
+            return
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # --- DYNAMIC STYLING ---
+    # Define colors for the MS_ENABLED families
+    colors = {0: 'royalblue', 1: 'darkorange'}
+    
+    # Define a list of line styles to cycle through for num_clients
+    line_styles_list = [
+        'solid',        # same as '-'
+        'dashed',       # same as '--'
+        'dotted',       # same as ':'
+        'dashdot',      # same as '-.'
+        (0, (1, 1)),    # densely dotted
+        (0, (5, 5)),    # loosely dashed
+        (0, (3, 5, 1, 5)),  # dash-dot
+        (0, (5, 10)),   # long dash
+        (0, (3, 1, 1, 1)),  # dash-dot-dotted
+        (0, (2, 4, 6, 4))   # mixed long/short dashes
+    ]
+    
+    # Discover unique num_clients from the filtered data and assign a style to each
+    unique_clients = sorted(plot_df['num_clients'].unique())
+    clients_to_linestyle = {
+        clients: line_styles_list[i % len(line_styles_list)] 
+        for i, clients in enumerate(unique_clients)
+    }
+
+    # Iterate through each MS_ENABLED family
+    for ms_enabled_value, family_group in plot_df.groupby('MS_ENABLED'):
+        # Iterate through each num_clients within the family
+        for clients_value, line_group in family_group.groupby('num_clients'):
+            line_group = line_group.sort_values('payload_size')
+            
+            ax.plot(line_group['payload_size'], line_group['max_throughput_kbps'],
+                    label=f'{"MS-TCP" if ms_enabled_value else "TCP"} - {clients_value} clients',
+                    color=colors.get(ms_enabled_value, 'gray'), # Default to gray if value is not 0 or 1
+                    linestyle=clients_to_linestyle[clients_value],
+                    marker='o',
+                    markersize=5)
+
+    # --- AXIS CONFIGURATION ---
+    # Set x-axis scale
+    ax.set_xscale(x_scale)
+    
+    payload_ticks = sorted(plot_df['payload_size'].unique())
+    if x_scale == 'log':
+        print(payload_ticks)
+        payload_ticks = [1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 400000, 600000]
+    ax.set_xticks(payload_ticks)
+    
+    if x_scale == 'log':
+        ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
+        ax.get_xaxis().set_minor_formatter(matplotlib.ticker.NullFormatter())
+    
+    # Configure the plot's appearance
+    ax.set_xlabel("Payload Size")
+    ax.set_ylabel("Maximum Throughput (KB/s)")
+    
+    # Dynamic title based on configuration
+    base_title = "Maximum Throughput vs. Payload Size"
+    if title_suffix:
+        base_title += f" - {title_suffix}"
+    ax.set_title(base_title)
+    
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax.legend(title="Configuration")
+
+    plt.tight_layout()
+    plt.show()
+
 def create_dynamic_performance_plot():
     """
     Allows user to select a CSV, then dynamically plots performance data
     adapting to the unique values in 'MS_ENABLED' and 'num_clients' columns.
+    Shows both logarithmic and linear scale plots with optional filtering.
     """
     # 1. Let the user choose a CSV file
     root = tk.Tk()
@@ -60,10 +149,6 @@ def create_dynamic_performance_plot():
         print(f"An error occurred while reading the file: {e}")
         return
 
-    #df = df[df['payload_size'] <= 500000]
-    #df = df[df['payload_size'] != 300000]
-    #df = df[df['payload_size'] != 150000]
-
     # 2. Process the data
     # Check for essential columns (now including dl_bytes for throughput calculation)
     required_cols = {'MS_ENABLED', 'payload_size', 'num_clients', 'time_ms', 'dl_bytes'}
@@ -81,77 +166,27 @@ def create_dynamic_performance_plot():
     # Group and aggregate data using throughput instead of time_ms
     filtered_groups = df.groupby(['MS_ENABLED', 'payload_size', 'num_clients'])['throughput_kbps'].apply(filter_outliers)
     processed_df = filtered_groups.groupby(['MS_ENABLED', 'payload_size', 'num_clients']).agg(['max', 'count']).reset_index()
-    processed_df.rename(columns={'max': 'avg_throughput_kbps'}, inplace=True)
+    processed_df.rename(columns={'max': 'max_throughput_kbps'}, inplace=True)
 
     print("\n--- Data Summary ---")
     print(processed_df)
     print("--------------------\n")
 
-    # 3. Plot the data dynamically
-    fig, ax = plt.subplots(figsize=(12, 8))
+    # Configure lower bound for linear plot (set to None for no filtering)
+    linear_plot_lower_bound = 100000
+    
+    # Show available payload sizes for reference
+    payload_sizes = sorted(processed_df['payload_size'].unique())
+    print(f"Available payload sizes: {payload_sizes}")
+    if linear_plot_lower_bound is not None:
+        print(f"Linear plot will show payload sizes >= {linear_plot_lower_bound}")
 
-    # --- DYNAMIC STYLING ---
-    # Define colors for the MS_ENABLED families
-    colors = {0: 'royalblue', 1: 'darkorange'}
+    # 3. Create plots
+    # Original logarithmic plot
+    plot_data(processed_df, "Logarithmic Scale", "log")
     
-    # Define a list of line styles to cycle through for num_clients
-    line_styles_list = [
-        'solid',        # same as '-'
-        'dashed',       # same as '--'
-        'dotted',       # same as ':'
-        'dashdot',      # same as '-.'
-        (0, (1, 1)),    # densely dotted
-        (0, (5, 5)),    # loosely dashed
-        (0, (3, 5, 1, 5)),  # dash-dot
-        (0, (5, 10)),   # long dash
-        (0, (3, 1, 1, 1)),  # dash-dot-dotted
-        (0, (2, 4, 6, 4))   # mixed long/short dashes
-    ]
-    
-    # Discover unique num_clients from the data and assign a style to each
-    unique_clients = sorted(processed_df['num_clients'].unique())
-    clients_to_linestyle = {
-        clients: line_styles_list[i % len(line_styles_list)] 
-        for i, clients in enumerate(unique_clients)
-    }
-    
-    print("Dynamically assigned line styles:")
-    for clients, style in clients_to_linestyle.items():
-        print(f"  - Num Clients {clients}: '{style}'")
-    print("-" * 20)
-
-    # Iterate through each MS_ENABLED family
-    for ms_enabled_value, family_group in processed_df.groupby('MS_ENABLED'):
-        # Iterate through each num_clients within the family
-        for clients_value, line_group in family_group.groupby('num_clients'):
-            line_group = line_group.sort_values('payload_size')
-            
-            ax.plot(line_group['payload_size'], line_group['avg_throughput_kbps'],
-                    label=f'MS_ENABLED={ms_enabled_value}, clients={clients_value}',
-                    color=colors.get(ms_enabled_value, 'gray'), # Default to gray if value is not 0 or 1
-                    linestyle=clients_to_linestyle[clients_value],
-                    marker='o',
-                    markersize=5)
-
-    # --- DYNAMIC AXIS CONFIGURATION ---
-    # Set x-axis to logarithmic scale
-    ax.set_xscale('log')
-    
-    # Set x-axis ticks to only the values present in the 'payload_size' column
-    payload_ticks = sorted(processed_df['payload_size'].unique())
-    ax.set_xticks(payload_ticks)
-    ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
-    ax.get_xaxis().set_minor_formatter(matplotlib.ticker.NullFormatter())
-    
-    # Configure the plot's appearance
-    ax.set_xlabel("Payload Size")
-    ax.set_ylabel("Average Throughput (KB/s)")
-    ax.set_title("Average Throughput vs. Payload Size by Number of Clients")
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax.legend(title="Configuration")
-
-    plt.tight_layout()
-    plt.show()
+    # New linear plot with optional filtering
+    plot_data(processed_df, "Linear Scale", "linear", linear_plot_lower_bound)
 
 # Run the main function
 if __name__ == "__main__":
