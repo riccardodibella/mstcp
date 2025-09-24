@@ -1,3 +1,5 @@
+size_str = "200B"
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import tkinter as tk
@@ -134,7 +136,7 @@ def create_dynamic_performance_plot():
     # Configure the plot's appearance
     ax.set_xlabel("Number of Requests")
     ax.set_ylabel("Minimum time [ms]")
-    ax.set_title("Time vs. Requests")
+    ax.set_title(f"Time vs. Requests {size_str}")
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
     ax.legend(title="Configuration")
 
