@@ -1,4 +1,4 @@
-size_str = "200B"
+size_str = "2KB - 60 Requests"
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -122,7 +122,8 @@ def create_dynamic_performance_plot():
             line_group = line_group.sort_values('requests')
             
             ax.plot(line_group['requests'], line_group['min_time_ms'],
-                    label=f'MS_ENABLED={ms_enabled_value}, payload={payload_value}',
+                    #label=f'MS_ENABLED={ms_enabled_value}, payload={payload_value}',
+                    label="MS-TCP" if ms_enabled_value else "TCP",
                     color=colors.get(ms_enabled_value, 'gray'), # Default to gray if value is not 0 or 1
                     linestyle=payload_to_linestyle[payload_value],
                     marker='o',
