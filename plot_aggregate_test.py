@@ -45,6 +45,7 @@ def plot_data(processed_df, title_suffix="", x_scale="log", payload_lower_bound=
     """
     # Filter data based on lower bound if specified
     plot_df = processed_df.copy()
+    plot_df = plot_df[plot_df['num_clients'] <= 24]
     if payload_lower_bound is not None:
         plot_df = plot_df[plot_df['payload_size'] >= payload_lower_bound]
         if plot_df.empty:
@@ -60,6 +61,9 @@ def plot_data(processed_df, title_suffix="", x_scale="log", payload_lower_bound=
     # Define a list of line styles to cycle through for num_clients
     line_styles_list = [
         'solid',        # same as '-'
+        'dashdot',      # same as '-.'
+        (0, (1, 1)),    # densely dotted
+        (0, (5, 10)),   # long dash
         'dashed',       # same as '--'
         'dotted',       # same as ':'
         'dashdot',      # same as '-.'
@@ -89,7 +93,7 @@ def plot_data(processed_df, title_suffix="", x_scale="log", payload_lower_bound=
                     color=colors.get(ms_enabled_value, 'gray'), # Default to gray if value is not 0 or 1
                     linestyle=clients_to_linestyle[clients_value],
                     marker='o',
-                    markersize=5)
+                    markersize=3)
 
     # --- AXIS CONFIGURATION ---
     # Set x-axis scale
@@ -187,6 +191,34 @@ def create_dynamic_performance_plot():
     
     # New linear plot with optional filtering
     plot_data(processed_df, "Linear Scale", "linear", linear_plot_lower_bound)
+
+    # Load second CSV file
+    print("\n" + "="*50)
+    print("Now select the second CSV file...")
+
+    file_path2 = filedialog.askopenfilename(
+        title="Select the second CSV data file",
+        filetypes=(("CSV files", "*.csv"), ("All files", "*.*"))
+    )
+
+    if file_path2:
+        try:
+            df2 = pd.read_csv(file_path2, delimiter=';')
+            print("Second file loaded successfully.")
+            
+            # Process second file the same way
+            df2['throughput_kbps'] = (df2['dl_bytes'] / df2['time_ms'])
+            filtered_groups2 = df2.groupby(['MS_ENABLED', 'payload_size', 'num_clients'])['throughput_kbps'].apply(filter_outliers)
+            processed_df2 = filtered_groups2.groupby(['MS_ENABLED', 'payload_size', 'num_clients']).agg(['max', 'count']).reset_index()
+            processed_df2.rename(columns={'max': 'max_throughput_kbps'}, inplace=True)
+            
+            # Plot only log scale for second file
+            plot_data(processed_df2, "6/12/18/24 clients - Logarithmic Scale", "log")
+            
+        except Exception as e:
+            print(f"Error reading second file: {e}")
+    else:
+        print("No second file selected.")
 
 # Run the main function
 if __name__ == "__main__":
