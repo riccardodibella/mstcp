@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -67,12 +67,12 @@ int payload_size_arr[] = {200};
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS_MAX 32
-#define NUM_CLIENT_REQUESTS_MAX 100
-int num_client_requests_test = 100;
+#define NUM_CLIENTS_MAX 64
+#define NUM_CLIENT_REQUESTS_MAX 1000
+int num_client_requests_test = 1000;
 
 //int num_clients_arr[] = {6, 12/*, 18*/};
-int num_clients_arr[] = {6, 12, 18, 24, 30};
+//int num_clients_arr[] = {6, 12, 18, 24, 30};
 
 //int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000}; // OK WITH NO LOGS
 //int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 300000, 400000, 500000, 600000};
@@ -81,11 +81,20 @@ int num_clients_arr[] = {6, 12, 18, 24, 30};
 //int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000};
 //int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000/*, 700000, 800000*/};
 
-int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000/*, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000*//*, 700000, 800000*/};
+//int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000/*, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000*//*, 700000, 800000*/};
 
+
+#define MS_ENABLED false
+// TCP: 1, 6
+// MS: 1, 6, 32
+int num_clients_arr[] = {6}; 
+int payload_size_arr[] = {10000};
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 800000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 10000 // This is the maximum
+
+//#define DELAY_REQ_PROB 1E-1
+#define DELAY_DURATION_MS 1000
 
 #endif
 
@@ -107,9 +116,6 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define UPLINK_STREAM_DROP_PROB 0
 #define DOWNLINK_STREAM_DROP_PROB 1E-1
 #endif
-
-#define DELAY_REQ_PROB 1E-1
-#define DELAY_DURATION_MS 1000
 
 
 #define CLIENT 0
@@ -4752,6 +4758,28 @@ void main_client_app(){
 	int test_num_bytes = payload_size_arr[sample_uint32() % (sizeof(payload_size_arr)/sizeof(payload_size_arr[0]))];
 	int num_clients_test = num_clients_arr[sample_uint32() % (sizeof(num_clients_arr)/sizeof(num_clients_arr[0]))];
 
+	bool app_delay[NUM_CLIENT_REQUESTS_MAX];
+	for(int i=0; i<NUM_CLIENT_REQUESTS_MAX; i++){
+		app_delay[i] = false;
+	}
+	
+	#ifdef DELAY_REQ_PROB
+	int delayed = 0;
+	uint32_t old_prng_state = prng_state;
+	prng_state = 1234;
+	while(delayed < NUM_CLIENT_REQUESTS_MAX * DELAY_REQ_PROB){
+		// rejection sampling
+		int sampled_pos = sample_uint32() % NUM_CLIENT_REQUESTS_MAX;
+		if(app_delay[sampled_pos]){
+			continue;
+		}
+		app_delay[sampled_pos] = true;
+		delayed++;
+	}
+	prng_state = old_prng_state;
+	#endif
+
+
 	if(!MS_ENABLED && num_clients_test > 6){
 		num_clients_test = 6;
 	}
@@ -4846,7 +4874,7 @@ void main_client_app(){
 			if(client_active[i] && cl_st[i] == CLIENT_ST_REQ){
 				#ifdef DELAY_REQ_PROB
 				double sample = sample_uniform_0_1();
-				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\nX-Delay: %d\r\n\r\n", test_num_bytes, i, current_request_number[i], sample < DELAY_REQ_PROB);
+				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\nX-Delay: %d\r\n\r\n", test_num_bytes, i, current_request_number[i], app_delay[current_request_number[i]]);
 				#else
 				sprintf(client_buffer[i], "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", test_num_bytes, i, current_request_number[i]);
 				#endif
@@ -4958,7 +4986,7 @@ void main_client_app(){
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
-	/*
+	
 	DEBUG("all requests completed :)");
 	DEBUG("########################### Statitics ###########################");
 	long ul_sum = 0, dl_sum = 0;
@@ -4972,14 +5000,16 @@ void main_client_app(){
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
-	*/	
+	
 
+	/*
 	long ul_sum = 0, dl_sum = 0;
 	for(int i=0; i<num_clients_test; i++){
 		ul_sum += ul_bytes[i];
 		dl_sum += dl_bytes[i];
 	}
 	printf("%d;%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,num_clients_test, num_client_requests_test, test_num_bytes, meas_dur, dl_sum, ul_sum);
+	*/
 }
 #endif
 
