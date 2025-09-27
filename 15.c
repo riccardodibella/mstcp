@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 
 /* DEFINE MACROS */
 
@@ -39,7 +40,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_AGGREGATE
+#define CL_MAIN CL_MAIN_HTML
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -94,12 +95,12 @@ int payload_size_arr[] = {10000};
 #define RESP_PAYLOAD_BYTES 10000 // This is the maximum
 
 //#define DELAY_REQ_PROB 1E-1
-#define DELAY_DURATION_MS 1000
 
 #endif
 
 #if CL_MAIN == CL_MAIN_HTML
-#define NUM_CLIENTS 1
+#define MS_ENABLED false
+#define NUM_CLIENTS 6
 #endif
 
 #define REQ_BUF_SIZE 100
@@ -117,6 +118,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define DOWNLINK_STREAM_DROP_PROB 1E-1
 #endif
 
+#define DELAY_DURATION_MS 1000
 
 #define CLIENT 0
 #define SERVER 1
@@ -4403,6 +4405,8 @@ void main_client_app(){
 	addr.sin_port = htons(19500);
 	addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
 
+	int64_t meas_start = get_timestamp_ms();
+
 	s = mysocket(AF_INET,SOCK_STREAM,0);
 	if(s == -1){
 		myperror("mysocket");
@@ -4523,6 +4527,13 @@ void main_client_app(){
 			if(client_connected[i]){
 				continue;
 			}
+			if(started_requests >= num_images){
+				client_connected[i] = true;
+				client_active[i] = true;
+				cl_st[i] = CLIENT_ST_IDLE;
+				client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+				continue;
+			}
 			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
 			if(ret == -1 && myerrno == EAGAIN){
 				myerrno = 0;
@@ -4532,6 +4543,7 @@ void main_client_app(){
 				myperror("myconnect");
 				exit(EXIT_FAILURE);
 			}
+			DEBUG("connect %d", i);
 			client_connected[i] = true;
 			client_active[i] = true;
 			cl_st[i] = CLIENT_ST_IDLE;
@@ -4655,12 +4667,17 @@ void main_client_app(){
 					myclose(client_sockets[i]);
 					client_active[i] = false;
 					safe_free(client_buffer[i]);
+					DEBUG("close %d", i);
 				}
 			}
 		}
 	}
 
+	int64_t meas_end = get_timestamp_ms();
+	int64_t meas_dur = meas_end - meas_start;
+
 	DEBUG("all requests completed :)");
+	DEBUG("%"PRId64" ms", meas_dur);
 	DEBUG("wait...");
 	persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
@@ -5384,7 +5401,9 @@ void full_duplex_server_app(int listening_socket){
 
 						clients[i].fp = fopen(file_path, "r");
 						if(clients[i].fp != NULL){
+							disable_signal_reception(false);
 							fseek(clients[i].fp, 0, SEEK_END); // seek to end of file
+							enable_signal_reception(false);
 							clients[i].requested_payload_bytes = (int) ftell(clients[i].fp); // get current file pointer
 						}
 					}
@@ -5419,7 +5438,9 @@ void full_duplex_server_app(int listening_socket){
 				}else{
 					if(clients[i].current_resp_bytes < end_index){
 						// Read the whole file from the beginning
+						disable_signal_reception(false);
 						fseek(clients[i].fp, 0, SEEK_SET); // seek back to beginning of file
+						enable_signal_reception(false);
 						int res = fread(srv_data+end_index, clients[i].requested_payload_bytes, 1, clients[i].fp);
 						if(res < 0){
 							perror("fread");
@@ -5429,7 +5450,9 @@ void full_duplex_server_app(int listening_socket){
 						missing = end_index + res;
 					}else{
 						int start_position = clients[i].current_resp_bytes - end_index; // How many bytes we already have sent through mywrite
+						disable_signal_reception(false);
 						fseek(clients[i].fp, start_position, SEEK_SET); // seek to the first byte that was not sent through mywrite
+						enable_signal_reception(false);
 						int missing_from_file = clients[i].requested_payload_bytes - start_position;
 						int res = fread(srv_data, missing_from_file, 1, clients[i].fp);
 						if(res < 0){
@@ -5474,6 +5497,7 @@ void full_duplex_server_app(int listening_socket){
 				for(int cur2 = cur+1; cur2 < num_clients; cur2++){
 					clients[cur2-1] = clients[cur2];
 				}
+				DEBUG("num_clients=%d", num_clients);
 				num_clients--;
 				if(num_clients == 0){
 					clients = NULL;

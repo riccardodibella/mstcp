@@ -127,5 +127,5 @@ async def main():
 if __name__ == "__main__":
     start_time = time.time()
     asyncio.run(main())
-    print(f"--- {(time.time() - start_time)} seconds ---")
+    print(f"{round((time.time() - start_time)*1000)} ms")
 
