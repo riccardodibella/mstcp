@@ -78,7 +78,7 @@ trap 'cleanup' SIGINT
 FILENAME="serial_test_$(date +%Y%m%d_%H%M%S).csv"
 echo $FILENAME
 
-echo "MS_ENABLED;requests;payload_size;time_ms;dl_bytes;ul_bytes" > $FILENAME
+echo "MS_ENABLED;requests;payload_size;time_ms;dl_bytes;ul_bytes;time_hs_ms" > $FILENAME
 
 # Initial server cleanup
 stop_server
@@ -88,17 +88,19 @@ while true; do
     i=$((i + 1))
     echo "Iteration $i"
     
-    # Start server
+    # Start server for MS client
     if start_server; then
-        
-        # Generate random number 0 or 1 (50/50 chance)
-        if [ $((RANDOM % 2)) -eq 0 ]; then
-            run_client "tcp"
-        else
-            run_client "ms"
-        fi
+        run_client "ms"
     fi
     
-    # Always stop server
+    # Stop server after MS client
+    stop_server
+    
+    # Start server for TCP client
+    if start_server; then
+        run_client "tcp"
+    fi
+    
+    # Stop server after TCP client
     stop_server
 done

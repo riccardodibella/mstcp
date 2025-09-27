@@ -25,8 +25,8 @@
 
 /* DEFINE MACROS */
 
-//#define NOLOGS
-#define SHORTLOGS
+#define NOLOGS
+//#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -39,7 +39,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_AGGREGATE
+#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -56,13 +56,14 @@ int payload_size_arr[] = {10, 100, 1000, 10000, 100000};
 int num_req_arr[] = {1, 2, 4, 6, 8, 10};
 int payload_size_arr[] = {10, 100, 1000, 2000, 5000, 10000, 20000};
 */
-//int num_req_arr[] = {2/*, 2, 4, 6, 8, 10*/};
-//int payload_size_arr[] = {/*200, 2000, 20000,*/ 100000000};
+int num_req_arr[] = {/*1, 2, 4, 6, 8, */10};
+//int payload_size_arr[] = {/*200, 2000, 20000, 200000*/};
+int payload_size_arr[] = {200};
 
-int num_req_arr[] = {1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
-int payload_size_arr[] = {2000};
+//int num_req_arr[] = {1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+//int payload_size_arr[] = {2000};
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 2000
+#define RESP_PAYLOAD_BYTES 200000
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
@@ -870,6 +871,9 @@ void print_tcp_segment(struct tcp_segment* tcp){
 	#ifdef NOLOGS
 	return; // Disables logging
 	#endif
+	#ifdef NODEBUG
+	return;
+	#endif
 	printf("----TCP SEGMENT----\n");
 	printf("PORTS: SRC %u DST %u\n", htons(tcp->s_port), htons(tcp->d_port));
 	printf("SEQ %u ACK %u\n", htonl(tcp->seq), htonl(tcp->ack));
@@ -930,11 +934,17 @@ void print_tcp_segment(struct tcp_segment* tcp){
 	printf("-------------------\n");
 }
 void print_mac(uint8_t* mac){
+	#ifdef NODEBUG
+	return;
+	#endif
 	for(int i=0; i<6; i++){
 		printf("%.2X%s", mac[i],i!=5?":":"\n");
 	}
 }
 void print_ip(uint8_t* ip){
+	#ifdef NODEBUG
+	return;
+	#endif
 	for(int i=0; i<4; i++){
 		printf("%d%s", ip[i],i!=3?".":"\n");
 	}
@@ -942,6 +952,9 @@ void print_ip(uint8_t* ip){
 void print_ip_datagram(struct ip_datagram* ip){
 	#ifdef NOLOGS
 	return; // Disables logging
+	#endif
+	#ifdef NODEBUG
+	return;
 	#endif
 	printf("----IP DATAGRAM----\n");
 	printf("VER_IHL: 0x%.2x\n", ip->ver_ihl);
@@ -958,6 +971,12 @@ void print_ip_datagram(struct ip_datagram* ip){
 	printf("-------------------\n");
 }
 void print_arp_packet(struct arp_packet* arp){
+	#ifdef NOLOGS
+	return; // Disables logging
+	#endif
+	#ifdef NODEBUG
+	return;
+	#endif
 	/*
 	struct arp_packet {
 		unsigned short int htype;
@@ -988,6 +1007,9 @@ void print_arp_packet(struct arp_packet* arp){
 void print_l2_packet(uint8_t* packet){
 	#ifdef NOLOGS
 	return; // Disables logging
+	#endif
+	#ifdef NODEBUG
+	return;
 	#endif
 	printf("---- L2 PACKET ----\n");
 	printf("SRC MAC: ");
@@ -2357,6 +2379,8 @@ uint32_t gen_sequence_offset(){
 	return 0;
 }
 
+int64_t hs_time_start;
+int64_t hs_time_tot = 0;
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
 	assert_handler_lock_acquired("fsm");
@@ -2480,6 +2504,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			opt_ptr[17] = 3; // Window Scale Length
 			opt_ptr[18] = DEFAULT_WINDOW_SCALE;
 
+			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
@@ -2676,6 +2701,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			opt_ptr[21] = 3; // Window Scale Length
 			opt_ptr[22] = DEFAULT_WINDOW_SCALE;
 
+			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
@@ -2806,6 +2832,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					prepare_tcp(s, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 
 					tcb->st = TCB_ST_ESTABLISHED;
+					hs_time_tot  += get_timestamp_ms() - hs_time_start;
 				}
 			}
 			break;
@@ -5045,7 +5072,13 @@ void main_client_app(){
 				break;
 			}
 		}
+		//if(num_req == 0 || num_req % 2){
+			int64_t meas_end = get_timestamp_ms();
+			int64_t meas_dur = meas_end - meas_start;
+			printf("%d;%d;%d;%"PRId64";%ld;%ld;%ld\n", MS_ENABLED?1:0,num_req+1, test_num_bytes, meas_dur, dl_sum, ul_sum, hs_time_tot);
+		//}
 	}
+	#if 0
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
 
@@ -5058,9 +5091,10 @@ void main_client_app(){
 	DEBUG("wait...");
 	*/
 	
-	printf("%d;%d;%d;%"PRId64";%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum);
+	printf("%d;%d;%d;%"PRId64";%ld;%ld;%ld\n", MS_ENABLED?1:0,test_num_requests, test_num_bytes, meas_dur, dl_sum, ul_sum, hs_time_tot);
 	//persistent_nanosleep(2, 0);
 	//DEBUG("main_client_app end");
+	#endif
 }
 #endif
 
