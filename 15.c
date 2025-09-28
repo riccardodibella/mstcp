@@ -40,7 +40,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_HTML
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -70,7 +70,7 @@ int payload_size_arr[] = {200};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS_MAX 64
 #define NUM_CLIENT_REQUESTS_MAX 1000
-int num_client_requests_test = 1000;
+int num_client_requests_test = 1024;
 
 //int num_clients_arr[] = {6, 12/*, 18*/};
 //int num_clients_arr[] = {6, 12, 18, 24, 30};
@@ -89,10 +89,10 @@ int num_client_requests_test = 1000;
 // TCP: 1, 6
 // MS: 1, 6, 32
 int num_clients_arr[] = {6}; 
-int payload_size_arr[] = {10000};
+int payload_size_arr[] = {500};
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 10000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 100000 // This is the maximum
 
 //#define DELAY_REQ_PROB 1E-1
 
@@ -4716,7 +4716,7 @@ void main_client_app(){
 		exit(EXIT_FAILURE);
 	}
 	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
-	sprintf(data, "GET /1000 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
+	sprintf(data, "GET /26677 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
 		ret = mywrite(s, data+sent, missing);
@@ -4855,6 +4855,13 @@ void main_client_app(){
 		// Attempt connection for all non-connected clients
 		for(int i=0; i<num_clients_test; i++){
 			if(client_connected[i]){
+				continue;
+			}
+			if(started_requests >= num_client_requests_test){
+				client_connected[i] = true;
+				client_active[i] = true;
+				cl_st[i] = CLIENT_ST_IDLE;
+				client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
 				continue;
 			}
 			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
@@ -5014,8 +5021,8 @@ void main_client_app(){
 	}
 	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
-	DEBUG("wait...");
-	persistent_nanosleep(2, 0);
+	//DEBUG("wait...");
+	//persistent_nanosleep(2, 0);
 	DEBUG("main_client_app end");
 	
 
