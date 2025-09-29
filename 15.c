@@ -70,7 +70,7 @@ int payload_size_arr[] = {200};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS_MAX 64
 #define NUM_CLIENT_REQUESTS_MAX 1000
-int num_client_requests_test = 1024;
+int num_client_requests_test = 64;
 
 //int num_clients_arr[] = {6, 12/*, 18*/};
 //int num_clients_arr[] = {6, 12, 18, 24, 30};
@@ -85,11 +85,11 @@ int num_client_requests_test = 1024;
 //int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000/*, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000*//*, 700000, 800000*/};
 
 
-#define MS_ENABLED false
+#define MS_ENABLED true
 // TCP: 1, 6
 // MS: 1, 6, 32
-int num_clients_arr[] = {6}; 
-int payload_size_arr[] = {500};
+int num_clients_arr[] = {32}; 
+int payload_size_arr[] = {10000};
 
 #undef RESP_PAYLOAD_BYTES
 #define RESP_PAYLOAD_BYTES 100000 // This is the maximum
@@ -4704,6 +4704,8 @@ void main_client_app(){
 	addr.sin_port = htons(19500);
 	addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
 
+	int64_t meas_start = get_timestamp_ms();
+
 	s = mysocket(AF_INET,SOCK_STREAM,0);
 	if(s == -1){
 		myperror("mysocket");
@@ -4716,7 +4718,7 @@ void main_client_app(){
 		exit(EXIT_FAILURE);
 	}
 	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
-	sprintf(data, "GET /26677 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
+	sprintf(data, "GET /2685 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
 		ret = mywrite(s, data+sent, missing);
@@ -4802,7 +4804,7 @@ void main_client_app(){
 	}
 	
 	//DEBUG("Starting the measurement");
-	int64_t meas_start = get_timestamp_ms();
+	
 
 
 

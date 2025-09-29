@@ -6,9 +6,9 @@ plot_titles = ["Page Load Time Comparison (1024 500B Images)", "Page Load Time C
 
 # Sample data array [3 plots][4 columns]
 data = [
-    [5880, 752, 5107, 1069],   # First histogram data
-    [683, 74, 433, 323],  # Second histogram data
-    [769, 419, 461, 550]      # Third histogram data
+    [6835, 1252, 5107, 1069],   # First histogram data
+    [1001, 210, 433, 323],  # Second histogram data
+    [1215, 862, 461, 550]      # Third histogram data
 ]
 
 # Column labels (split into 2 lines)
