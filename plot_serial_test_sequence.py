@@ -1,37 +1,15 @@
+file_name = "serial_test_200KB_sequence.csv"
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import filedialog
+import numpy as np
 
 import matplotlib
 matplotlib.use('TkAgg')  # Ensures GUI backend
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL) # https://stackoverflow.com/a/75864329
-
-
-def filter_outliers(values: pd.Series) -> pd.Series:
-   # return values
-   """Remove outliers using IQR method, only if outliers are detected."""
-   if len(values) < 4:
-       return values
-   
-   Q1 = values.quantile(0.25)
-   Q3 = values.quantile(0.75)
-   IQR = Q3 - Q1
-   
-   # If IQR is 0 (all values very similar), no outliers to remove
-   if IQR == 0:
-       return values
-   
-   lower_bound = Q1 - 1.5 * IQR
-   upper_bound = Q3 + 1.5 * IQR
-   
-   # Only filter if there are actual outliers
-   outliers_exist = (values < lower_bound).any() or (values > upper_bound).any()
-   if not outliers_exist:
-       return values
-   
-   return values[(values >= lower_bound) & (values <= upper_bound)]
 
 
 def identify_sequences(group):
@@ -178,18 +156,7 @@ def get_best_sequence_data(group):
     # If no complete sequence found, fall back to original method
     if best_sequence_data is None or best_sequence_data.empty:
         print(f"  Warning: No complete sequences found, falling back to minimum selection per request count")
-        result_data = []
-        for req_val in unique_requests:
-            req_rows = group[group['requests'] == req_val]
-            if not req_rows.empty:
-                # Filter outliers
-                filtered_times = filter_outliers(req_rows['time_ms'])
-                if len(filtered_times) > 0:
-                    min_idx = filtered_times.idxmin()
-                    result_data.append(group.loc[min_idx])
-                else:
-                    min_idx = req_rows['time_ms'].idxmin()
-                    result_data.append(group.loc[min_idx])
+        exit()
         
         if result_data:
             best_sequence_data = pd.DataFrame(result_data)
@@ -209,18 +176,10 @@ def create_dynamic_performance_plot():
     root = tk.Tk()
     root.withdraw()  # Hide the main tkinter window
 
-    file_path = filedialog.askopenfilename(
-        title="Select the CSV data file",
-        filetypes=(("CSV files", "*.csv"), ("All files", "*.*"))
-    )
-
-    if not file_path:
-        print("No file selected. The program will now exit.")
-        return
 
     # Load the selected file as a pandas DataFrame
     try:
-        df = pd.read_csv(file_path, delimiter=';')
+        df = pd.read_csv(file_name, delimiter=';')
         print("File loaded successfully. Here's a preview of the data:")
         print(df.head())
     except Exception as e:
@@ -314,7 +273,10 @@ def create_dynamic_performance_plot():
                 # Plot based on type
                 if plot_type in ["combined", "time_ms"]:
                     # Plot time_ms (solid lines with circles)
-                    time_ms_label = base_label if (base_label not in added_labels and plot_type != "combined") else (base_label if plot_type == "combined" and base_label not in added_labels else None)
+                    if plot_type == "combined":
+                        time_ms_label = f"{base_label} (Handshake + App Traffic)" if f"{base_label} (Handshake + App Traffic)" not in added_labels else None
+                    else:
+                        time_ms_label = f"{base_label} (Handshake + App Traffic)" if base_label not in added_labels else None
                     if time_ms_label:
                         added_labels.add(base_label)
                     
@@ -367,6 +329,35 @@ def create_dynamic_performance_plot():
                                 markersize=4,
                                 alpha=0.8)
 
+                        # --- Trend line ONLY for MS-TCP and ONLY on the App-Time-only plot ---
+                        if plot_type == "difference" and ms_enabled_value == 1:
+                            sorted_diff = valid_diff_data.sort_values('requests')
+                            if len(sorted_diff) >= 2:
+                                x1 = sorted_diff['requests'].iloc[0]
+                                y1 = sorted_diff['time_difference'].iloc[0]
+                                x2 = sorted_diff['requests'].iloc[1]
+                                y2 = sorted_diff['time_difference'].iloc[1]
+                                if x2 != x1:
+                                    m = (y2 - y1) / (x2 - x1)
+                                    x_min = sorted_diff['requests'].min()
+                                    x_max = sorted_diff['requests'].max()
+                                    y_min = m * (x_min - x1) + y1
+                                    y_max = m * (x_max - x1) + y1
+
+                                    trend_label = "Reference linear trend"
+                                    # add legend entry only once total
+                                    if "TREND_MS_ONLY" in added_labels:
+                                        trend_label = None
+                                    else:
+                                        added_labels.add("TREND_MS_ONLY")
+
+                                    ax.plot([x_min, x_max], [y_min, y_max],
+                                            color=colors.get(ms_enabled_value, 'gray'),
+                                            linestyle='--',
+                                            linewidth=1.0,
+                                            alpha=0.7,
+                                            label=trend_label)
+
         # --- DYNAMIC AXIS CONFIGURATION ---
         request_ticks = sorted(final_data['requests'].unique())
         ax.set_xticks(request_ticks)
@@ -375,15 +366,15 @@ def create_dynamic_performance_plot():
         ax.set_xlabel("Number of Requests")
         
         if plot_type == "combined":
-            title = f"Full Performance Comparison - 10 Serial 200KB Requests"
+            title = f"Full Performance Comparison - Serial 200KB Requests"
             #if has_time_hs_ms:
                 #title += "\n(Solid: time_ms, Dashed: time_hs_ms, Dotted: difference)"
         elif plot_type == "time_ms":
-            title = f"Total Time - 10 Serial 200KB Requests"
+            title = f"Total Time (Handshake + Application Traffic) - Serial 200KB Requests"
         elif plot_type == "time_hs_ms":
-            title = f"Handshake Time - 10 Serial 200KB Requests"
+            title = f"Handshake Time - Serial 200KB Requests"
         elif plot_type == "difference":
-            title = f"Application Traffic Time - 10 Serial 200KB Requests"
+            title = f"Application Traffic Time - Serial 200KB Requests"
         ax.set_ylabel("Time [ms]")
         
         ax.set_title(title)
