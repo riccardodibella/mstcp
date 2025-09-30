@@ -1,5 +1,3 @@
-size_str = "2KB - 60 Requests"
-
 import pandas as pd
 import matplotlib.pyplot as plt
 import tkinter as tk
@@ -332,7 +330,7 @@ def create_dynamic_performance_plot():
                     # Plot time_hs_ms (dashed lines with squares for combined, solid for separate)
                     valid_hs_data = line_group.dropna(subset=['time_hs_ms'])
                     if not valid_hs_data.empty:
-                        hs_label_suffix = " (HS)" if plot_type == "combined" else ""
+                        hs_label_suffix = " (Handshake)" if plot_type == "combined" else ""
                         hs_label = f"{base_label}{hs_label_suffix}" if f"{base_label}{hs_label_suffix}" not in added_labels else None
                         if hs_label:
                             added_labels.add(f"{base_label}{hs_label_suffix}")
@@ -354,7 +352,7 @@ def create_dynamic_performance_plot():
                     
                     valid_diff_data = line_group_copy.dropna(subset=['time_difference'])
                     if not valid_diff_data.empty:
-                        diff_label_suffix = " (Diff)" if plot_type == "combined" else ""
+                        diff_label_suffix = " (App Traffic)" if plot_type == "combined" else ""
                         diff_label = f"{base_label}{diff_label_suffix}" if f"{base_label}{diff_label_suffix}" not in added_labels else None
                         if diff_label:
                             added_labels.add(f"{base_label}{diff_label_suffix}")
@@ -377,19 +375,16 @@ def create_dynamic_performance_plot():
         ax.set_xlabel("Number of Requests")
         
         if plot_type == "combined":
-            ax.set_ylabel("Time [ms]")
-            title = f"Combined - Time vs. Requests {size_str} (Best Sequence Selection)"
-            if has_time_hs_ms:
-                title += "\n(Solid: time_ms, Dashed: time_hs_ms, Dotted: difference)"
+            title = f"Full Performance Comparison - 10 Serial 200KB Requests"
+            #if has_time_hs_ms:
+                #title += "\n(Solid: time_ms, Dashed: time_hs_ms, Dotted: difference)"
         elif plot_type == "time_ms":
-            ax.set_ylabel("Time [ms]")
-            title = f"Time MS - Time vs. Requests {size_str} (Best Sequence Selection)"
+            title = f"Total Time - 10 Serial 200KB Requests"
         elif plot_type == "time_hs_ms":
-            ax.set_ylabel("Time HS [ms]")
-            title = f"Time HS MS - Time vs. Requests {size_str} (Best Sequence Selection)"
+            title = f"Handshake Time - 10 Serial 200KB Requests"
         elif plot_type == "difference":
-            ax.set_ylabel("Time Difference [ms]")
-            title = f"Time Difference (MS - HS) - Time vs. Requests {size_str} (Best Sequence Selection)"
+            title = f"Application Traffic Time - 10 Serial 200KB Requests"
+        ax.set_ylabel("Time [ms]")
         
         ax.set_title(title)
         ax.grid(True, which='both', linestyle='--', linewidth=0.5)
@@ -402,7 +397,7 @@ def create_dynamic_performance_plot():
         plt.show()
 
     # Create all plots
-    print("\nGenerating plots...")
+    print("Generating plots...")
     
     # Plot 1: Combined (all three line types)
     create_plot("combined")
