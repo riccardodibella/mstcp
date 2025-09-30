@@ -231,7 +231,7 @@ def create_dynamic_performance_plot():
     # 3. Create all plots
     def create_plot(plot_type="combined"):
         """Create a single plot of specified type"""
-        fig, ax = plt.subplots(figsize=(12, 8))
+        fig, ax = plt.subplots(figsize=(9, 6))
 
         # --- DYNAMIC STYLING ---
         # Define colors for the MS_ENABLED families
