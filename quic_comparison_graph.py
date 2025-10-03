@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Sample data - replace with your actual data
-plot_titles = ["Page Load Time Comparison (1024 500B Images)", "Page Load Time Comparison (64 500B Images)", "Page Load Time Comparison (64 10KB Images)"]
+plot_titles = ["Page Load Time Comparison (1024 x 500B Images)", "Page Load Time Comparison (64 x 500B Images)", "Page Load Time Comparison (64 x 10KB Images)"]
 
 # Sample data array [3 plots][4 columns]
 data = [
