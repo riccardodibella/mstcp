@@ -26,7 +26,7 @@
 
 /* DEFINE MACROS */
 
-#define NOLOGS
+//#define NOLOGS
 //#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
@@ -68,31 +68,18 @@ int payload_size_arr[] = {200};
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS_MAX 64
-#define NUM_CLIENT_REQUESTS_MAX 1000
-int num_client_requests_test = 64;
+#define NUM_CLIENTS_MAX 6
+#define NUM_CLIENT_REQUESTS_MAX 6
+int num_client_requests_test = 6;
 
-//int num_clients_arr[] = {6, 12/*, 18*/};
-//int num_clients_arr[] = {6, 12, 18, 24, 30};
-
-//int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000}; // OK WITH NO LOGS
-//int payload_size_arr[] = {/*100, 200, 500,*/ 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 300000, 400000, 500000, 600000};
-//int payload_size_arr[] = {100000, 150000, 200000, 300000, 400000, 500000, 600000};
-
-//int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000};
-//int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000/*, 700000, 800000*/};
-
-//int payload_size_arr[] = {1000, 2000, 5000, 10000, 20000, 50000, 100000/*, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000*//*, 700000, 800000*/};
-
-
-#define MS_ENABLED true
+#define MS_ENABLED false
 // TCP: 1, 6
 // MS: 1, 6, 32
-int num_clients_arr[] = {32}; 
-int payload_size_arr[] = {10000};
+int num_clients_arr[] = {6}; 
+int payload_size_arr[] = {100};
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 100000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 100 // This is the maximum
 
 //#define DELAY_REQ_PROB 1E-1
 
@@ -3055,6 +3042,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					fdinfo[s].tcb->listening_fd = s;
 					fdinfo[s].sid = SID_UNASSIGNED; // Go back from stream 0 (used to open the incoming connection) to unassigned
 				}
+			}else if(event == FSM_EVENT_PKT_RCV && (tcp->flags & SYN) && !(tcp->flags & ACK)){
+				LOG_MESSAGE("Dropped SYN packet");
 			}
 			break;
 		case TCB_ST_ESTABLISHED:
@@ -3145,6 +3134,7 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	}
 
 	if(myconnect_mode == MYCONNECT_MODE_BLOCKING){
+		DEBUG("myconnect blocking socket %d", s);
 		struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
 		disable_signal_reception(false);
 		int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
@@ -3179,6 +3169,7 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	}else{ // myconnect_mode == MYCONNECT_MODE_NON_BLOCKING
 		if(fdinfo[s].st == FDINFO_ST_UNBOUND || fdinfo[s].st == FDINFO_ST_BOUND){
 			struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
+			DEBUG("Active open FSM socket %d", s);
 			disable_signal_reception(false);
 			int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
 			enable_signal_reception(false);
@@ -3753,7 +3744,7 @@ void myio(int ignored){
 			}
 			if(i == MAX_FD){
 				for(i=0;i<MAX_FD;i++){
-					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port) ){
+					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN || fdinfo[i].tcb->st == TCB_ST_SYN_RECEIVED) && (tcp->d_port == fdinfo[i].l_port) ){
 						break;
 					}
 				}
@@ -4718,7 +4709,7 @@ void main_client_app(){
 		exit(EXIT_FAILURE);
 	}
 	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
-	sprintf(data, "GET /2685 HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
+	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
 		ret = mywrite(s, data+sent, missing);

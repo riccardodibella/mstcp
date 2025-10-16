@@ -1,0 +1,1 @@
+ssh dibella@liquigas.duckdns.org "sudo /usr/sbin/tcpdump -U -s0 'not port 22' -i eth0 -w -" | "C:\Program Files\Wireshark\Wireshark.exe" -k -i -
