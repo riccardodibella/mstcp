@@ -69,8 +69,8 @@ int payload_size_arr[] = {200};
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 #define NUM_CLIENTS_MAX 6
-#define NUM_CLIENT_REQUESTS_MAX 6
-int num_client_requests_test = 6;
+#define NUM_CLIENT_REQUESTS_MAX 12
+int num_client_requests_test = 12;
 
 #define MS_ENABLED false
 // TCP: 1, 6
@@ -1436,9 +1436,22 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 
-int prepare_tcp(int s, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
+
+// see update_tcp_header for backlog_entry_index
+int prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("prepare_tcp");
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+
+	if(backlog_entry_index >= 0){
+		if(tcb->st != TCB_ST_LISTEN){
+			ERROR("prepare_tcp backlog_entry_index %d >= 0 with main TCB state not listen", backlog_entry_index);
+		}
+		tcb = &(fdinfo[s].channel_backlog[backlog_entry_index]);
+	}
+	if(tcb->st == 0 || tcb->st == TCB_ST_LISTEN || tcb->st == TCB_ST_LISTEN){
+		ERROR("prepare_tcp incompatible tcb state %d", tcb->st);
+	}
+
 	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof(struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
@@ -1651,12 +1664,13 @@ unsigned short int tcp_checksum(uint8_t* b1, int len1, uint8_t* b2, int len2){
 	return (0xFFFF - total);
 }
 
-void update_tcp_header(int s, struct txcontrolbuf *txctrl){
+void update_tcp_header(int s /* main TCB file descriptor */, int backlog_entry_index /* >= 0 for sockets in the backlog of fdinfo entry s; -1 otherwise */, struct txcontrolbuf *txctrl){
 	assert_handler_lock_acquired("update_tcp_header");
 	static bool ssn_wrap_warning[32] = {false};
 	if(txctrl == NULL){
 		ERROR("update_tcp_header NULL txctrl");
 	}
+
 	/*
 	DEFERRED FIELDS
 	tcp->ack;
@@ -1669,6 +1683,15 @@ void update_tcp_header(int s, struct txcontrolbuf *txctrl){
 	*/
 
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+
+	if(backlog_entry_index >= 0){
+		if(tcb->st != TCB_ST_LISTEN){
+			ERROR("update_tcp_header backlog_entry_index %d >= 0 with main TCB state not listen", backlog_entry_index);
+		}
+		tcb = &(fdinfo[s].channel_backlog[backlog_entry_index]);
+
+		// We take everything from the backlog TCB, apart from the local address of the pseudo header which is taken from fdinfo
+	}
 
 	struct tcp_segment* tcp = txctrl->segment;
 
@@ -2179,7 +2202,7 @@ void circular_start_scheduler(int s){
 				current_transfer_bytes -= payload_length;
 
 				if(!tcb->ms_option_enabled){
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 				}else{
 					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 					uint8_t* opt = malloc(optlen);
@@ -2190,7 +2213,7 @@ void circular_start_scheduler(int s){
 					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
 					update_next_ssn(&(tcb->next_ssn[sid]));
 
-					prepare_tcp(s, ACK, temp_payload_buf, payload_length, opt, optlen);
+					prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, opt, optlen);
 					free(opt);
 				}
 			}
@@ -2198,7 +2221,7 @@ void circular_start_scheduler(int s){
 			if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_REQUESTED){
 				if(tcb->txfree[sid] == TX_BUFFER_SIZE){
 					if(!tcb->ms_option_enabled){
-						prepare_tcp(s, ACK | FIN, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+						prepare_tcp(s, -1, ACK | FIN, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 					}else{
 						// Enqueue LSS segment
 						int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -2212,7 +2235,7 @@ void circular_start_scheduler(int s){
 
 						uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-						prepare_tcp(s, ACK | DMP, dummy_payload, 1, opt, optlen);
+						prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 						free(dummy_payload);
 						free(opt);
 					}
@@ -2500,7 +2523,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			opt_ptr[18] = DEFAULT_WINDOW_SCALE;
 
 			hs_time_start = get_timestamp_ms();
-			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
+			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
@@ -2697,7 +2720,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			opt_ptr[22] = DEFAULT_WINDOW_SCALE;
 
 			hs_time_start = get_timestamp_ms();
-			prepare_tcp(s,SYN,NULL,0,opt_ptr,opt_len);
+			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
 			free(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
@@ -2719,6 +2742,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 		case TCB_ST_SYN_SENT:
 			if(event == FSM_EVENT_PKT_RCV){
 				if((tcp->flags&SYN) && (tcp->flags&ACK) && (htonl(tcp->ack)==tcb->seq_offs + 1)){
+					DEBUG("SYN+ACK received");
 					tcb->seq_offs++;
 					tcb->ack_offs = htonl(tcp->seq) + 1;	
 					free(tcb->txfirst->segment);
@@ -2824,7 +2848,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					We include all the usual payload options in this ACK
 					(we could avoid inserting the SACK, but it is simpler to do like this)
 					*/
-					prepare_tcp(s, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					prepare_tcp(s, -1, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 
 					tcb->st = TCB_ST_ESTABLISHED;
 					hs_time_tot  += get_timestamp_ms() - hs_time_start;
@@ -2833,9 +2857,81 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			break;
 		case TCB_ST_LISTEN:
 			if(event == FSM_EVENT_PKT_RCV){
+				if(!(tcp->flags & SYN) && (tcp->flags & ACK)){
+					// ACK of the 3 way handshake: Find the corresponding entry in the backlog, and transition it from SYN_RECEIVED to ESTABLISHED
+
+					int backlog_index;
+					for(backlog_index = 0; backlog_index < fdinfo[s].backlog_length; backlog_index++){
+						tcb = &(fdinfo[s].channel_backlog[backlog_index]);
+						if(tcb->st == TCB_ST_SYN_RECEIVED && (tcp->s_port == tcb->r_port) && (ip->srcaddr == tcb->r_addr)){
+							// found matching backlog entry
+
+							// the current pointer "tcb" will be used for the remaining part of the code
+							break;
+						}
+					}
+					if(backlog_index == fdinfo[s].backlog_length){
+						// no backlog entry found
+						break;
+					}
+
+					if(htonl(tcp->ack) == tcb->seq_offs + 1){
+						// Passive open connection establishment
+						free(tcb->txfirst->segment);
+						free(tcb->txfirst);
+						tcb->txfirst = tcb->txlast = NULL;
+						tcb->seq_offs++;
+						tcb->ack_offs=htonl(tcp->seq);
+						tcb->st = TCB_ST_ESTABLISHED;
+						
+						if(fdinfo[s].backlog_length == fdinfo[s].ready_channels){
+							// The incoming connection (MS or not) cannot be accepted
+							fast_send_tcp(s, RST, NULL, 0);
+							ERROR("TODO reset TCB");
+						}
+						fdinfo[s].ready_channels++;
+						fdinfo[s].ready_streams++; // Stream 0 is counted but is not inserted in the stream backlog
+
+						/* Initialization of the stream-specific fields and buffers */
+
+						tcb->stream_state[0] = STREAM_STATE_READY;
+						tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
+						tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = NULL;
+						//tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
+						tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+						tcb->txfree[0] = TX_BUFFER_SIZE;
+						tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
+						tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
+
+						tcb->next_rx_ssn[0] = 1; // SSN 0 already received (SYN+ACK)
+						tcb->stream_fsm_timer[0] = 0;
+						for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
+							tcb->stream_state[i] = STREAM_STATE_UNUSED;
+							tcb->stream_tx_buffer[i] = NULL;
+							tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
+							tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
+							tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
+							tcb->txfree[i] = 0;
+							tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
+							tcb->next_ssn[i] = 0;
+							tcb->next_rx_ssn[i] = 0;
+							tcb->stream_fsm_timer[i] = 0;
+							tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
+							tcb->lss_received[i] = tcb->lss_consumed[i] = false;
+						}
+						tcb->listening_fd = s;
+					}
+
+
+					break;
+				}
+
 				if(!(tcp->flags & SYN)){
 					break;
 				}
+
+				// The packet is a SYN: create a backlog entry for the new connection, and set it to state SYN_RECEIVED
+
 
 				bool ms_received = false;
 				bool sack_perm_received = false;
@@ -2885,6 +2981,24 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					ERROR("SACK not enabled with the SYN");
 				}
 
+
+
+
+				// End of SYN segment parsing: now we can duplicate the TCB and modify the one in the backlog
+
+				int cursor_index;
+				for(cursor_index = 0; cursor_index < fdinfo[s].backlog_length && fdinfo[s].channel_backlog[cursor_index].st != 0; cursor_index++); // Empty entries are bzero-ed, so they will have state 0
+				if(cursor_index == fdinfo[s].backlog_length){
+					ERROR("insufficient backlog size; the connection request should be ignored or RSTed");
+				}
+				struct tcpctrlblk* backlog_tcb = fdinfo[s].channel_backlog + cursor_index; // free tcb in the backlog
+				memcpy(backlog_tcb, tcb, sizeof(struct tcpctrlblk));
+
+				tcb = backlog_tcb;
+
+
+				DEBUG("TCB duplicated in backlog entry %d", cursor_index);
+
 				tcb->in_window_scale_factor = win_scale_factor_received;
 				tcb->out_window_scale_factor = DEFAULT_WINDOW_SCALE;
 				tcb->mss = MIN(mss_received, TCP_MSS);
@@ -2912,7 +3026,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE;
 
-				fdinfo[s].sid = 0; // We use stream 0 to open the connection
+				tcb->st = TCB_ST_SYN_RECEIVED; // state of the TCB in the backlog. The listening socket TCB remains in state LISTEN
+
 
 				uint8_t* opt_ptr = NULL;
 				int opt_len;
@@ -2971,79 +3086,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				}
 
 				assert_handler_lock_acquired("SYN|ACK");
-				prepare_tcp(s, SYN|ACK, NULL, 0, opt_ptr, opt_len);
+				//ERROR("Non va bene! Il segmento va aggiunto alla coda del TCB nella backlog, non a quello in stato LISTEN");
+				prepare_tcp(s, cursor_index, SYN|ACK, NULL, 0, opt_ptr, opt_len);
 				free(opt_ptr);
-    			tcb->st = TCB_ST_SYN_RECEIVED;
-			}
-			break;
-		case TCB_ST_SYN_RECEIVED:
-			if(event == FSM_EVENT_PKT_RCV && !(tcp->flags & SYN) && (tcp->flags & ACK)){
-				// It is an ACK (and it is not a SYN, that may be RETXed)
-				if(htonl(tcp->ack) == tcb->seq_offs + 1){
-					// Passive open connection establishment
-					free(tcb->txfirst->segment);
-					free(tcb->txfirst);
-					tcb->txfirst = tcb->txlast = NULL;
-					tcb->seq_offs++;
-					tcb->ack_offs=htonl(tcp->seq);
-					tcb->st = TCB_ST_ESTABLISHED;
-					
-					if(fdinfo[s].backlog_length == fdinfo[s].ready_channels){
-						// The incoming connection (MS or not) cannot be accepted
-						prepare_tcp(s,RST,NULL,0,NULL,0);
-						ERROR("TODO reset TCB");
-					}
-					fdinfo[s].ready_channels++;
-					fdinfo[s].ready_streams++; // Stream 0 is counted but is not inserted in the stream backlog
-
-
-					/* Duplication of the current TCB and insertion in the backlog */
-
-					int cursor_index;
-					for(cursor_index = 0;cursor_index < fdinfo[s].backlog_length && fdinfo[s].channel_backlog[cursor_index].st != 0; cursor_index++); // Empty entries are bzero-ed, so they will have state 0
-					struct tcpctrlblk* backlog_tcb = fdinfo[s].channel_backlog + cursor_index; // free tcb in the backlog
-					memcpy(backlog_tcb, tcb, sizeof(struct tcpctrlblk));
-
-
-					/* Initialization of the stream-specific fields and buffers */
-
-					backlog_tcb->stream_state[0] = STREAM_STATE_READY;
-					backlog_tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
-					backlog_tcb->stream_rx_queue[0] = backlog_tcb->stream_rx_queue_tail[0] = NULL;
-					//backlog_tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
-					backlog_tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-					backlog_tcb->txfree[0] = TX_BUFFER_SIZE;
-					backlog_tcb->tx_buffer_occupied_region_start[0] = backlog_tcb->tx_buffer_occupied_region_end[0] = 0;
-					backlog_tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
-
-					backlog_tcb->next_rx_ssn[0] = 1; // SSN 0 already received (SYN+ACK)
-					backlog_tcb->stream_fsm_timer[0] = 0;
-					for(int i = 1; i<TOT_SID; i++){ // Initialize as unused all the streams after SID 0
-						backlog_tcb->stream_state[i] = STREAM_STATE_UNUSED;
-						backlog_tcb->stream_tx_buffer[i] = NULL;
-						backlog_tcb->stream_rx_queue[i] = backlog_tcb->stream_rx_queue_tail[i] = NULL;
-						backlog_tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
-						backlog_tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
-						backlog_tcb->txfree[i] = 0;
-						backlog_tcb->tx_buffer_occupied_region_start[i] = backlog_tcb->tx_buffer_occupied_region_end[i] = 0;
-						backlog_tcb->next_ssn[i] = 0;
-						backlog_tcb->next_rx_ssn[i] = 0;
-						backlog_tcb->stream_fsm_timer[i] = 0;
-						backlog_tcb->write_side_close_state[i] = WR_CLOSE_ST_OPEN;
-						backlog_tcb->lss_received[i] = backlog_tcb->lss_consumed[i] = false;
-					}
-					backlog_tcb->listening_fd = s;
-
-
-					// Listening TCB re-initialization (same as mylisten)
-					bzero(tcb,sizeof(struct tcpctrlblk));
-					tcb->st = TCB_ST_LISTEN;
-					fdinfo[s].tcb->is_active_side = false;
-					fdinfo[s].tcb->listening_fd = s;
-					fdinfo[s].sid = SID_UNASSIGNED; // Go back from stream 0 (used to open the incoming connection) to unassigned
-				}
-			}else if(event == FSM_EVENT_PKT_RCV && (tcp->flags & SYN) && !(tcp->flags & ACK)){
-				LOG_MESSAGE("Dropped SYN packet");
 			}
 			break;
 		case TCB_ST_ESTABLISHED:
@@ -3066,7 +3111,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-				prepare_tcp(s, ACK | DMP, dummy_payload, 1, opt, optlen);
+				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 
 				free(dummy_payload);
 				free(opt);
@@ -3299,7 +3344,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			fdinfo[s].ready_streams--;
 			fdinfo[s].ready_channels--;
 
-			prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+			prepare_tcp(free_fd, -1, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 			enable_signal_reception(false);
 			return free_fd;
 		}
@@ -3324,7 +3369,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		fdinfo[s].ready_streams--;
 		fdinfo[s].stream_backlog_head.next = first->next;
 
-		prepare_tcp(free_fd, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+		prepare_tcp(free_fd, -1,  ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 		enable_signal_reception(false);
 		return free_fd;
 	}while(pause());
@@ -3554,7 +3599,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 			uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-			prepare_tcp(s, ACK | DMP, dummy_payload, 1, opt, optlen);
+			prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 			free(dummy_payload);
 			free(opt);
 		}
@@ -3744,7 +3789,7 @@ void myio(int ignored){
 			}
 			if(i == MAX_FD){
 				for(i=0;i<MAX_FD;i++){
-					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN || fdinfo[i].tcb->st == TCB_ST_SYN_RECEIVED) && (tcp->d_port == fdinfo[i].l_port) ){
+					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port) ){
 						break;
 					}
 				}
@@ -4172,7 +4217,7 @@ void myio(int ignored){
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-							prepare_tcp(i, ACK | DMP, dummy_payload, 1, opt, optlen);
+							prepare_tcp(i, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 							free(dummy_payload);
 							free(opt);
 						}
@@ -4239,12 +4284,31 @@ void mytimer(int ignored){
 		if(fdinfo[i].st != FDINFO_ST_TCB_CREATED){
 			continue;
 		}
-		struct tcpctrlblk* tcb = fdinfo[i].tcb;
+
+		int fdinfo_backlog_length = fdinfo[i].backlog_length;
+		for(int backlog_index = 0; backlog_index <= fdinfo_backlog_length; backlog_index++){
+		
+		struct tcpctrlblk* tcb;
+		int fd_sid;
+
+		if(backlog_index == fdinfo[i].backlog_length){
+			// The last iteration is for the "main" TCB
+			tcb = fdinfo[i].tcb;
+			fd_sid = fdinfo[i].sid;
+		}else{
+			tcb = &(fdinfo[i].channel_backlog[backlog_index]);
+			fd_sid = 0; // fd_sid is valid only if tcb->st != 0
+		}
+
+		if(tcb->st == 0 || tcb->st == TCB_ST_LISTEN || tcb->st == TCB_ST_CLOSED){
+			continue;
+		}
+
 		if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
 			fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
 			continue;
 		}
-		if(fdinfo[i].sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fdinfo[i].sid] != 0) && (tcb->stream_fsm_timer[fdinfo[i].sid] <= tick)){
+		if(fd_sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fd_sid] != 0) && (tcb->stream_fsm_timer[fd_sid] <= tick)){
 			/* Note: If for any reason the stream timeout is used for something different from the opening of streams without anything to transmit, you need to modify
 			in prepare_tcp where the stream_fsm_timer is set to 0 if any segment is transmitted on the stream
 			*/
@@ -4291,12 +4355,15 @@ void mytimer(int ignored){
 			}
 			txcb->retry++;
 
-			update_tcp_header(i, txcb);
+			update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
 			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
 
 			acc += txcb->payloadlen;
 			prev = txcb;
 			txcb = txcb->next;
+		}
+
+
 		}
 	}
 
