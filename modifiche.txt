@@ -1,0 +1,81 @@
+Modifiche fatte rispetto a quanto scritto nel paper
+
+- Acknowledgement Scheme: non era specificato, ho usato quello semplice gestito nella tesi
+    - è stata aggiunta la condizione che l'opzione MS può essere inserita solo nei segmenti ack-eliciting, quindi non negli
+    ACK senza payload non-DMP, perchè l'opzione deve allocare un SSN e sennò se viene perso si perde il sync
+    - la adwin è associata ad uno stream quindi può essere aggiornata solo con segmenti ack-eliciting, siano essi DMP o con
+    payload utile
+- Stream Close: non era scritto molto bene, implementandolo lo ho specificato un po' meglio
+- Stream Reuse: dall'implementazione di stream close segue naturalmente il fatto che il client può riaprire stream chiusi
+- Channel Close mancante
+    - va capito quando triggerarlo, chi lo triggera, ed accertarsi che non faccia casino con stream reuse
+    - la mia idea sarebbe di impostare 2 timeout per iniziare il close in una direzione: il client più corto e il server più
+    lungo. Quello del client scade prima, così è lui ad avere l'ultima parola sul se vuole riaprire uno stream o se vuole lasciare
+    che venga chiuso il canale. Se per qualche motivo il client non fa niente, il server può prendere questa iniziativa dopo un
+    timeout più lungo. Dato che è solo una cosa a livello di protocollo ma non riguarda l'applicazione, se uno riceve il FIN manda 
+    subito il suo e dopo gli ACK si chiude tutto
+    - va capito chi deve fare il free del TCB
+- I campi "di stream" sono stati resi degli array, con indice dato dal SID
+    - per non avere TCB diversi tra MS-TCP e TCP, per TCP normale si può usare solo la entry "0" degli array. Non si spreca molta
+    memoria perchè il grosso della richiesta di memoria arriva dai buffer che vengono allocati per ogni stream solo se servono
+    - nel paper era scritto "extends the Transmission Control Block (TCB) with the new stream"
+- Campi aggiuni al TCB ([S]: stream property, [C]: channel property)
+    - [S] stream_state: semplice FSM per la gestione degli stati
+        - UNUSED / READY (solo passive open) / OPENED
+    - [S] stream_tx_buffer: descritto nel paper, non presente in mytcp
+    - [S] next_ssn: prossimo ssn da usare per inserimenti in channel TX queue
+    - [S] next_rx_ssn: SSN del prossimo segmento in-order per lo stream
+    - [S] stream_fsm_timer: descritto nel paper, usato per l'apertura degli stream dopo un timeout se l'applicazione non ha niente da
+    trasmettere. Viene gestito resettato in prepare_tcp se qualsiasi segmento per quello stream viene generato
+    - [S] stream_rx_queue / stream_rx_queue: puntatori al primo/ultimo elemento della linked list per la stream RX queue. La tail viene
+    usata per inserire velocemente senza dover scorrere tutta la coda, perchè se un'applicazione imposta una adwin molto grande e non
+    consuma sennò bisogna scorrere tutta la coda potenzialmente molto lunga ogni volta
+    - [S] write_side_close_state / lss_received / lss_consumed: campi per la chiusura di stream, non ben specificata nel paper
+    - [C] unack_tail: usato per la costruzione del campo SACK
+    - [C] init_radwin: il valore della adwin per lo stream 0 viene usato anche per tutti gli altri stream come valore iniziale, per
+    iniziare la trasmissione appena lo si apre senza aspettare un ACK che contiene adwin
+    - [C] is_active_side: nuovi stream possono essere aperti solo dal lato active open
+    - [C] listening_fd: per lato passive open, è il fd del listening socket a cui associare i nuovi stream
+    - [C] ms_option_requested / ms_option_enabled: tengono traccia di se Multi-Stream è abilitato per la connessione
+    - [C] out_window_scale_factor / in_window_scale_factor / ts_recent / ts_offset: per opzioni window scale e timestamps
+- Non c'è più una corrispondenza 1 ad 1 tra TCB ed entry di fdinfo, ma un TCB può corrispondere a tante entry di fdinfo
+    - in fdinfo c'è un campo che dice il SID per il socket all'interno del canale (e del TCB)
+- Lasciando uno stream half-closed va linkato il buffer alla entry di fdinfo, ma è un problema di mytcp e non è specifico di MSTCP
+- Al momento tutti i segmenti DMP hanno 1 byte di payload arbitraro che viene ignorato al ricevitore, si potrebbe usare quel payload 
+per qualche altra forma di messaggi di controllo (ad esempio per TLS, oppure per altro). In questo caso se si volesse fare una
+implementazione robusta sarebbe da fissare la lunghezza a 1 e il valore a qualcosa di non casuale, tipo 0, ed ignorare comunque tutto
+al ricevitore
+- Gestione della backlog lato fdinfo
+    - semantica della backlog cambiata, adesso è il numero di canali, non di stream full-duplex che possono essere consumati da accept
+    - viene data priorità ai canali rispetto agli stream per accept
+    - campi aggiunti a fdinfo:
+        - ready_channels: usato solo per comodità, corrisponde al numero di connessioni ESTABLISHED nella backlog, si potrebbe scorrere
+        sempre tutta la backlog per controllare se ci sono canali pronti per essere consumati da myaccept
+        - ready_streams: numero di stream pronti per essere consumati da accept. Include anche gli stream con SID 0 aperti implicitamente
+        con il 3-way handshake
+        - coda FIFO per gli stream pronti per quel listening socket, per ogni entry ci sono puntatore al TCB e SID. Non include gli 
+        stream con SID=0 corrispondenti a nuovi canali
+    - dal TCB si accede alla entry di fdinfo del listening socket con il campo listening_fd
+- Non è specificato cosa fare se c'è già una richiesta di connessione con opzione MS-TCP in corso e si vuole aprire un altro socket
+    - Se è già bound, bisogna per forza creare una connessione nuova perchè la porta è già assegnata. In ogni caso, questo è raro
+    perchè di solito non fai bind se sei il client
+    - Se è unbound, ho scelto di considerare solo canali ESTABLISHED con ms-tcp attivo e stesso addr/port di destinazione. Ignoro
+    connessioni ancora SYN_SENT perchè non so ancora se saranno con MS enabled o no, quindi per sicurezza non aspetto sennò potrei
+    avere una penalità rispetto alla baseline TCP, e non voglio fare peggio
+    - Volendo si potrebbe anche pensare "se so già che il server è MS-TCP compliant aspetto", ma non cè niente che obblighi un server
+    a accettare sempre di usare MS-TCP se lo supporta, quindi secondo me è una complicazione superflua
+    - Si sta comunque parlando di un caso raro, in teoria (da controllare) di solito un server HTTP/1.1 apre prima 1 socket e poi
+    altri 5 dopo che la prima pagina è scaricata, quindi in quel caso il problema non si porrebbe
+- Lo scheduler non segue la policy "fair" descritta nel paper (circular_start round robin)
+- Nagle applicato per stream (non era specificato nel paper)
+- Modifiche code di ricezione canale/stream:
+    - Dalla figura del paper, una entry della RX channel queue dovrebbe puntare ad una della stream queue invece che direttamente
+    al segmento. Io invece ho fatto puntare la channel queue direttamente ai segmenti, e anche le entry della stream queue, che
+    viene creata solo quando il segmento è in ordine per lo stream invece che sempre appena viene ricevuto. Non mi sembra una
+    differenza molto importante
+    - Alla entry della stream rx queue è stato aggiunto il campo consumed_bytes usato in myread
+- Receiver buffer Overflow Exception non implementata, perchè in un funzionamento "corretto" può succedere solo se si riduce la
+advertised window per uno stream, e questo per il momento è stato proibito (VEDI TESI per gestione @ TX)
+- Il campo SACK non è costruito come scritto negli RFC, invece si considerano i gruppi di segmenti più vicini alla fine della
+coda di ricezione di canale, perchè era più facile fare così
+- Le opzioni hanno dimensione fissa nella mia implementazione, 40B. Semplifica la costruzione e l'update dei segmenti in uscita

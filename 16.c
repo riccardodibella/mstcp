@@ -396,7 +396,7 @@ struct tcpctrlblk{
 	struct stream_rx_queue_node* stream_rx_queue_tail[TOT_SID];
 
 	// "write" direction
-	int write_side_close_state[TOT_SID];
+	int write_side_close_state[TOT_SID]; // WR_CLOSE_ST_OPEN / LSS_REQUESTED / LSS_TXED / LSS_ACKED
 
 	// "read" direction
 	bool lss_received[TOT_SID]; // LSS dequeued from channel queue and enqueued in stream queue
@@ -422,8 +422,8 @@ struct tcpctrlblk{
 	long long timeout; // Channel property
 	unsigned int sequence; // Channel property 
 	unsigned int mss; // Channel property
-	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH (when ms-tcp is enabled, otherwise... I don't yet know)
-	unsigned int stream_end; // Channel property (bad name)
+	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH
+	unsigned int stream_end; // Channel property (bad name) - unused
 	unsigned int fsm_timer; // Channel property
 	uint32_t init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
