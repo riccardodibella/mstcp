@@ -45,6 +45,7 @@ Modifiche fatte rispetto a quanto scritto nel paper
 per qualche altra forma di messaggi di controllo (ad esempio per TLS, oppure per altro). In questo caso se si volesse fare una
 implementazione robusta sarebbe da fissare la lunghezza a 1 e il valore a qualcosa di non casuale, tipo 0, ed ignorare comunque tutto
 al ricevitore
+    - Bisogna comunque distinguere il formato rispetto a un DMP con lunghezza > 1 per RX buffer overflow exception
 - Gestione della backlog lato fdinfo
     - semantica della backlog cambiata, adesso è il numero di canali, non di stream full-duplex che possono essere consumati da accept
     - viene data priorità ai canali rispetto agli stream per accept
@@ -79,3 +80,4 @@ advertised window per uno stream, e questo per il momento è stato proibito (VED
 - Il campo SACK non è costruito come scritto negli RFC, invece si considerano i gruppi di segmenti più vicini alla fine della
 coda di ricezione di canale, perchè era più facile fare così
 - Le opzioni hanno dimensione fissa nella mia implementazione, 40B. Semplifica la costruzione e l'update dei segmenti in uscita
+- è difficile accorgersi dei RX buffer overflow

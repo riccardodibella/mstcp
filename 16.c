@@ -134,7 +134,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #ifdef LOCAL_SERVER
 #define SERVER_IP_STR "127.0.0.1"
 #else
-#define SERVER_IP_STR "172.104.237.69"
+#define SERVER_IP_STR "88.80.187.84"
 #endif
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
@@ -5656,7 +5656,7 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mybind OK");
-		if ( mylisten(listening_socket,5) == -1 ) { 
+		if ( mylisten(listening_socket,10) == -1 ) { 
 			myperror("mylisten"); 
 			exit(EXIT_FAILURE);
 		}
