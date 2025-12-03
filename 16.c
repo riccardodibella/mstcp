@@ -68,18 +68,19 @@ int payload_size_arr[] = {200};
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
-#define NUM_CLIENTS_MAX 6
-#define NUM_CLIENT_REQUESTS_MAX 12
-int num_client_requests_test = 12;
-
-#define MS_ENABLED false
-// TCP: 1, 6
-// MS: 1, 6, 32
-int num_clients_arr[] = {6}; 
-int payload_size_arr[] = {100};
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 100 // This is the maximum
+#define RESP_PAYLOAD_BYTES 1000000 // This is the maximum
+
+#define NUM_CLIENTS_MAX 2
+#define NUM_CLIENT_REQUESTS_MAX 10
+int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
+
+#define MS_ENABLED true
+// TCP: 1, 6
+// MS: 1, 6, 32
+int num_clients_arr[] = {NUM_CLIENTS_MAX}; 
+int payload_size_arr[] = {RESP_PAYLOAD_BYTES};
 
 //#define DELAY_REQ_PROB 1E-1
 
@@ -3214,7 +3215,6 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 	}else{ // myconnect_mode == MYCONNECT_MODE_NON_BLOCKING
 		if(fdinfo[s].st == FDINFO_ST_UNBOUND || fdinfo[s].st == FDINFO_ST_BOUND){
 			struct sockaddr_in * remote_addr = (struct sockaddr_in*) addr; //mytcp: a
-			DEBUG("Active open FSM socket %d", s);
 			disable_signal_reception(false);
 			int res = fsm(s, FSM_EVENT_APP_ACTIVE_OPEN, NULL, remote_addr); 
 			enable_signal_reception(false);
@@ -4236,7 +4236,11 @@ void myio(int ignored){
 			}
 
 			// ts_recent update ( https://datatracker.ietf.org/doc/html/rfc7323#section-4.3 )
-			uint32_t ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
+			int ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
+			if(ts_index < 0){
+				print_l2_packet(l2_rx_buf);
+				ERROR("Timestamps not received (myio)");
+			}
 			uint32_t segment_ts_val = ntohl(*(uint32_t*) (tcp->payload+ts_index+2));
 			uint32_t segment_seq = ntohl(tcp->seq);
 			/*
@@ -5079,7 +5083,7 @@ void main_client_app(){
 		dl_sum += dl_bytes[i];
 		DEBUG("Client %d: %d requests (ul %ld dl %ld)", i, completed_requests[i], ul_bytes[i], dl_bytes[i]);
 	}
-	DEBUG("Total: %.2f KB/s DL %.2f KB/s UL (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
+	DEBUG("Total:  %.2f KB/s DL  |  %.2f KB/s UL  (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	//DEBUG("wait...");
 	//persistent_nanosleep(2, 0);
@@ -5601,6 +5605,7 @@ int main(){
 
 	load_ifconfig();
 
+	DEBUG("load_ifconfig OK");
 	raw_socket_setup();
 
 	// Mask configuration (moved here for sa_mask reuse) 
@@ -5638,6 +5643,8 @@ int main(){
 
 	last_port = MIN_PORT + sample_uint32() % (MAX_PORT - MIN_PORT);
 
+	DEBUG("Before main body");
+
 	if(MAIN_MODE == CLIENT){
 		main_client_app();
 	}else if(MAIN_MODE == SERVER){
@@ -5656,31 +5663,12 @@ int main(){
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mybind OK");
-		if ( mylisten(listening_socket,10) == -1 ) { 
+		if ( mylisten(listening_socket,128) == -1 ) { 
 			myperror("mylisten"); 
 			exit(EXIT_FAILURE);
 		}
 		DEBUG("mylisten OK");
 		
-		/*
-		int client_sockets[NUM_CLIENTS];
-		for(int i=0; i<NUM_CLIENTS; i++){
-			struct sockaddr_in remote_addr;
-			remote_addr.sin_family=AF_INET;
-			int len = sizeof(struct sockaddr_in);
-			DEBUG("wait myaccept client %d", i);
-			int s;
-			do{
-				s = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
-				if(s<0 && myerrno != EAGAIN){
-					myperror("myaccept");
-					exit(EXIT_FAILURE);
-				}
-			}while(s < 0);
-			DEBUG("myaccept %d OK (fd %d)", i, s);
-			client_sockets[i] = s;
-		}
-		*/
 		full_duplex_server_app(listening_socket);
 	}else{
 		ERROR("Invalid MAIN_MODE %d", MAIN_MODE);
