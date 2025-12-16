@@ -32,3 +32,25 @@ alle variabili del TCB, e un wrapper esterno che fa il parsing ai pacchetti, gua
 - Non serve tenere traccia di quale stream contribuisce agli ACK
     - La funzione per evitare HoL blocking si può tenere nello scheduler, in cui però si da priorità prima a tutti gli stream 
     senza buchi, e poi agli stream che hanno ancora buchi se avanza spazio nella cwnd
+
+- Per compatibilità di overflow exception (non implementata) con il SACK, farei così:
+    - Ogni volta che arriva un SACK, si scorre la coda di trasmissione fino a che non si trovano i segmenti SACKed
+    - Se è il primo segmento unacked per quello stream, allora faccio unlink del suo payload (che non può essere revocato) e
+    segno l'header node come SACKed
+    - Se non è il primo segmento unacked per quello stream, quindi c'è un "buco" prima, allora lo segno come SACKed ma lascio
+    collegato il payload, perchè potrebbe essere revocato in futuro
+    - Se un ricevitore ha intenzione di revocare la ricezione di un payload, deve evitare di inserire quel segmento all'interno
+    di un intervallo SACK
+        - Questo non permette di avere una conoscenza "perfetta" della possibilità di overflow del segmento appena ricevuto, in
+        caso ci sia un buco precedente a quello che si sta SACKando. Però se si tiene una contabilità della memoria per stream
+        allora ci si può comunque accorgere della violazione, solo che non per forza con l' "ultimo" segmento della coda, ma
+        con uno prima se sono arrivati fuori ordine. Ma non c'è problema: appena ce se ne accorge, non si fa il SACK di tutti
+        i segmenti che violano la contabilità, a prescindere dalla memoria. Quando lo si aggiunge alla coda di ricezione, non 
+        si inserisce il payload ma solo l'header, però non si attiva il flag SACKed. Volendo si potrebbe usare un altro flag per
+        segnalarlo in modo più evidente, ma non è necessario. 
+        - Bisogna fare attenzione: per tutti i segmenti SACKed successivi a uno di questi sullo stesso stream non va mai
+        tolto il payload, fino a quando tutti i buchi prima non sono riempiti o tutti i NACK non sono stati ACKed
+        - Andrà capito come "ricostruire" la sequenza corretta al ricevitore una volta che il segmento viene ritrasmesso con
+        sequence number diverso, e come si distingue quel segmento da un altro che arriva semplicemente dopo in quella posizione
+        - Ci sono un po' di cose da capire, in realtà... Implementandolo in pratica va fatta molta attenzione a tutto, e adesso
+        sicuramente non mi vengono in mente tutti i problemi possibili
