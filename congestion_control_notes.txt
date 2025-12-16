@@ -1,29 +1,34 @@
 Multi-Stream TCP Congestion Control
 
+ASSUNZIONE DI BASE: i segmenti SACKed non occupano spazio nella congestion window
+    - Questa è una modifica "di implementazione". Se uno vuole può gestire la cosa diversamente, "allargando" a mano la cwnd come
+    si fa con LTA per "togliere" i segmenti SACKed che però occuperanno quindi ancora spazio, ma non è una modifica che ha effetto
+    su quello che viene trasmesso
+    - Congettura: l'effetto di questa scelta è concettualmente identico a quello di LTA, 
+    - qua si sta parlando solo di cwnd, non di adwin. Questo non è collegato con il meccanismo di adwin inflation descritto
+    nel paper
+
 - Gli ACK normali vengono inviati con segmenti DMP, che arrivano in un "treno" al tick successivo di mytimer
 - Ad ognuno di questi ACK che arriva, si aumenta la congestion window basandosi su quanti byte sono ACKed da quel segmento
     - Questo consente di gestire in automatico i delayed ACK (incluso accorpamento descritto nella tesi)
+    - L'aumento della cwnd è abbastanza basso (soprattutto in congestion avoidance), perchè non include lo spazio già liberato
+    dal cumulative ACK
 - I dupACK si individuano sempre allo stesso modo: segmenti solo ACK vuoti con ack == last_ack
     - I dupACK arrivano uno alla volta, separati a seconda di come sono arrivati i pacchetti dall'altra parte
     - Quando arriva un dupACK si aumenta il contatore dei dupACK (per eventualmente triggerare fast recovery), ma non si aumenta
     a mano la congestion window
-
+- Sia per cumulative ACK che per SACK, ogni volta che un segmento viene ACKato bisogna diminuire la variabile di canale flightsize,
+che considera il numero di byte unacked in volo
+    - questo va fatto solo se il segmento ACKed o SACKed non è DMP
+    - quando si riduce la lista per cumulative ACK, man mano che si scorre bisogna fare attenzione a non ridurre flightsize per
+    segmenti che sono già stati SACKed
+- Quando arriva un cumulativeACK, la cwnd viene allargata (se non si è in fast recovery) basandosi sul numero totale di byte
+di cui viene fatto l'ACK, a prescindere di se alcuni dei segmenti di cui viene fatto il cumulative ACK prima erano stati SACKed
+o meno
 
 - Per avere una struttura concettuale "pulita" si potrebbe fare una FSM piccola che fa solo le transizioni e le modifiche 
 alle variabili del TCB, e un wrapper esterno che fa il parsing ai pacchetti, guarda il TCB e decide gli eventi e i parametri
-    - Eventi possibili: ACK (con # byte ACKed + SACKed), dupACK (con # byte SACKed), timeout
-    - L'evento dupACK deve avere un effetto diverso da quello di ACK nella FSM per l'aumento della cwnd in funzione del numero
-    di byte di cui si sta facendo ACK
-        - Normalmente, con ACK normale, l'aumento dipende dallo stato della FSM ma è relativamente piccolo, perchè viene liberato
-        anche lo spazio del segmento che è stato ACKed
-        - con dupACK la cwnd non deve aumentare proprio, perchè viene già liberato lo spazio con i SACK
-            - Quindi non ci serve mai sapere il numero di byte ACKed per i dupACK?
-            - Allora, per lo stesso ragionamento, con ACK normali vogliamo sapere nella FSM solo il numero di byte ACKed con
-            cumulative ACK, non quelli SACKed
-- Direi di non tenere traccia di quale stream contribuisce agli ACK
+    - Eventi possibili: ACK (con # byte ACKed), dupACK, timeout
+- Non serve tenere traccia di quale stream contribuisce agli ACK
     - La funzione per evitare HoL blocking si può tenere nello scheduler, in cui però si da priorità prima a tutti gli stream 
     senza buchi, e poi agli stream che hanno ancora buchi se avanza spazio nella cwnd
-    - In questo modo si possono gestire allo stesso modo i byte ACKed e SACKed nella FSM del congestion control, a cui si può
-    passare solo il numero di byte totale per quel pacchetto
-
-
