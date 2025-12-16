@@ -1,0 +1,1 @@
+ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 rdibella@178.79.147.254

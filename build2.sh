@@ -15,6 +15,6 @@ fi
 if [[ "$1" == "--local" ]]; then
     gcc 16.c -O3 -g -DMAIN_MODE=SERVER -DLOCAL_SERVER -o server.out
 else
-    scp 16.c rdibella@88.80.187.84:/home/rdibella
-    ssh rdibella@88.80.187.84 'gcc 16.c -O3 -g -DMAIN_MODE=SERVER -o np'
+    scp 16.c rdibella@178.79.147.254:/home/rdibella
+    ssh rdibella@178.79.147.254 'gcc 16.c -O3 -g -DMAIN_MODE=SERVER -o server.out'
 fi

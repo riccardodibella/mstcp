@@ -139,7 +139,8 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define SERVER_IP_STR "127.0.0.1"
 #else
 //#define SERVER_IP_STR "88.80.187.84"
-#define SERVER_IP_STR "172.104.237.69"
+//#define SERVER_IP_STR "172.104.237.69"
+#define SERVER_IP_STR "178.79.147.254"
 #endif
 
 #define INTERFACE_NAME "eth0" // load_ifconfig
