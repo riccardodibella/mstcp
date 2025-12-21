@@ -26,6 +26,7 @@
 
 /* DEFINE MACROS */
 
+//#define NODEBUG
 //#define NOLOGS
 //#define SHORTLOGS
 
@@ -566,7 +567,7 @@ int current_field_num = 0;
 
 // In case you need to know the name of the caller function: https://stackoverflow.com/a/16100246
 void ERROR(char* c, ...){
-	#ifndef NO_DEBUG
+	#ifndef NODEBUG
 	printf("ERROR %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
@@ -578,7 +579,7 @@ void ERROR(char* c, ...){
 }
 
 void DEBUG(char* c, ...){
-	#ifndef NO_DEBUG
+	#ifndef NODEBUG
 	printf("DEBUG %.6u: ", (uint32_t) tick);
 	va_list args;
 	va_start(args, c);
@@ -1187,6 +1188,24 @@ void load_ifconfig(){
 
 
 #pragma region RAW_SOCKET_ACCESS
+// returns -1 if not found, >= 0 index otherwise
+int search_mac_cache(uint8_t* ip){
+	int i;
+	for(i=0;i<MAX_ARP && (arpcache[i].key!=0);i++){
+		if(!memcmp(&arpcache[i].key,gateway,4)) 
+			break;
+	}
+	if(arpcache[i].key != 0){
+		return i;
+	}
+	return -1;
+}
+void resolve_gateway_mac(){
+	resolve_gateway_mac_requested = true;
+	while(search_mac_cache(gateway) < 0){
+		pause();
+	}
+}
 int resolve_mac(unsigned int destip, unsigned char * destmac){
 	int len,n,i;
 	struct sockaddr_ll sll;
@@ -1194,11 +1213,8 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	unsigned char pkt[1500];
 	struct ethernet_frame *eth;
 	struct arp_packet *arp;
-	for(i=0;i<MAX_ARP && (arpcache[i].key!=0);i++){
-		if(!memcmp(&arpcache[i].key,&destip,4)) 
-			break;
-	}
-	if(arpcache[i].key){ //If found return 
+	i = search_mac_cache((uint8_t*)&destip);
+	if(i >= 0){ //If found return 
 		memcpy(destmac,arpcache[i].mac,6);
 		DEBUG("mac cache\t\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 		return 0;
@@ -1239,11 +1255,8 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	start=clock();
 
 	while(pause()){ //wake up only upon signals (only I/O)
-		for(i=0;(i<MAX_ARP) && (arpcache[i].key!=0);i++){
-			if(!memcmp(&arpcache[i].key,&destip,4)) 
-				break;
-		}
-		if(arpcache[i].key){ 
+		i = search_mac_cache((uint8_t*)&destip);
+		if(i >= 0){ //If found return 
 			// found in cache
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
@@ -5621,20 +5634,6 @@ void full_duplex_server_app(int listening_socket){
 }
 
 
-bool gateway_mac_resolved(){
-	int i;
-	for(i=0;i<MAX_ARP && (arpcache[i].key!=0);i++){
-		if(!memcmp(&arpcache[i].key,gateway,4)) 
-			break;
-	}
-	return arpcache[i].key != 0;
-}
-void resolve_gateway_mac(){
-	resolve_gateway_mac_requested = true;
-	while(!gateway_mac_resolved()){
-		pause();
-	}
-}
 
 int main(){
 	// https://chatgpt.com/share/6831f26e-d848-8007-9105-69f30fe620ff
