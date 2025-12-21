@@ -41,7 +41,7 @@
 #define CL_MAIN_AGGREGATE 3
 #define CL_MAIN_HTML 4
 
-#define CL_MAIN CL_MAIN_SERIAL_BLOCKING
+#define CL_MAIN CL_MAIN_AGGREGATE
 
 #if CL_MAIN == CL_MAIN_PARALLEL
 #define NUM_CLIENTS 10
@@ -68,19 +68,18 @@ int payload_size_arr[] = {100};
 #undef RESP_PAYLOAD_BYTES
 #define RESP_PAYLOAD_BYTES 100
 
-int64_t meas_start;
 #endif
 
 #if CL_MAIN == CL_MAIN_AGGREGATE
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 100 // This is the maximum
+#define RESP_PAYLOAD_BYTES 100000 // This is the maximum
 
-#define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 1
+#define NUM_CLIENTS_MAX 32
+#define NUM_CLIENT_REQUESTS_MAX 200
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
-#define MS_ENABLED false
+#define MS_ENABLED true
 // TCP: 1, 6
 // MS: 1, 6, 32
 int num_clients_arr[] = {NUM_CLIENTS_MAX}; 
@@ -1216,7 +1215,6 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	i = search_mac_cache((uint8_t*)&destip);
 	if(i >= 0){ //If found return 
 		memcpy(destmac,arpcache[i].mac,6);
-		DEBUG("mac cache\t\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 		return 0;
 	}
 	eth = (struct ethernet_frame *) pkt;
@@ -1261,8 +1259,6 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 			memcpy(destmac,arpcache[i].mac,6);
 			sigprocmask(SIG_BLOCK,&tmpmask,NULL);
 			acquire_handler_lock();
-
-			// DEBUG("mac resolved\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 			
 			return 0;
 		}
@@ -1387,7 +1383,6 @@ bool drop_packet(struct tcp_segment* tcp){
 }
 
 void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, unsigned char proto){
-	DEBUG("send_ip\t\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 	int i,t,len ;
 	struct sockaddr_ll sll;
 	unsigned char destmac[6];
@@ -1411,7 +1406,6 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	if(t==-1){
 		ERROR("send_ip resolve_mac failed");
 	}
-	// DEBUG("resolve_mac\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 
 	if(proto == TCP_PROTO){
 		LOG_TCP_SEGMENT("OUT", payload, payloadlen);
@@ -1429,9 +1423,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	int attempts = 0;
 	st:
 	;
-	DEBUG("before sendto\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
-	DEBUG("after sendto\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 	/*
 	if (t == -1) {
 		if(errno == EMSGSIZE){
@@ -2181,6 +2173,7 @@ void circular_start_scheduler(int s){
 				continue;
 			}
 
+			#if false
 			/* FLOW CONTROL START */
 			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
 			bool small_in_flight = false;
@@ -2203,6 +2196,20 @@ void circular_start_scheduler(int s){
 			int current_transfer_bytes = MIN(available_bytes, allowed_bytes);
 			LOG_SCHEDULER_BYTES(sid, available_bytes, flow_control_allowed_bytes, cong_control_allowed_bytes);
 			/* FLOW CONTROL END */
+			#else
+			bool small_in_flight = false;
+			struct txcontrolbuf* tx_cursor = tcb->txfirst;
+			while(tx_cursor != NULL){
+				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
+					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
+						small_in_flight = true;
+					}
+				}
+				tx_cursor = tx_cursor->next;
+			}
+			int current_transfer_bytes = available_bytes;
+			LOG_SCHEDULER_BYTES(sid, available_bytes, RX_VIRTUAL_BUFFER_SIZE, cong_control_allowed_bytes);
+			#endif
 
 			while(current_transfer_bytes > 0){
 				int payload_length = MIN(current_transfer_bytes, max_payload_length);
@@ -3217,20 +3224,16 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		//DEBUG("myconnect sid %d", fdinfo[s].sid);
 		struct tcpctrlblk* tcb = fdinfo[s].tcb;
 		if(tcb->st != TCB_ST_ESTABLISHED){
-			DEBUG("myconnect sleep\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 			while(sleep(10)){
 				// This connect call is opening a new connection (Multi-Stream or not); wait until the SYN+ACK arrives
 				if(tcb->st == TCB_ST_ESTABLISHED){
-					DEBUG("myconnect est\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 					return 0;
 				}
 				if(tcb->st == TCB_ST_CLOSED){ 
-					DEBUG("myconnect refused\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 					myerrno = ECONNREFUSED; 
 					return -1;
 				}
 			}
-			DEBUG("myconnect timeout\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 			// If the connection is not established within the timeout
 			myerrno=ETIMEDOUT;
 			return -1;
@@ -4389,9 +4392,6 @@ void mytimer(int ignored){
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
 			txcb->txtime = tick;
 			if(txcb->retry > 0 && !is_fast_transmit){
-				DEBUG("Segment RETX %d", txcb->retry);
-				DEBUG("RETX\t\t%"PRId64" ms", get_timestamp_ms() - meas_start);
-
 				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0);
 				LOG_RTO(tcb->timeout);
 			}
@@ -5152,7 +5152,7 @@ void main_client_app(){
 
 	long ul_sum = 0, dl_sum = 0;
 	//DEBUG("Starting the measurement");
-	meas_start = get_timestamp_ms();
+	int64_t meas_start = get_timestamp_ms();
 
 
 	for(int num_req = 0; num_req < test_num_requests; num_req++){
@@ -5162,18 +5162,15 @@ void main_client_app(){
 			myperror("mysocket");
 			exit(EXIT_FAILURE);
 		}
-		DEBUG("mysocket\t\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 		struct sockaddr_in addr;
 		addr.sin_family = AF_INET;
 		addr.sin_port = htons(19500);
 		addr.sin_addr.s_addr = inet_addr(SERVER_IP_STR);
-		DEBUG("before myconnect\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 		ret = myconnect(s,(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
 		if(ret < 0){
 			myperror("myconnect");
 			exit(EXIT_FAILURE);
 		}
-		DEBUG("after myconnect\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 		int expected_payload_bytes = test_num_bytes;
 		//char data[RESP_BUF_SIZE]; // both req and resp
 		sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", expected_payload_bytes, num_req, num_req);
@@ -5189,7 +5186,6 @@ void main_client_app(){
 
 			ul_sum += ret;
 		}
-		DEBUG("mywrite completed\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 
 		memset(data, 0, sizeof(data));
 		int recv_bytes = 0;
@@ -5205,7 +5201,6 @@ void main_client_app(){
 				myperror("unexpected read return 0");
 				exit(EXIT_FAILURE);
 			}
-			DEBUG("myread %d\t%"PRId64" ms", ret, get_timestamp_ms() - meas_start);
 			recv_bytes += ret;
 			dl_sum += ret;
 			if(content_length < 0){
@@ -5229,9 +5224,7 @@ void main_client_app(){
 			}
 
 			if(content_length >= 0 && recv_bytes >= header_portion_length + content_length){
-				DEBUG("before myclose\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 				myclose(s);
-				DEBUG("after myclose\t%"PRId64" ms", get_timestamp_ms() - meas_start);
 				break;
 			}
 		}
@@ -5696,8 +5689,6 @@ int main(){
 	if(MAIN_MODE == CLIENT){
 		main_client_app();
 	}else if(MAIN_MODE == SERVER){
-		meas_start = get_timestamp_ms();
-
 		int listening_socket=mysocket(AF_INET,SOCK_STREAM,0);
 		if(listening_socket == -1){
 			myperror("mysocket");
