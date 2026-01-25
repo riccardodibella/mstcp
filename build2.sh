@@ -1,5 +1,23 @@
 #!/bin/bash
 echo "$(date '+%d/%m/%Y %H:%M:%S')"
+
+# Test both configurations locally first
+gcc 16.c -O3 -g -DMAIN_MODE=CLIENT -o /tmp/tmp_client.out
+if [[ $? -ne 0 ]]; then
+    echo "Error: Client mode compilation failed."
+    exit 1
+fi
+rm /tmp/tmp_client.out
+echo "Client compilation OK"
+
+gcc 16.c -O3 -g -DMAIN_MODE=SERVER -o /tmp/tmp_server.out
+if [[ $? -ne 0 ]]; then
+    echo "Error: Server mode compilation failed."
+    exit 1
+fi
+rm /tmp/tmp_server.out
+echo "Server compilation OK"
+
 # https://chatgpt.com/share/67e8062d-fd34-8007-8492-0853ae27c423
 if [[ "$1" == "--local" ]]; then
     gcc 16.c -O3 -g -DMAIN_MODE=CLIENT -DLOCAL_SERVER -o client.out

@@ -47,7 +47,7 @@ alle variabili del TCB, e un wrapper esterno che fa il parsing ai pacchetti, gua
         con uno prima se sono arrivati fuori ordine. Ma non c'è problema: appena ce se ne accorge, non si fa il SACK di tutti
         i segmenti che violano la contabilità, a prescindere dalla memoria. Quando lo si aggiunge alla coda di ricezione, non 
         si inserisce il payload ma solo l'header, però non si attiva il flag SACKed. Volendo si potrebbe usare un altro flag per
-        segnalarlo in modo più evidente, ma non è necessario. 
+        segnalarlo in modo più evidente, ma non è necessario.
         - Bisogna fare attenzione: per tutti i segmenti SACKed successivi a uno di questi sullo stesso stream non va mai
         tolto il payload, fino a quando tutti i buchi prima non sono riempiti o tutti i NACK non sono stati ACKed
         - Andrà capito come "ricostruire" la sequenza corretta al ricevitore una volta che il segmento viene ritrasmesso con

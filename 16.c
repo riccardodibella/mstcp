@@ -2307,22 +2307,6 @@ bool port_in_use(unsigned short port){
 	return false;
 }
 
-/*
-unsigned short get_free_port(){
-	unsigned short p;
-	for(p = last_port; p<MAX_PORT && port_in_use(p); p++);
-	if(p<MAX_PORT){
-		//DEBUG("get_free_port %d", p);
-		return last_port=p;
-	}
-	for( p = MIN_PORT; p<last_port && port_in_use(p); p++);
-	if (p<last_port){
-		//DEBUG("get_free_port %d", p);
-		return last_port=p;
-	}
-	return 0;
-}
-*/
 
 // https://claude.ai/share/a071ff4c-b4ba-4443-9a5b-5bf0a334de18
 unsigned short get_free_port(){
