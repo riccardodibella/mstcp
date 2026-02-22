@@ -2165,10 +2165,11 @@ void stream_holes_scheduler(int s){
 
 	int sids_list[TOT_SID];
 	int sids_list_length = TOT_SID;
+	static int circular_start_sid = 0;
 	for(int i=0; i<sids_list_length; i++){
-		// TODO circular start (addition mod TOT_SID of a random number)
-		sids_list[i] = i;
+		sids_list[i] = (circular_start_sid + i) % TOT_SID;
 	}
+	circular_start_sid = (circular_start_sid + 1) % TOT_SID;
 
 	// Remove streams with state != STREAM_STATE_OPENED
 	for(int i=0; i<sids_list_length; i++){
