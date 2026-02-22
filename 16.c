@@ -75,8 +75,8 @@ int payload_size_arr[] = {100};
 #undef RESP_PAYLOAD_BYTES
 #define RESP_PAYLOAD_BYTES 100000 // This is the maximum
 
-#define NUM_CLIENTS_MAX 32
-#define NUM_CLIENT_REQUESTS_MAX 200
+#define NUM_CLIENTS_MAX 8
+#define NUM_CLIENT_REQUESTS_MAX 128
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -430,7 +430,7 @@ struct tcpctrlblk{
 	unsigned int mss; // Channel property
 	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH
 	unsigned int stream_end; // Channel property (bad name) - unused
-	unsigned int fsm_timer; // Channel property
+	unsigned int fsm_timer; // Channel property - unused
 	uint32_t init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
 	bool is_active_side; // Channel property
@@ -1978,7 +1978,9 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 							// We avoid having timeouts for segments that are not retransmitted
 							struct txcontrolbuf* cursor = tcb->txfirst->next;
 							while(cursor != NULL){
-								cursor->txtime = tick;
+								if(cursor->txtime >= 0){
+									cursor->txtime = tick;
+								}
 								cursor = cursor->next;
 							}
 						}
@@ -2022,6 +2024,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		tcb->last_ack = tcp->ack; //in network order
 
 	} else if (event == FSM_EVENT_TIMEOUT) {
+		DEBUG("TIMEOUT! %"PRIu64, tick);
 		if(tcb->cong_st == CONGCTRL_ST_CONG_AVOID) tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
 		if(tcb->cong_st == CONGCTRL_ST_FAST_RECOV) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
 		if(tcb->cong_st == CONGCTRL_ST_SLOW_START) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
@@ -4611,6 +4614,15 @@ void mytimer(int ignored){
 			if(txcb->retry > 0 && !is_fast_transmit){
 				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
 				LOG_RTO(tcb->timeout);
+
+				// Reset the TX time of all other segments in the tx queue, otherwise they could trigger a timeout soon after this
+				struct txcontrolbuf* cursor = txcb->next;
+				while(cursor != NULL){
+					if(cursor->retry > 0 && cursor->txtime > 0){
+						cursor->txtime = tick;
+					}
+					cursor = cursor->next;
+				}
 			}
 			txcb->retry++;
 
