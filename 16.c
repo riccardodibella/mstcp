@@ -2149,6 +2149,152 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 }
 
 
+
+
+void stream_holes_scheduler(int s){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("unfair_congestion_scheduler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("unfair_congestion_scheduler tcb NULL");
+	}
+	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
+	uint8_t* temp_payload_buf = malloc(max_payload_length);
+
+
+	int sids_list[TOT_SID];
+	int sids_list_length = TOT_SID;
+	for(int i=0; i<sids_list_length; i++){
+		// TODO circular start (addition mod TOT_SID of a random number)
+		sids_list[i] = i;
+	}
+
+	// Remove streams with state != STREAM_STATE_OPENED
+	for(int i=0; i<sids_list_length; i++){
+		int sid = sids_list[i];
+		if(sid >= 0 && tcb->stream_state[sid] != STREAM_STATE_OPENED){
+			sids_list[i] = -1;
+		}
+	}
+	for(int i=0; i<sids_list_length; i++){
+		if(sids_list[i]<0){
+			// Move current element to position sids_list_length - 1
+			for(int j = i; j < sids_list_length-1; j++){
+				int tmp = sids_list[j+1];
+				sids_list[j+1]=sids_list[j];
+				sids_list[j] = tmp;
+			}
+
+			sids_list_length -= 1;
+			i--; // restarts the next iteration from the same point
+		}
+	}
+
+
+
+
+	for(int sid_list_i = 0; sid_list_i < sids_list_length; sid_list_i++){
+		int sid = sids_list[sid_list_i];
+
+		// We can transmit some more data on the stream
+		int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
+
+		int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
+		if((available_bytes == 0 || cong_control_allowed_bytes == 0) && tcb->write_side_close_state[sid] != WR_CLOSE_ST_LSS_REQUESTED){
+			// We can do nothing for this stream
+			// we cannot send data, and we cannot enqueue the LSS(/FIN), so we skip it
+			continue;
+		}
+
+		// Flow control removed; kept only nagle check
+
+		bool small_in_flight = false;
+		struct txcontrolbuf* tx_cursor = tcb->txfirst;
+		while(tx_cursor != NULL){
+			if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
+				if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
+					small_in_flight = true;
+				}
+			}
+			tx_cursor = tx_cursor->next;
+		}
+		int current_transfer_bytes = available_bytes;
+		LOG_SCHEDULER_BYTES(sid, available_bytes, RX_VIRTUAL_BUFFER_SIZE, cong_control_allowed_bytes);
+
+		while(current_transfer_bytes > 0){
+			int payload_length = MIN(current_transfer_bytes, max_payload_length);
+			if(payload_length < max_payload_length && small_in_flight){
+				break;
+			}
+
+			/*
+			for(int i=0; i<payload_length; i++){
+				temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
+				tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
+				tcb->txfree[sid]++;
+				current_transfer_bytes--;
+			}
+			*/
+			int first_chunk = payload_length, second_chunk = 0;
+			if(first_chunk > (TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid])){
+				second_chunk = first_chunk -(TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid]);
+				first_chunk -= second_chunk;
+			}
+			memcpy(temp_payload_buf, tcb->stream_tx_buffer[sid] + tcb->tx_buffer_occupied_region_start[sid], first_chunk);
+			memcpy(temp_payload_buf + first_chunk, tcb->stream_tx_buffer[sid], second_chunk);
+			tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid] + payload_length) % TX_BUFFER_SIZE;
+			tcb->txfree[sid] += payload_length;
+			current_transfer_bytes -= payload_length;
+
+			if(!tcb->ms_option_enabled){
+				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+			}else{
+				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+				uint8_t* opt = malloc(optlen);
+				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+				
+				// Stream update
+				opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
+				opt[3] = (tcb->next_ssn[sid]) & 0xFF;
+				update_next_ssn(&(tcb->next_ssn[sid]));
+
+				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, opt, optlen);
+				free(opt);
+			}
+		}
+
+		if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_REQUESTED){
+			if(tcb->txfree[sid] == TX_BUFFER_SIZE){
+				if(!tcb->ms_option_enabled){
+					prepare_tcp(s, -1, ACK | FIN, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				}else{
+					// Enqueue LSS segment
+					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+					uint8_t* opt = malloc(optlen);
+					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+					
+					// Stream update
+					opt[2] = (0b1 << 7) | sid<<2 | ((tcb->next_ssn[sid] >> 8)&0x3);
+					opt[3] = (tcb->next_ssn[sid])&0xFF;
+					update_next_ssn(&(tcb->next_ssn[sid]));
+
+					uint8_t* dummy_payload = malloc(1); // value doesn't matter
+
+					prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
+					free(dummy_payload);
+					free(opt);
+				}
+
+				tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_TXED;
+			}
+		}
+	}
+	free(temp_payload_buf);
+}
+
+
+
 int circular_starting_sid = 0;
 void circular_start_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
@@ -2288,7 +2434,8 @@ void circular_start_scheduler(int s){
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
-	circular_start_scheduler(s);
+	// circular_start_scheduler(s);
+	stream_holes_scheduler(s);
 }
 
 
@@ -5105,7 +5252,7 @@ void main_client_app(){
 		dl_sum += dl_bytes[i];
 		DEBUG("Client %d: %d requests (ul %ld dl %ld)", i, completed_requests[i], ul_bytes[i], dl_bytes[i]);
 	}
-	DEBUG("Total:  %.2f KB/s DL  |  %.2f KB/s UL  (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
+	DEBUG("Total:  %.2f KB/s (%.2f Mbps) DL  |  %.2f KB/s UL  (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)dl_sum) / meas_dur * 8 / 1000, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	//DEBUG("wait...");
 	//persistent_nanosleep(2, 0);
