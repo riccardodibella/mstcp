@@ -2150,6 +2150,65 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 
+/*
+	Returns true if there is a "hole" in the TX queue for the stream, false otherwise.
+	
+	For each stream we traverse the channel tx queue, that contains the segments that need to be transmitted
+	and are not yet acked. Until the firs segment that we find for the stream we will certainly not have a hole,
+	because up to that segment they all have been acked on that stream. After that segment, we will check the
+	continuity of the SSNs, so we will check that all the segments after that one are still in the channel queue
+	and they have not been removed. If we arrive at the end of the queue without finding any discontinuity on that
+	stream, then there are no holes. If we found a segment that has a SSN different than what we expect, this means
+	that on that stream there was something that was acked after the first unacked segment, so we have a hole.
+	There is another possibility: maybe all the segments for that stream after the first one that was acked are also
+	acked. This is still a hole, and we can detect this by comparing the next ssn that we would expect in the loop
+	with the next_ssn field of the tcb. If they are different, this means that there was some segment transmitted
+	after the last one that we found and it was acked.
+*/
+bool does_stream_have_hole(int s, int sid){
+	if(s < 3 || s >= MAX_FD){
+		ERROR("does_stream_have_hole invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
+	if(tcb == NULL){
+		ERROR("does_stream_have_hole tcb NULL");
+	}
+	if(sid < 0){
+		ERROR("does_stream_have_hole sid %d < 0", sid);
+	}
+	if(tcb->stream_state[sid] != STREAM_STATE_OPENED){
+		ERROR("does_stream_have_hole invalid stream state %d", tcb->stream_state[sid]);
+	}
+
+	struct txcontrolbuf* iter = tcb->txfirst;
+	uint16_t next_ssn;
+	bool first_ssn_found = false;
+	while(iter != NULL){
+		if(iter->sid == sid){
+			if(!first_ssn_found){
+				// This is the first segment that we find for this stream
+				next_ssn == iter->ssn;
+				first_ssn_found = true;
+			}else{
+				if(iter->ssn != next_ssn){
+					// We have found a hole!
+					// Some segment in the middle was acked, but this one wasn't so this is a hole
+					return true;
+				}
+			}
+			update_next_ssn(&next_ssn);
+		}
+		iter = iter->next;
+	}
+
+	if(first_ssn_found && next_ssn != tcb->next_ssn[sid]){
+		// There was some segment that was already transmitted and acked after the last one that we saw.
+		// This is still a hole!
+		return true;
+	}
+
+	return false;
+}
 
 void stream_holes_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
@@ -2189,6 +2248,30 @@ void stream_holes_scheduler(int s){
 
 			sids_list_length -= 1;
 			i--; // restarts the next iteration from the same point
+		}
+	}
+
+	// Move all the sids that have at least 1 hole to the end of the list
+	{
+		int no_hole_list_last = sids_list_length - 1;
+		for(int sid_list_i = 0; sid_list_i < no_hole_list_last; sid_list_i++){ // No need to iterate over the last element
+			int sid = sids_list[sid_list_i];
+
+			// Does this sid have a hole?
+			bool hole = does_stream_have_hole(s, sid);
+
+			if(hole){
+				// Move it at the end of the "no hole" list
+				for(int j = sid_list_i; j < no_hole_list_last; j++){
+					int tmp = sids_list[j+1];
+					sids_list[j+1]=sids_list[j];
+					sids_list[j] = tmp;
+				}
+				// Shorten the "no hole" list (the element placed at the end will now be outside the list)
+				no_hole_list_last--;
+
+				sid_list_i--; // In the next iteration we will look at what we have moved in this position
+			}
 		}
 	}
 
