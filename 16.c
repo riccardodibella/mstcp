@@ -1898,7 +1898,7 @@ void fast_send_tcp(int s, uint16_t flags /*Host order*/, uint8_t* options, int o
 
 
 
-void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize){
+void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize, int acked_size){
 	if(event == FSM_EVENT_PKT_RCV){
 		bool dmp = tcp->d_offs_res & (DMP >> 8);
 		if(streamsegmentsize > 0 && !dmp){
@@ -1920,7 +1920,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		switch( tcb->cong_st ){
 			case CONGCTRL_ST_SLOW_START: 
 				// when GRO is active tcb->cgwin += (htonl(tcp->ack)-htonl(tcb->last_ack));
-				tcb->cgwin += tcb->payload_mss;
+				tcb->cgwin += acked_size; // We use ABC (Appropriate Byte Counting) for cwnd increase
 				if(tcb->cgwin > tcb->ssthreshold) {
 					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
 					//  DEBUG("SLOW START->CONG AVOID");	
@@ -1989,7 +1989,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				}
 				else {// normal CONG AVOID 
 					//if( streamsegmentsize > 0 && !dmp){
-					tcb->cgwin += (tcb->payload_mss)*(tcb->payload_mss)/tcb->cgwin;
+					tcb->cgwin += (acked_size)*(tcb->payload_mss)/tcb->cgwin; // We use ABC (Appropriate Byte Counting) for cwnd increase
 					if (tcb->cgwin<tcb->payload_mss){
 						tcb->cgwin = tcb->payload_mss;
 					}
@@ -4088,6 +4088,7 @@ void myio(int ignored){
 				// TODO ho tolto il controllo per il FIN, va rimesso se si sistema la chiusura delle connessioni
 				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= htonl(tcb->txlast->segment->seq) + ((uint32_t)tcb->txlast->payloadlen) - shifter)){
 					bool send_window_advanced = false;
+					int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen						
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
@@ -4103,6 +4104,7 @@ void myio(int ignored){
 
 						if(!temp->dummy_payload && temp->payloadlen > 0){
 							fdinfo[i].tcb->flightsize-=temp->payloadlen;
+							acked_size += temp->payloadlen;
 
 							int sid = temp->sid;
 							if(!tcb->ms_option_enabled){
@@ -4153,7 +4155,7 @@ void myio(int ignored){
 						rtt_estimate(tcb, tcp);
 					}
 
-					congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length);
+					congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
 				}
 			}
 
@@ -4607,7 +4609,7 @@ void mytimer(int ignored){
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
 			txcb->txtime = tick;
 			if(txcb->retry > 0 && !is_fast_transmit){
-				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0);
+				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
 				LOG_RTO(tcb->timeout);
 			}
 			txcb->retry++;
