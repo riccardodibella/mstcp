@@ -73,10 +73,10 @@ int payload_size_arr[] = {100};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 100000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 1000 // This is the maximum
 
-#define NUM_CLIENTS_MAX 8
-#define NUM_CLIENT_REQUESTS_MAX 128
+#define NUM_CLIENTS_MAX 1
+#define NUM_CLIENT_REQUESTS_MAX 1
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -1774,8 +1774,15 @@ void update_tcp_header(int s /* main TCB file descriptor */, int backlog_entry_i
 
 // Just send it! Used for ACKs (in particular dupACKs)
 // Same signature as prepare_tcp but without the payload
-void fast_send_tcp(int s, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
+void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("send_tcp");
+
+	if(backlog_entry_index != -1){
+		ERROR("fast_send_tcp not implemented for backlog_entry_index >= 0"); // TODO
+
+		// This should be easy to handle, following what is done in prepare_tcp. This should happen with MS-TCP disabled
+	}
+
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
@@ -2024,7 +2031,8 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		tcb->last_ack = tcp->ack; //in network order
 
 	} else if (event == FSM_EVENT_TIMEOUT) {
-		DEBUG("TIMEOUT! %"PRIu64, tick);
+		DEBUG("TIMEOUT! %lli -> %lli %"PRIu64, tcb->timeout, MIN( MAX_TIMEOUT , tcb->timeout*2 ), tick);
+		LOG_MESSAGE("TIMEOUT!");
 		if(tcb->cong_st == CONGCTRL_ST_CONG_AVOID) tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
 		if(tcb->cong_st == CONGCTRL_ST_FAST_RECOV) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
 		if(tcb->cong_st == CONGCTRL_ST_SLOW_START) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
@@ -3138,7 +3146,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						
 						if(fdinfo[s].backlog_length == fdinfo[s].ready_channels){
 							// The incoming connection (MS or not) cannot be accepted
-							fast_send_tcp(s, RST, NULL, 0);
+							fast_send_tcp(s, -1, RST, NULL, 0); // What should the destination address and port be?
 							ERROR("TODO reset TCB");
 						}
 						fdinfo[s].ready_channels++;
@@ -3836,7 +3844,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 	}
 	if(adwin_increased){
 		if(!tcb->ms_option_enabled){
-			fast_send_tcp(s, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+			fast_send_tcp(s, -1, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 		}else{
 			int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
 			uint8_t* opt = malloc(optlen);
@@ -3941,6 +3949,7 @@ void rtt_estimate(struct tcpctrlblk* tcb, struct tcp_segment* tcp){
 		tcb->Drtt_e = ((8-BETA)*tcb->Drtt_e + BETA*abs(rtt_ticks-tcb->rtt_e))>>3;
 		tcb->rtt_e = ((8-ALPHA)*tcb->rtt_e + ALPHA*rtt_ticks)>>3;
 	}
+	//DEBUG("tcb->timeout %lli -> (%lli) %lli", tcb->timeout, tcb->rtt_e + KRTO*tcb->Drtt_e, MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,MIN_TIMEOUT), MAX_TIMEOUT));
 	tcb->timeout = MIN(MAX(tcb->rtt_e + KRTO*tcb->Drtt_e,MIN_TIMEOUT), MAX_TIMEOUT);
 	LOG_RTO(tcb->timeout);
 }
@@ -4051,9 +4060,21 @@ void myio(int ignored){
 
 			LOG_TCP_SEGMENT("IN", (uint8_t*) tcp, htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 
-			struct tcpctrlblk * tcb = fdinfo[i].tcb;
 			assert_handler_lock_acquired("myio FSM_EVENT_PKT_RCV");
 			fsm(i, FSM_EVENT_PKT_RCV, ip, NULL);
+
+			struct tcpctrlblk * tcb = fdinfo[i].tcb;
+			int backlog_index = -1;
+
+			if(tcb->st == TCB_ST_LISTEN){
+				for(int backlog_i = 0; backlog_i < fdinfo[i].backlog_length; backlog_i ++){
+					if(ip->srcaddr == fdinfo[i].channel_backlog[backlog_i].r_addr && tcp->s_port == fdinfo[i].channel_backlog[backlog_i].r_port){
+						tcb = &(fdinfo[i].channel_backlog[backlog_i]);
+						backlog_index = backlog_i;
+						break;
+					}
+				}
+			}
 
 			if(tcb->st < TCB_ST_ESTABLISHED){
 				continue;
@@ -4449,7 +4470,7 @@ void myio(int ignored){
 					
 					// Generate an ACK without MS Option
 					//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-					fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+					fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 
 					//}
 				}else{
@@ -4469,7 +4490,7 @@ void myio(int ignored){
 
 							uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-							prepare_tcp(i, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
+							prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
 							free(dummy_payload);
 							free(opt);
 						}
@@ -4477,7 +4498,7 @@ void myio(int ignored){
 							// Generic ACK
 							//ERROR("Inviare subito, non accodare!");
 							//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-							fast_send_tcp(i, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+							fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						}
 					}else{
 						DEBUG("Unexpected packet with payload but no MSTCP option:");
@@ -5716,7 +5737,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					DEBUG(clients[i].req_arr);
+					//DEBUG(clients[i].req_arr);
 
 					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
 					char* str_end = requested_ptr;
