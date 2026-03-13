@@ -73,10 +73,10 @@ int payload_size_arr[] = {100};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 200000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 5000000 // This is the maximum
 
 #define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 100
+#define NUM_CLIENT_REQUESTS_MAX 1
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -4371,7 +4371,7 @@ void myio(int ignored){
 					}
 				}
 
-			congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
+				congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
 
 			}
 
@@ -4585,22 +4585,24 @@ void myio(int ignored){
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload && in_order_for_channel){
-							// Allocate a new SSN and send an ACK on the stream with the DMP flag
+							if(tcb->txlast != NULL && tcb->txlast->retry != 0 && tcb->txlast->sid != sid){
+								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
-							int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-							uint8_t* opt = malloc(optlen);
-							memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-							
-							// Stream update
-							opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
-							opt[3] = (tcb->next_ssn[sid])&0xFF;
-							update_next_ssn(&(tcb->next_ssn[sid]));
+								int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+								uint8_t* opt = malloc(optlen);
+								memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+								
+								// Stream update
+								opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
+								opt[3] = (tcb->next_ssn[sid])&0xFF;
+								update_next_ssn(&(tcb->next_ssn[sid]));
 
-							uint8_t* dummy_payload = malloc(1); // value doesn't matter
+								uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-							prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
-							free(dummy_payload);
-							free(opt);
+								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
+								free(dummy_payload);
+								free(opt);
+							}
 						}
 						else{
 							// Generic ACK
