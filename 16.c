@@ -28,7 +28,7 @@
 
 //#define NODEBUG
 //#define NOLOGS
-//#define SHORTLOGS
+#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -73,10 +73,10 @@ int payload_size_arr[] = {100};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 1000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 200000 // This is the maximum
 
 #define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 1
+#define NUM_CLIENT_REQUESTS_MAX 100
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -270,8 +270,8 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define CONGCTRL_ST_SLOW_START 0
 #define CONGCTRL_ST_CONG_AVOID 1
 #define CONGCTRL_ST_FAST_RECOV 2
-#define INIT_CGWIN 1 //in MSS
-#define INIT_THRESH 8 //in MSS
+#define INIT_CGWIN 10 //in MSS
+#define INIT_THRESH 1000000 //in MSS
 
 /* STRUCT DEFINITIONS */
 
@@ -426,7 +426,8 @@ struct tcpctrlblk{
 	unsigned int ack_offs; // Channel property
     unsigned int seq_offs; // Channel property
 	long long timeout; // Channel property
-	unsigned int sequence; // Channel property 
+	unsigned int sequence; // Channel property
+	unsigned int highest_sent_sequence_number; // Channel property 
 	unsigned int mss; // Channel property
 	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH
 	unsigned int stream_end; // Channel property (bad name) - unused
@@ -1355,6 +1356,7 @@ bool drop_packet(struct tcp_segment* tcp){
 	double relevant_drop_prob = (MAIN_MODE == CLIENT)? UPLINK_DROP_PROB : DOWNLINK_DROP_PROB;
 	double sample = sample_uniform_0_1();
 	if(sample < relevant_drop_prob){
+		DEBUG("DROP!");
 		return true;
 	}
 	#endif
@@ -1393,6 +1395,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	if(proto == TCP_PROTO){
 		if(drop_packet((struct tcp_segment*)payload)){
 			DEBUG("Packet dropped! <======================");
+			print_ip(payload);
 			LOG_TCP_SEGMENT("DROP", payload, payloadlen);
 			return;
 		}
@@ -1804,7 +1807,8 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 	struct tcp_segment * tcp = /*txcb->segment =*/ (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
 	tcp->s_port = fdinfo[s].l_port;
 	tcp->d_port = tcb->r_port;
-	tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
+	// tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
+	tcp->seq = htonl(tcb->highest_sent_sequence_number);
 	tcp->d_offs_res=((5+FIXED_OPTIONS_LENGTH/4) << 4) | ((flags >> 8)&0b1111);
 	tcp->flags = flags & 0xFF;
 	tcp->urgp=0;
@@ -1923,15 +1927,59 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		if(dmp && sid == -1){
 			ERROR("congctrl_fsm invalid dmp segment (no sid)");
 		}
+
+		bool is_dupack = false;
+		if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
+			is_dupack = true;
+		}else{
+			int sack_index = search_tcp_option(tcp, OPT_KIND_SACK);
+			if(sack_index >= 0){
+				uint8_t sack_length = tcp->payload[sack_index+1];
+				if(sack_length != 2){
+					is_dupack = true;
+				}
+			}
+		}
+		
 		//DEBUG(" ACK: %d last ACK: %d",htonl(tcp->ack)-tcb->seq_offs, htonl(tcb->last_ack)-tcb->seq_offs);
 		switch( tcb->cong_st ){
-			case CONGCTRL_ST_SLOW_START: 
-				// when GRO is active tcb->cgwin += (htonl(tcp->ack)-htonl(tcb->last_ack));
-				tcb->cgwin += acked_size; // We use ABC (Appropriate Byte Counting) for cwnd increase
-				if(tcb->cgwin > tcb->ssthreshold) {
-					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
-					//  DEBUG("SLOW START->CONG AVOID");	
-					tcb->repeated_acks = 0;
+			case CONGCTRL_ST_SLOW_START:
+				if(is_dupack){
+					DEBUG("%d DUPACKS: SS -> FAST", 1);
+					if(tcb->txfirst!= NULL){
+						struct txcontrolbuf * txcb;
+						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
+						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
+
+						/*
+						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
+						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
+						*/
+						unsigned int shifter = MIN(htonl(tcb->txfirst->segment->seq),htonl(tcb->txfirst->segment->ack));
+						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
+							tcb->txfirst->txtime = 0; //immediate retransmission
+
+							/*
+							// We avoid having timeouts for segments that are not retransmitted
+							struct txcontrolbuf* cursor = tcb->txfirst->next;
+							while(cursor != NULL){
+								if(cursor->txtime >= 0){
+									cursor->txtime = tick;
+								}
+								cursor = cursor->next;
+							}
+							*/
+						}
+						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
+					}
+				}else{
+					tcb->cgwin += acked_size; // We use ABC (Appropriate Byte Counting) for cwnd increase
+					if(tcb->cgwin > tcb->ssthreshold) {
+						DEBUG("Tresh: SS -> AVOID");
+						tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
+						//  DEBUG("SLOW START->CONG AVOID");	
+						tcb->repeated_acks = 0;
+					}
 				}
 				break;
 			case CONGCTRL_ST_CONG_AVOID: 
@@ -1943,13 +1991,14 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
 				*/
 				tcb->lta = 0;
-				if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
+				if(is_dupack){
 					tcb->repeated_acks++;
+					DEBUG("DUPACK #%d", tcb->repeated_acks);
 				}else{
 					tcb->repeated_acks = 0;
 				}
 				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
-				if((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2)){
+				if(false && ((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2))){
 					/*
 					Ho modificato questa sezione perchè:
 					- A quanto ho capito, la condizione dell'if è sulla adwin, non sulla cgwin, e la adwin (dell'altro peer) viene gestita già altrove quindi non ce ne preoccupiamo qui
@@ -1958,21 +2007,20 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						tcb->lta = tcb->repeated_acks+2*tcb->payload_mss; //RFC 3042 Limited Transmit Extra-TX-win;
 					}
 					*/
-					tcb->lta = tcb->repeated_acks * tcb->payload_mss;
+					//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 				}
 				/*
 				2.  When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the value given in equation (4).  When [RFC3042]
 					is in use, additional data sent in limited transmit MUST NOT be included in this calculation.
 													ssthresh = max (FlightSize / 2, 2*SMSS)            (4)
 				*/
-				else if (tcb->repeated_acks == 3){
+				else if (tcb->repeated_acks == 1){
+					DEBUG("%d DUPACKS: AVOID -> FAST", tcb->repeated_acks);
 					//DEBUG(" THIRD ACK...");
 					if(tcb->txfirst!= NULL){
 						struct txcontrolbuf * txcb;
 						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
-						// tcb->cgwin = tcb->ssthreshold + 2*tcb->payload_mss; /* The third increment is in the FAST_RECOV state*/
-						tcb->cgwin = tcb->ssthreshold;
-						tcb->lta = tcb->repeated_acks * tcb->payload_mss;
+						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 
 						/*
 						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
@@ -1982,6 +2030,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
 							tcb->txfirst->txtime = 0; //immediate retransmission
 
+							/*
 							// We avoid having timeouts for segments that are not retransmitted
 							struct txcontrolbuf* cursor = tcb->txfirst->next;
 							while(cursor != NULL){
@@ -1990,6 +2039,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 								}
 								cursor = cursor->next;
 							}
+							*/
 						}
 						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
@@ -2012,18 +2062,60 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					congestion window in order to reflect the additional segment that has left the network.
 				*/
 				if(tcb->last_ack==tcp->ack) {
-					tcb->lta += tcb->payload_mss;
+					//tcb->lta += tcb->payload_mss; // Do we need to do this, or SACK already removes from cwnd?
 					//DEBUG(" Increasing congestion window to : %d", tcb->cgwin);
 				} else {
 					/*
 					6.  When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
 						set in step 2).  This is termed "deflating" the window.
 					*/
-					tcb->cgwin = tcb->ssthreshold;
-					tcb->lta = 0;
-					tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
-					//  DEBUG("FAST_RECOVERY ---> CONG_AVOID");
-					tcb->repeated_acks=0;
+					
+					bool there_is_hole = false;
+					struct txcontrolbuf* iter = tcb->txfirst;
+					while(iter != NULL && iter->next != NULL){
+						if(iter->seq+iter->payloadlen != iter->next->seq){
+							there_is_hole = true;
+							break;
+						}
+						iter = iter->next;
+					}
+					if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
+						//DEBUG("TAIL HOLE"); // Not a great name...
+						there_is_hole = true;
+					}
+
+					if(there_is_hole){
+						//DEBUG("Hole: FAST -> FAST (ACK %u != last_ack %u)", htonl(tcp->ack), htonl(tcb->last_ack));
+						struct txcontrolbuf* iter = tcb->txfirst;
+						while(iter != NULL && iter->next != NULL){
+							if(iter->seq+iter->payloadlen != iter->next->seq){
+								//DEBUG("ACKed %u - %u", iter->seq+iter->payloadlen, iter->next->seq);
+							}
+							iter = iter->next;
+						}
+
+
+						// Set fast retransmit for the first unacked packet
+						tcb->txfirst->txtime = 0; //immediate retransmission
+
+						
+						// We avoid having timeouts for segments that are not retransmitted
+						struct txcontrolbuf* cursor = tcb->txfirst->next;
+						while(cursor != NULL){
+							if(cursor->txtime >= 0){
+								cursor->txtime = tick;
+							}
+							cursor = cursor->next;
+						}
+						
+					}else{
+						DEBUG("No Hole: FAST -> AVOID");
+						tcb->cgwin = tcb->ssthreshold;
+						tcb->lta = 0;
+						tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
+						//  DEBUG("FAST_RECOVERY ---> CONG_AVOID");
+						tcb->repeated_acks=0;
+					}
 				}
 				break;
         }
@@ -2041,6 +2133,16 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
 		//  DEBUG("TIMEOUT: --->SLOW_START");
 		tcb->cong_st = CONGCTRL_ST_SLOW_START;
+		DEBUG("Timeout: X -> SS");
+
+		struct txcontrolbuf* cursor = tcb->txfirst->next;
+		while(cursor != NULL){
+			if(cursor->txtime >= 0){
+				cursor->txtime = -MAX_TIMEOUT;
+				cursor->retry = 0;
+			}
+			cursor = cursor->next;
+		}
 	}
 	LOG_CONGCTRL(tcb);
 }
@@ -2703,7 +2805,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->stream_end=0xFFFFFFFF; //Max file
 			tcb->mss = TCP_MSS;
 			tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
-			tcb->sequence=0;
+			tcb->highest_sent_sequence_number = tcb->sequence = 0;
 			tcb->cumulativeack = 0;
 			tcb->timeout = INIT_TIMEOUT;
 			tcb->fsm_timer = 0;
@@ -2898,7 +3000,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->stream_end=0xFFFFFFFF;
 			tcb->mss = TCP_MSS;
 			tcb->payload_mss = tcb->mss - FIXED_OPTIONS_LENGTH;
-			tcb->sequence=0;
+			tcb->highest_sent_sequence_number = tcb->sequence = 0;
 			tcb->cumulativeack = 0;
 			tcb->timeout = INIT_TIMEOUT;
 			tcb->fsm_timer = 0;
@@ -4092,6 +4194,8 @@ void myio(int ignored){
 
 			int payload_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4 - (tcp->d_offs_res>>4)*4;
 
+			int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment
+
 			if(tcb->txfirst !=NULL){
 				// Removal from TX queue for the cumulative ACK
 
@@ -4112,7 +4216,6 @@ void myio(int ignored){
 				// TODO ho tolto il controllo per il FIN, va rimesso se si sistema la chiusura delle connessioni
 				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= htonl(tcb->txlast->segment->seq) + ((uint32_t)tcb->txlast->payloadlen) - shifter)){
 					bool send_window_advanced = false;
-					int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen						
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
@@ -4179,9 +4282,7 @@ void myio(int ignored){
 						rtt_estimate(tcb, tcp);
 					}
 
-					congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
 				}
-			}
 
 			if(tcb->txfirst != NULL){
 				// Removal from TX queue for SACK option
@@ -4269,6 +4370,13 @@ void myio(int ignored){
 					}
 				}
 			}
+
+			congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
+
+			}
+
+
+			
 
 			if(payload_length > 0){
 				int sid = 0;
@@ -4631,10 +4739,11 @@ void mytimer(int ignored){
 				continue;
 			}
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
-			txcb->txtime = tick;
 			if(txcb->retry > 0 && !is_fast_transmit){
-				congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
-				LOG_RTO(tcb->timeout);
+				if(!is_fast_transmit){
+					congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
+					LOG_RTO(tcb->timeout);
+				}
 
 				// Reset the TX time of all other segments in the tx queue, otherwise they could trigger a timeout soon after this
 				struct txcontrolbuf* cursor = txcb->next;
@@ -4646,8 +4755,12 @@ void mytimer(int ignored){
 				}
 			}
 			txcb->retry++;
+			txcb->txtime = tick;
 
 			update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
+			if(txcb->seq >= tcb->highest_sent_sequence_number){
+				tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen;
+			}
 			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
 
 			acc += txcb->payloadlen;
@@ -5068,7 +5181,7 @@ void main_client_app(){
 		exit(EXIT_FAILURE);
 	}
 	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
-	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", RESP_PAYLOAD_BYTES, 0, -1);
+	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", MIN(RESP_PAYLOAD_BYTES,1000), 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
 		ret = mywrite(s, data+sent, missing);
@@ -5737,7 +5850,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					//DEBUG(clients[i].req_arr);
+					DEBUG(clients[i].req_arr);
 
 					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
 					char* str_end = requested_ptr;
