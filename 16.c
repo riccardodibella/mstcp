@@ -4284,92 +4284,92 @@ void myio(int ignored){
 
 				}
 
-			if(tcb->txfirst != NULL){
-				// Removal from TX queue for SACK option
+				if(tcb->txfirst != NULL){
+					// Removal from TX queue for SACK option
 
-				int sack_opt_index = search_tcp_option(tcp, OPT_KIND_SACK);
-				if(sack_opt_index > 0){
+					int sack_opt_index = search_tcp_option(tcp, OPT_KIND_SACK);
+					if(sack_opt_index > 0){
 
-					uint32_t shifter = tcb->seq_offs;
+						uint32_t shifter = tcb->seq_offs;
 
-					int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
-					if(sack_entries_count > 0){
-						//DEBUG("%d SACK entries! shifter=%u", sack_entries_count, shifter);
-					}
-					for(int entry = 0; entry < sack_entries_count; entry++){
-						int block_left_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8)));
-						int block_right_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8 + 4)));
+						int sack_entries_count = (tcp->payload[sack_opt_index+1] - 2) / 8;
+						if(sack_entries_count > 0){
+							//DEBUG("%d SACK entries! shifter=%u", sack_entries_count, shifter);
+						}
+						for(int entry = 0; entry < sack_entries_count; entry++){
+							int block_left_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8)));
+							int block_right_edge_seq = ntohl(*((uint32_t*) (tcp->payload + sack_opt_index + 2 + entry*8 + 4)));
 
-						uint32_t left_shifted_seq = block_left_edge_seq - shifter;
-						uint32_t right_shifted_seq = block_right_edge_seq - shifter;
+							uint32_t left_shifted_seq = block_left_edge_seq - shifter;
+							uint32_t right_shifted_seq = block_right_edge_seq - shifter;
 
-						//DEBUG("%u - %u (src %u - %u)", left_shifted_seq, right_shifted_seq, block_left_edge_seq,block_right_edge_seq);
+							//DEBUG("%u - %u (src %u - %u)", left_shifted_seq, right_shifted_seq, block_left_edge_seq,block_right_edge_seq);
 
-						struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
-						while(cursor != NULL){
-							uint32_t cursor_shifted_seq = cursor->seq - shifter;
-							uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
+							struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
+							while(cursor != NULL){
+								uint32_t cursor_shifted_seq = cursor->seq - shifter;
+								uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
 
-							if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
-								//DEBUG("Something removed");
-								// Remove the node from the tx queue
+								if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
+									//DEBUG("Something removed");
+									// Remove the node from the tx queue
 
-								if(!cursor->dummy_payload && cursor->payloadlen > 0){
-									// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
-									fdinfo[i].tcb->flightsize-=cursor->payloadlen;
+									if(!cursor->dummy_payload && cursor->payloadlen > 0){
+										// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
+										fdinfo[i].tcb->flightsize-=cursor->payloadlen;
 
-									/*
-									if(tcb->radwin[cursor->sid] < cursor->payloadlen){
-										ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
+										/*
+										if(tcb->radwin[cursor->sid] < cursor->payloadlen){
+											ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
+										}
+										tcb->radwin[cursor->sid] -= cursor->payloadlen;
+										*/
 									}
-									tcb->radwin[cursor->sid] -= cursor->payloadlen;
-									*/
-								}
 
-								int sid = -1;
-								bool lss = false;
-								int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
-								if(ms_index>=0){
-									sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
-									lss = cursor->segment->payload[ms_index+2]>>7;
-								}
-								if(sid >= 0){
-									// MS option is present in cursor segment
-									if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
-										tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
-										stream_close_handler(tcb, sid);
+									int sid = -1;
+									bool lss = false;
+									int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+									if(ms_index>=0){
+										sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
+										lss = cursor->segment->payload[ms_index+2]>>7;
 									}
-								}
-
-
-								if(prev == NULL){
-									tcb->txfirst = cursor->next;
-									if(tcb->txfirst == NULL){
-										tcb->txlast = NULL; // The list is now empty
+									if(sid >= 0){
+										// MS option is present in cursor segment
+										if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
+											tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
+											stream_close_handler(tcb, sid);
+										}
 									}
-									free(cursor->segment);
-									free(cursor);
-									cursor = tcb->txfirst;
-									if(tcb->txfirst == NULL){
-										break;
+
+
+									if(prev == NULL){
+										tcb->txfirst = cursor->next;
+										if(tcb->txfirst == NULL){
+											tcb->txlast = NULL; // The list is now empty
+										}
+										free(cursor->segment);
+										free(cursor);
+										cursor = tcb->txfirst;
+										if(tcb->txfirst == NULL){
+											break;
+										}
+									}else{
+										prev->next = cursor->next;
+										if(tcb->txlast == cursor){
+											tcb->txlast = prev;
+										}
+										free(cursor->segment);
+										free(cursor);
+										cursor = prev->next;
 									}
 								}else{
-									prev->next = cursor->next;
-									if(tcb->txlast == cursor){
-										tcb->txlast = prev;
-									}
-									free(cursor->segment);
-									free(cursor);
-									cursor = prev->next;
+									prev = cursor;
+									cursor = cursor->next;
 								}
-							}else{
-								prev = cursor;
-								cursor = cursor->next;
 							}
 						}
 					}
 				}
-			}
 
 			congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
 
