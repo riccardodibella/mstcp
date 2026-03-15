@@ -190,7 +190,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 
 #define TCP_PROTO 6 // protocol field inside IP header
 
-#define TCP_MSS 1260
+#define TCP_MSS 1460
 //#define TCP_MSS 1460 // MTU = 1500, MSS = MTU - 20 (IP Header) - 20 (TCP Header)
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
