@@ -73,10 +73,10 @@ int payload_size_arr[] = {100};
 #if CL_MAIN == CL_MAIN_AGGREGATE
 
 #undef RESP_PAYLOAD_BYTES
-#define RESP_PAYLOAD_BYTES 5000000 // This is the maximum
+#define RESP_PAYLOAD_BYTES 1000000 // This is the maximum
 
 #define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 1
+#define NUM_CLIENT_REQUESTS_MAX 128
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -416,7 +416,7 @@ struct tcpctrlblk{
     standard TCP (new data is inserted in the queue as soon as it is available) 
     and MS-TCP (data to TX is consumed and inserted in this queue by a scheduler)
     */
-	struct txcontrolbuf *txfirst, * txlast;
+	struct txcontrolbuf *txfirst, *txlast;
 
 	unsigned short r_port; // Channel property
 	unsigned int r_addr; // Channel property
@@ -1908,6 +1908,65 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 
 
 
+void fast_retransmit_holes(struct tcpctrlblk* tcb){
+	// "There is hole" code in fast retransmit FSM
+	bool there_is_hole = false;
+	struct txcontrolbuf* iter = tcb->txfirst;
+	while(iter != NULL && iter->next != NULL){
+		if(iter->seq+iter->payloadlen != iter->next->seq){
+			there_is_hole = true;
+			break;
+		}
+		iter = iter->next;
+	}
+	if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
+		DEBUG("TAIL HOLE (frh)"); // Not a great name...
+		there_is_hole = true;
+	}
+	if(!there_is_hole){
+		return;
+	}
+	
+	if(tcb == NULL){
+		ERROR("fast_retransmit_holes NULL tcb");
+	}
+	if(tcb->txfirst == NULL || tcb->txlast == NULL){
+		ERROR("fast_retransmit_holes txfirst / txlast NULL");
+	}
+	struct txcontrolbuf* unacked_region_start = tcb->txfirst;
+	if(tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
+		// Tail hole: everything that is currently in the TX queue needs to be retransmitted
+		unacked_region_start = NULL; // We transmit until the cursor is == NULL (so it traversed the whole tx queue)
+	}else{
+		if(tcb->txfirst->next == NULL){
+			ERROR("fast_retransmit_holes unexpected tx queue of length one"); // either there is no hole, or we have a tail hole, but that check was already done
+		}
+		while(true){ // There will always be a hole (otherwise, this will make me notice!)
+			struct txcontrolbuf* region_end = unacked_region_start->next;
+			bool found_next_hole = false;
+			while(region_end != NULL && region_end->next != NULL){
+				if(region_end->seq + region_end->payloadlen != region_end->next->seq){
+					// This is the end of the region! We have found a hole
+					unacked_region_start = region_end->next;
+					found_next_hole = true;
+					break;
+				}
+				region_end = region_end->next;
+			}
+
+			if(!found_next_hole){
+				break; // Exit from the infinite loop
+			}
+		}
+		// unacked_region_start now has the correct value
+	}
+	for(struct txcontrolbuf* cursor = tcb->txfirst; cursor != unacked_region_start; cursor = cursor->next){
+		if(cursor->retry == 0){
+			ERROR("fast_retransmit_holes - we are retxing a segment that was never transmitted (retry = 0)");
+		}
+		cursor->txtime = 0;
+	}
+}
 
 void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, int streamsegmentsize, int acked_size){
 	if(event == FSM_EVENT_PKT_RCV){
@@ -1951,6 +2010,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
 						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 
+						#if false
 						/*
 						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
 						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
@@ -1970,6 +2030,10 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 							}
 							*/
 						}
+						#endif
+
+						fast_retransmit_holes(tcb);
+
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
 					}
 				}else{
@@ -1990,7 +2054,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					FlightSize would remain less than or equal to cwnd plus 2*SMSS, and that new data is available for transmission.  Further, the
 					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
 				*/
-				tcb->lta = 0;
+				//tcb->lta = 0;
 				if(is_dupack){
 					tcb->repeated_acks++;
 					DEBUG("DUPACK #%d", tcb->repeated_acks);
@@ -2022,6 +2086,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
 						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
 
+						#if false
 						/*
 						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
 						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
@@ -2041,6 +2106,10 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 							}
 							*/
 						}
+						#endif
+
+						fast_retransmit_holes(tcb);
+
 						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
 						//  DEBUG("CONG AVOID-> FAST_RECOVERY");
@@ -2080,12 +2149,14 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 						iter = iter->next;
 					}
 					if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
-						//DEBUG("TAIL HOLE"); // Not a great name...
+						DEBUG("TAIL HOLE (congctrl_fsm)"); // Not a great name...
 						there_is_hole = true;
 					}
 
 					if(there_is_hole){
 						//DEBUG("Hole: FAST -> FAST (ACK %u != last_ack %u)", htonl(tcp->ack), htonl(tcb->last_ack));
+						/*
+						// Print for debugging
 						struct txcontrolbuf* iter = tcb->txfirst;
 						while(iter != NULL && iter->next != NULL){
 							if(iter->seq+iter->payloadlen != iter->next->seq){
@@ -2093,12 +2164,14 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 							}
 							iter = iter->next;
 						}
+						*/
 
 
 						// Set fast retransmit for the first unacked packet
 						tcb->txfirst->txtime = 0; //immediate retransmission
 
 						
+						/*
 						// We avoid having timeouts for segments that are not retransmitted
 						struct txcontrolbuf* cursor = tcb->txfirst->next;
 						while(cursor != NULL){
@@ -2107,6 +2180,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 							}
 							cursor = cursor->next;
 						}
+						*/
 						
 					}else{
 						DEBUG("No Hole: FAST -> AVOID");
@@ -4585,7 +4659,15 @@ void myio(int ignored){
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload && in_order_for_channel){
-							if(tcb->txlast != NULL && tcb->txlast->retry != 0 && tcb->txlast->sid != sid){
+							bool new_dmp_ack_needed = false;
+
+							// This is an easy policy.
+							// We could also check from the start to the end to see if we find any segment yet to be transmitted for the same SID
+							// that would for sure be transmitted before the new one
+							// Note: If we do this optimization, it must have been never transmitted, it is not enough that it is about to be transmitted now
+							// because otherwise it could be acked in the meanwhile and the DMP ack would never be TXed
+							new_dmp_ack_needed = tcb->txfirst == NULL || (tcb->txlast != NULL && tcb->txlast->retry != 0 && tcb->txlast->sid != sid);
+							if(new_dmp_ack_needed){
 								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
 								int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -4741,7 +4823,7 @@ void mytimer(int ignored){
 				continue;
 			}
 			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
-			if(txcb->retry > 0 && !is_fast_transmit){
+			if(txcb->retry > 0){
 				if(!is_fast_transmit){
 					congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
 					LOG_RTO(tcb->timeout);
@@ -5488,8 +5570,8 @@ void main_client_app(){
 	}
 	DEBUG("Total:  %.2f KB/s (%.2f Mbps) DL  |  %.2f KB/s UL  (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)dl_sum) / meas_dur * 8 / 1000, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
-	//DEBUG("wait...");
-	//persistent_nanosleep(2, 0);
+	DEBUG("wait...");
+	persistent_nanosleep(0, 200000000); // wait 200 ms
 	DEBUG("main_client_app end");
 	
 
