@@ -76,7 +76,7 @@ int payload_size_arr[] = {100};
 #define RESP_PAYLOAD_BYTES 1000000 // This is the maximum
 
 #define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 128
+#define NUM_CLIENT_REQUESTS_MAX 32
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -170,7 +170,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #endif
 #endif
 
-#define L2_RX_BUF_SIZE 30000
+#define L2_RX_BUF_SIZE 1600 // This was 30000 for some reason... I try to lower it, just out of curiosity, I don't know if this is a problem or not
 #define MIN_TIMEOUT_MSEC 300
 #define MIN_TIMEOUT (MIN_TIMEOUT_MSEC * 1000 / TIMER_USECS)
 #define INIT_TIMEOUT_SEC 1
@@ -182,7 +182,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define RX_VIRTUAL_BUFFER_SIZE (1024*1024)
 #define DEFAULT_WINDOW_SCALE 10 // Default parameter sent during the handshake
 
-#define TX_BUFFER_SIZE (1024*1024)
+#define TX_BUFFER_SIZE (10*1024*1024)
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
 
 #define MIN_PORT 19000
@@ -271,7 +271,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define CONGCTRL_ST_CONG_AVOID 1
 #define CONGCTRL_ST_FAST_RECOV 2
 #define INIT_CGWIN 10 //in MSS
-#define INIT_THRESH 1000000 //in MSS
+#define INIT_THRESH 500000 //in MSS
 
 /* STRUCT DEFINITIONS */
 
@@ -754,6 +754,24 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 		LOG_FIELD("ts_val", "%"PRIu32, ts_val);
 		LOG_FIELD("ts_recent", "%"PRIu32, ts_recent);
 	}
+	int sack_index = search_tcp_option(tcp, OPT_KIND_SACK);
+	if(sack_index >= 0){
+		int sack_payload_length = tcp->payload[sack_index+1] - 2;
+		if(sack_payload_length > 0){
+			// https://claude.ai/share/76bf04ae-943b-4d07-a91f-602af38c8d41
+			int sack_entries_count = sack_payload_length / 8;
+			// LOG_FIELD writes the key; then we write the JSON array value manually via LOG_TEXT
+			LOG_FIELD("sack_blocks", ""); // emits: "sack_blocks": 
+			LOG_TEXT("[");
+			for(int entry = 0; entry < sack_entries_count; entry++){
+				uint32_t left  = ntohl(*((uint32_t*)(tcp->payload + sack_index + 2 + entry*8)));
+				uint32_t right = ntohl(*((uint32_t*)(tcp->payload + sack_index + 2 + entry*8 + 4)));
+				if(entry > 0) LOG_TEXT(", ");
+				fprintf(log_file, "{\"left\": %"PRIu32", \"right\": %"PRIu32", \"length\": %"PRIu32"}", left, right, right-left);
+			}
+			LOG_TEXT("]");
+		}
+	}
 	
 
 	LOG_OBJ_END();
@@ -1094,6 +1112,21 @@ void persistent_nanosleep(int sec, int nsec){
 	}
 }
 
+
+void check_drops() {
+    struct tpacket_stats stats;
+    socklen_t len = sizeof(stats);
+
+    if (getsockopt(unique_raw_socket_fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len) < 0) {
+        perror("getsockopt PACKET_STATISTICS");
+        return;
+    }
+	if(stats.tp_drops > 0){
+		ERROR(".");
+		//printf("Packets Received: %u\n", stats.tp_packets);
+    	//printf("Packets Dropped:  %u\n", stats.tp_drops);
+	}
+}
 
 
 #pragma region STARTUP_FUNCTIONS
@@ -1562,6 +1595,9 @@ void update_SACK_option(struct tcpctrlblk* tcb, uint8_t* opt_bytes){
 	if(opt_bytes[0] != OPT_KIND_SACK){
 		ERROR("update_SACK_option non-sack pointer");
 	}
+	if((tcb->unack == NULL || tcb->unack_tail == NULL) && tcb->unack != tcb->unack_tail){
+		ERROR("update_SACK_option inconsistent unack queue state");
+	}
 	if(tcb->unack_tail == NULL){
 		return;
 	}
@@ -1604,6 +1640,9 @@ void update_SACK_option(struct tcpctrlblk* tcb, uint8_t* opt_bytes){
 	}
 
 	for(int num_block = 0; num_block < used_blocks; num_block++){
+		if(sack_blocks[num_block][0] <= tcb->cumulativeack){
+			ERROR("sack fill sequence before cumulativeack?");
+		}
 		uint8_t* start_ptr = opt_bytes + 2 + num_block*8;
 		//DEBUG("%u - %u", sack_blocks[num_block][0], sack_blocks[num_block][1]);
 		*((uint32_t*)(start_ptr + 0)) = htonl(sack_blocks[num_block][0]+tcb->ack_offs);
@@ -1961,9 +2000,6 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 		// unacked_region_start now has the correct value
 	}
 	for(struct txcontrolbuf* cursor = tcb->txfirst; cursor != unacked_region_start; cursor = cursor->next){
-		if(cursor->retry == 0){
-			ERROR("fast_retransmit_holes - we are retxing a segment that was never transmitted (retry = 0)");
-		}
 		cursor->txtime = 0;
 	}
 }
@@ -2000,37 +2036,14 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 			}
 		}
 		
-		//DEBUG(" ACK: %d last ACK: %d",htonl(tcp->ack)-tcb->seq_offs, htonl(tcb->last_ack)-tcb->seq_offs);
 		switch( tcb->cong_st ){
 			case CONGCTRL_ST_SLOW_START:
 				if(is_dupack){
 					DEBUG("%d DUPACKS: SS -> FAST", 1);
+					LOG_MESSAGE("DUPACK: SS -> FAST");
 					if(tcb->txfirst!= NULL){
 						struct txcontrolbuf * txcb;
-						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
-						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
-
-						#if false
-						/*
-						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
-						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
-						*/
-						unsigned int shifter = MIN(htonl(tcb->txfirst->segment->seq),htonl(tcb->txfirst->segment->ack));
-						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
-							tcb->txfirst->txtime = 0; //immediate retransmission
-
-							/*
-							// We avoid having timeouts for segments that are not retransmitted
-							struct txcontrolbuf* cursor = tcb->txfirst->next;
-							while(cursor != NULL){
-								if(cursor->txtime >= 0){
-									cursor->txtime = tick;
-								}
-								cursor = cursor->next;
-							}
-							*/
-						}
-						#endif
+						tcb->ssthreshold = MAX(tcb->cgwin/2,2*tcb->payload_mss);
 
 						fast_retransmit_holes(tcb);
 
@@ -2040,105 +2053,44 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					tcb->cgwin += acked_size; // We use ABC (Appropriate Byte Counting) for cwnd increase
 					if(tcb->cgwin > tcb->ssthreshold) {
 						DEBUG("Tresh: SS -> AVOID");
+						LOG_MESSAGE("Tresh: SS -> AVOID");
 						tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
-						//  DEBUG("SLOW START->CONG AVOID");	
 						tcb->repeated_acks = 0;
 					}
 				}
 				break;
 			case CONGCTRL_ST_CONG_AVOID: 
-				/* 
-				RFC 5681 page 9: 
-				1.   On the first and second duplicate ACKs received at a sender, a
-					TCP SHOULD send a segment of previously unsent data per [RFC3042] provided that the receiver's advertised window allows, the total
-					FlightSize would remain less than or equal to cwnd plus 2*SMSS, and that new data is available for transmission.  Further, the
-					TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
-				*/
-				//tcb->lta = 0;
+
 				if(is_dupack){
 					tcb->repeated_acks++;
 					DEBUG("DUPACK #%d", tcb->repeated_acks);
 				}else{
 					tcb->repeated_acks = 0;
 				}
-				//DEBUG(" REPEATED ACKS = %d (flags=0x%.2x streamsgmsize=%d, tcp->win=%d radwin=%d tcp->ack=%d tcb->lastack=%d)",tcb->repeated_acks,tcp->flags,streamsegmentsize,htons(tcp->window), tcb->radwin,htonl(tcp->ack),htonl(tcb->last_ack));
-				if(false && ((tcb->repeated_acks == 1 ) || ( tcb->repeated_acks == 2))){
-					/*
-					Ho modificato questa sezione perchè:
-					- A quanto ho capito, la condizione dell'if è sulla adwin, non sulla cgwin, e la adwin (dell'altro peer) viene gestita già altrove quindi non ce ne preoccupiamo qui
-					- Non ha senso sommare repeated_acks (che è un intero che vale 1 o 2) e 2*payload_mss che è molto grande; a quanto ho capito, dovrebbe esserci repeated_acks invece di 2
-					if (tcb->flightsize<=tcb->cgwin + 2* (tcb->payload_mss)){
-						tcb->lta = tcb->repeated_acks+2*tcb->payload_mss; //RFC 3042 Limited Transmit Extra-TX-win;
-					}
-					*/
-					//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
-				}
-				/*
-				2.  When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the value given in equation (4).  When [RFC3042]
-					is in use, additional data sent in limited transmit MUST NOT be included in this calculation.
-													ssthresh = max (FlightSize / 2, 2*SMSS)            (4)
-				*/
-				else if (tcb->repeated_acks == 1){
+				
+				if (tcb->repeated_acks == 1){
 					DEBUG("%d DUPACKS: AVOID -> FAST", tcb->repeated_acks);
-					//DEBUG(" THIRD ACK...");
+					LOG_MESSAGE("DUPACK: AVOID -> FAST");
 					if(tcb->txfirst!= NULL){
 						struct txcontrolbuf * txcb;
-						tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
-						//tcb->lta = tcb->repeated_acks * tcb->payload_mss;
-
-						#if false
-						/*
-						3.  The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus 3*SMSS.  This artificially "inflates"
-						the congestion window by the number of segments (three) that have left the network and which the receiver has buffered. 
-						*/
-						unsigned int shifter = MIN(htonl(tcb->txfirst->segment->seq),htonl(tcb->txfirst->segment->ack));
-						if(htonl(tcb->txfirst->segment->seq)-shifter <= (htonl(tcp->ack)-shifter)){
-							tcb->txfirst->txtime = 0; //immediate retransmission
-
-							/*
-							// We avoid having timeouts for segments that are not retransmitted
-							struct txcontrolbuf* cursor = tcb->txfirst->next;
-							while(cursor != NULL){
-								if(cursor->txtime >= 0){
-									cursor->txtime = tick;
-								}
-								cursor = cursor->next;
-							}
-							*/
-						}
-						#endif
+						tcb->ssthreshold = MAX(tcb->cgwin/2,2*tcb->payload_mss);
 
 						fast_retransmit_holes(tcb);
 
-						//DEBUG(" FAST RETRANSMIT....");
 						tcb->cong_st=CONGCTRL_ST_FAST_RECOV;
-						//  DEBUG("CONG AVOID-> FAST_RECOVERY");
 					}
 				}
 				else {// normal CONG AVOID 
-					//if( streamsegmentsize > 0 && !dmp){
 					tcb->cgwin += (acked_size)*(tcb->payload_mss)/tcb->cgwin; // We use ABC (Appropriate Byte Counting) for cwnd increase
 					if (tcb->cgwin<tcb->payload_mss){
 						tcb->cgwin = tcb->payload_mss;
 					}
-					//}
 				}
 				break;
 
 			case CONGCTRL_ST_FAST_RECOV:
-				/*
-				4.  For each additional duplicate ACK received (after the third), cwnd MUST be incremented by SMSS.  This artificially inflates the
-					congestion window in order to reflect the additional segment that has left the network.
-				*/
-				if(tcb->last_ack==tcp->ack) {
-					//tcb->lta += tcb->payload_mss; // Do we need to do this, or SACK already removes from cwnd?
-					//DEBUG(" Increasing congestion window to : %d", tcb->cgwin);
-				} else {
-					/*
-					6.  When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
-						set in step 2).  This is termed "deflating" the window.
-					*/
-					
+				if(tcb->last_ack!=tcp->ack) {
+
 					bool there_is_hole = false;
 					struct txcontrolbuf* iter = tcb->txfirst;
 					while(iter != NULL && iter->next != NULL){
@@ -2154,40 +2106,15 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					}
 
 					if(there_is_hole){
-						//DEBUG("Hole: FAST -> FAST (ACK %u != last_ack %u)", htonl(tcp->ack), htonl(tcb->last_ack));
-						/*
-						// Print for debugging
-						struct txcontrolbuf* iter = tcb->txfirst;
-						while(iter != NULL && iter->next != NULL){
-							if(iter->seq+iter->payloadlen != iter->next->seq){
-								//DEBUG("ACKed %u - %u", iter->seq+iter->payloadlen, iter->next->seq);
-							}
-							iter = iter->next;
-						}
-						*/
-
-
 						// Set fast retransmit for the first unacked packet
 						tcb->txfirst->txtime = 0; //immediate retransmission
-
-						
-						/*
-						// We avoid having timeouts for segments that are not retransmitted
-						struct txcontrolbuf* cursor = tcb->txfirst->next;
-						while(cursor != NULL){
-							if(cursor->txtime >= 0){
-								cursor->txtime = tick;
-							}
-							cursor = cursor->next;
-						}
-						*/
 						
 					}else{
 						DEBUG("No Hole: FAST -> AVOID");
+						LOG_MESSAGE("No Hole: FAST -> AVOID");
 						tcb->cgwin = tcb->ssthreshold;
 						tcb->lta = 0;
 						tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
-						//  DEBUG("FAST_RECOVERY ---> CONG_AVOID");
 						tcb->repeated_acks=0;
 					}
 				}
@@ -2199,13 +2126,12 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 	} else if (event == FSM_EVENT_TIMEOUT) {
 		DEBUG("TIMEOUT! %lli -> %lli %"PRIu64, tcb->timeout, MIN( MAX_TIMEOUT , tcb->timeout*2 ), tick);
 		LOG_MESSAGE("TIMEOUT!");
-		if(tcb->cong_st == CONGCTRL_ST_CONG_AVOID) tcb->ssthreshold = MAX(tcb->flightsize/2,2*tcb->payload_mss);
-		if(tcb->cong_st == CONGCTRL_ST_FAST_RECOV) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
-		if(tcb->cong_st == CONGCTRL_ST_SLOW_START) tcb->ssthreshold = MAX(tcb->payload_mss,tcb->ssthreshold/=2);
+
+		tcb->ssthreshold = MAX(tcb->cgwin/2,2*tcb->payload_mss);
+
 		tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
 		tcb->timeout = MIN( MAX_TIMEOUT , tcb->timeout*2 );
 		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
-		//  DEBUG("TIMEOUT: --->SLOW_START");
 		tcb->cong_st = CONGCTRL_ST_SLOW_START;
 		DEBUG("Timeout: X -> SS");
 
@@ -4233,6 +4159,7 @@ void myio(int ignored){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
+			check_drops();
 
 			LOG_TCP_SEGMENT("IN", (uint8_t*) tcp, htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 
@@ -4666,7 +4593,9 @@ void myio(int ignored){
 							// that would for sure be transmitted before the new one
 							// Note: If we do this optimization, it must have been never transmitted, it is not enough that it is about to be transmitted now
 							// because otherwise it could be acked in the meanwhile and the DMP ack would never be TXed
-							new_dmp_ack_needed = tcb->txfirst == NULL || (tcb->txlast != NULL && tcb->txlast->retry != 0 && tcb->txlast->sid != sid);
+							
+							
+							new_dmp_ack_needed = tcb->txfirst == NULL || tcb->txlast->retry != 0 /*|| tcb->txlast->sid != sid*/;
 							if(new_dmp_ack_needed){
 								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
@@ -4801,8 +4730,9 @@ void mytimer(int ignored){
 				if(!txcb->dummy_payload){
 					tcb->flightsize += txcb->payloadlen;
 				}
-			} else if(txcb->txtime != 0 && txcb->txtime+tcb->timeout > tick){
+			} else if(txcb->txtime > 0 && txcb->txtime+tcb->timeout > tick){
 				acc += txcb->payloadlen;
+				prev = txcb;
 				txcb = txcb->next;
 				continue;
 			}
