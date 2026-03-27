@@ -75,8 +75,8 @@ int payload_size_arr[] = {100};
 #undef RESP_PAYLOAD_BYTES
 #define RESP_PAYLOAD_BYTES 1000000 // This is the maximum
 
-#define NUM_CLIENTS_MAX 1
-#define NUM_CLIENT_REQUESTS_MAX 32
+#define NUM_CLIENTS_MAX 4
+#define NUM_CLIENT_REQUESTS_MAX 128
 int num_client_requests_test = NUM_CLIENT_REQUESTS_MAX;
 
 #define MS_ENABLED true
@@ -182,8 +182,11 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define RX_VIRTUAL_BUFFER_SIZE (1024*1024)
 #define DEFAULT_WINDOW_SCALE 10 // Default parameter sent during the handshake
 
-#define TX_BUFFER_SIZE (10*1024*1024)
+#define TX_BUFFER_SIZE (1024*1024)
 #define STREAM_OPEN_TIMEOUT 2 // in ticks
+
+#define REQUESTED_KERNEL_RX_BUF_SIZE (32*1024*1024)
+#define REQUESTED_KERNEL_TX_BUF_SIZE (32*1024*1024)
 
 #define MIN_PORT 19000
 #define MAX_PORT 19999
@@ -1113,7 +1116,7 @@ void persistent_nanosleep(int sec, int nsec){
 }
 
 
-void check_drops() {
+void check_rx_buffer_drops(char* str) {
     struct tpacket_stats stats;
     socklen_t len = sizeof(stats);
 
@@ -1122,9 +1125,7 @@ void check_drops() {
         return;
     }
 	if(stats.tp_drops > 0){
-		ERROR(".");
-		//printf("Packets Received: %u\n", stats.tp_packets);
-    	//printf("Packets Dropped:  %u\n", stats.tp_drops);
+		ERROR("Packet(s) dropped in the kernel receive buffer (position %s) [Received %u Dropped %u]", str ? str : "NULL", stats.tp_packets, stats.tp_drops);
 	}
 }
 
@@ -1136,6 +1137,59 @@ void raw_socket_setup(){
 		perror("Socket raw failed"); 
 		exit(EXIT_FAILURE);
 	}
+
+
+	int rcvbuf;
+	socklen_t alen = sizeof(rcvbuf);
+
+	rcvbuf = REQUESTED_KERNEL_RX_BUF_SIZE;
+	if (setsockopt(unique_raw_socket_fd, SOL_SOCKET, SO_RCVBUFFORCE,
+				&rcvbuf, sizeof(rcvbuf)) < 0) {
+		perror("setsockopt SO_RCVBUFFORCE");
+		exit(EXIT_FAILURE);
+	}
+
+	alen = sizeof(rcvbuf);
+	if (getsockopt(unique_raw_socket_fd, SOL_SOCKET, SO_RCVBUF,
+               &rcvbuf, &alen) < 0) {
+		perror("getsockopt SO_RCVBUF");
+		exit(EXIT_FAILURE);
+	}
+	
+	if(rcvbuf < REQUESTED_KERNEL_RX_BUF_SIZE){
+		ERROR("raw_socket_setup kernel rx buffer size granted %d < requested %d", rcvbuf, REQUESTED_KERNEL_RX_BUF_SIZE);
+	}
+
+
+
+
+	
+
+    int sndbuf;
+    socklen_t slen = sizeof(sndbuf);
+
+    sndbuf = REQUESTED_KERNEL_TX_BUF_SIZE; 
+    if (setsockopt(unique_raw_socket_fd, SOL_SOCKET, SO_SNDBUFFORCE,
+                &sndbuf, sizeof(sndbuf)) < 0) {
+        perror("setsockopt SO_SNDBUFFORCE");
+		exit(EXIT_FAILURE);
+    }
+
+    slen = sizeof(sndbuf);
+    if (getsockopt(unique_raw_socket_fd, SOL_SOCKET, SO_SNDBUF,
+               &sndbuf, &slen) < 0) {
+        perror("getsockopt SO_SNDBUF");
+        exit(EXIT_FAILURE);
+    }
+
+	if(sndbuf < REQUESTED_KERNEL_TX_BUF_SIZE){
+		ERROR("raw_socket_setup kernel tx buffer size granted %d < requested %d", sndbuf, REQUESTED_KERNEL_TX_BUF_SIZE);
+	}
+
+
+
+
+
 
 	if (-1 == fcntl(unique_raw_socket_fd, F_SETOWN, getpid())){ 
 		perror("fcntl setown"); 
@@ -1456,33 +1510,14 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
 
 	const int num_bytes_sendto = 14+20+payloadlen;
-	int attempts = 0;
-	st:
-	;
-	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
-	/*
-	if (t == -1) {
-		if(errno == EMSGSIZE){
-			ERROR("EMSGSIZE");
-		}
-		perror("send_ip sendto failed");
-		DEBUG("ERRNO %d%s", errno, errno==EAGAIN?" (EAGAIN)":"");
-		print_l2_packet(packet);
-		DEBUG("attempts %d", attempts);
-		if(attempts < 1000){
-			attempts++;
-			goto st;
-		}
-		exit(EXIT_FAILURE);
-	}
-	if(t != num_bytes_sendto){
-		DEBUG("sendto result %d != num_bytes_sendto %d", t, num_bytes_sendto);
-	}
 
-	if(attempts > 0){
-		DEBUG("sendto ok after EAGAIN!");
+	errno = 0;
+	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
+	if(t != num_bytes_sendto){
+		int tmp_errno = errno;
+		perror("sendto");
+		ERROR("t %d != num_bytes_sendto %d errno %d%s", t, num_bytes_sendto, tmp_errno, tmp_errno==EAGAIN?" (EAGAIN)":"");
 	}
-	*/
 }
 #pragma endregion RAW_SOCKET_ACCESS
 
@@ -3492,7 +3527,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(!lss && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
-							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+							//tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -4096,6 +4131,8 @@ void myio(int ignored){
 		return;
 	}
 
+	check_rx_buffer_drops("myio_start");
+
 	int received_packet_size; // mytcp: size
 	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
 		if(received_packet_size < 0){
@@ -4159,7 +4196,6 @@ void myio(int ignored){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
-			check_drops();
 
 			LOG_TCP_SEGMENT("IN", (uint8_t*) tcp, htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 
@@ -4240,9 +4276,9 @@ void myio(int ignored){
 							}
 
 							if(tcb->radwin[sid] < temp->payloadlen){
-								ERROR("tcb->radwin[%d] would become < 0", sid);
+								//ERROR("tcb->radwin[%d] would become < 0", sid);
 							}
-							tcb->radwin[sid] -= temp->payloadlen;
+							//tcb->radwin[sid] -= temp->payloadlen;
 						}
 
 						int sid = -1;
@@ -4402,7 +4438,7 @@ void myio(int ignored){
 
 					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					if(new_radwin >= tcb->radwin[sid]){
-						tcb->radwin[sid] = new_radwin;
+						//tcb->radwin[sid] = new_radwin;
 					}
 
 					struct channel_rx_queue_node* newrx = NULL;
@@ -4423,7 +4459,7 @@ void myio(int ignored){
 
 							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
 
-							tcb->radwin[sid] = new_radwin;
+							//tcb->radwin[sid] = new_radwin;
 						}else{
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
@@ -4668,6 +4704,8 @@ void myio(int ignored){
 	if(duration_us > TIMER_USECS){
 		//DEBUG("myio %ld us", duration_us);
 	}
+
+	check_rx_buffer_drops("myio_end");
 
 	enable_signal_reception(true);
 }
