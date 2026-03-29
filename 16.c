@@ -2059,15 +2059,11 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 		}
 
 		bool is_dupack = false;
-		if((((tcp->flags)&(SYN|FIN))==0) && (streamsegmentsize==0) && (tcp->ack == tcb->last_ack) && tcb->txfirst != NULL){
-			is_dupack = true;
-		}else{
-			int sack_index = search_tcp_option(tcp, OPT_KIND_SACK);
-			if(sack_index >= 0){
-				uint8_t sack_length = tcp->payload[sack_index+1];
-				if(sack_length != 2){
-					is_dupack = true;
-				}
+		int sack_index = search_tcp_option(tcp, OPT_KIND_SACK);
+		if(sack_index >= 0){
+			uint8_t sack_length = tcp->payload[sack_index+1];
+			if(sack_length != 2){
+				is_dupack = true;
 			}
 		}
 		
