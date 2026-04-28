@@ -275,6 +275,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define CONGCTRL_ST_FAST_RECOV 2
 #define INIT_CGWIN 10 //in MSS
 #define INIT_THRESH 500000 //in MSS
+#define FAST_RETX_DUPACK_THRESH 3 // How many consecutive dupACKs trigger a transition to fast retransmit (defined to 3 in RFC 5681)
 
 /* STRUCT DEFINITIONS */
 
@@ -1983,7 +1984,6 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 
 
 void fast_retransmit_holes(struct tcpctrlblk* tcb){
-	// "There is hole" code in fast retransmit FSM
 	bool there_is_hole = false;
 	struct txcontrolbuf* iter = tcb->txfirst;
 	while(iter != NULL && iter->next != NULL){
@@ -1994,7 +1994,6 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 		iter = iter->next;
 	}
 	if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
-		DEBUG("TAIL HOLE (frh)"); // Not a great name...
 		there_is_hole = true;
 	}
 	if(!there_is_hole){
@@ -2043,11 +2042,15 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 	if(event == FSM_EVENT_PKT_RCV){
 		bool dmp = tcp->d_offs_res & (DMP >> 8);
 		if(streamsegmentsize > 0 && !dmp){
+			// This segment carries application data; it is not useful for congestion control (right?)
 			return;
 		}
 		if(streamsegmentsize == 0 && dmp){
 			ERROR("congctrl_fsm invalid dmp segment (len 0)");
 		}
+
+
+		// Consistency check: ensure that DMP packets contain the MS option
 		int sid = -1;
 		// We don't care about ssn
 		int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
@@ -2058,19 +2061,28 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 			ERROR("congctrl_fsm invalid dmp segment (no sid)");
 		}
 
-		bool is_dupack = false;
+
+		bool is_sack = false;
 		int sack_index = search_tcp_option(tcp, OPT_KIND_SACK);
 		if(sack_index >= 0){
 			uint8_t sack_length = tcp->payload[sack_index+1];
 			if(sack_length != 2){
-				is_dupack = true;
+				is_sack = true;
 			}
 		}
+		bool is_repeated_ack = (tcb->last_ack==tcp->ack);
+		bool is_dupack = is_sack && is_repeated_ack;
 		
 		switch( tcb->cong_st ){
 			case CONGCTRL_ST_SLOW_START:
 				if(is_dupack){
-					DEBUG("%d DUPACKS: SS -> FAST", 1);
+					tcb->repeated_acks++;
+					DEBUG("DUPACK #%d", tcb->repeated_acks);
+				}else{
+					tcb->repeated_acks = 0;
+				}
+				if (tcb->repeated_acks == FAST_RETX_DUPACK_THRESH){
+					DEBUG("%d DUPACKS: SS -> FAST", tcb->repeated_acks);
 					LOG_MESSAGE("DUPACK: SS -> FAST");
 					if(tcb->txfirst!= NULL){
 						struct txcontrolbuf * txcb;
@@ -2099,7 +2111,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 					tcb->repeated_acks = 0;
 				}
 				
-				if (tcb->repeated_acks == 1){
+				if (tcb->repeated_acks == FAST_RETX_DUPACK_THRESH){
 					DEBUG("%d DUPACKS: AVOID -> FAST", tcb->repeated_acks);
 					LOG_MESSAGE("DUPACK: AVOID -> FAST");
 					if(tcb->txfirst!= NULL){
@@ -2120,34 +2132,11 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 				break;
 
 			case CONGCTRL_ST_FAST_RECOV:
-				if(tcb->last_ack!=tcp->ack) {
-
-					bool there_is_hole = false;
-					struct txcontrolbuf* iter = tcb->txfirst;
-					while(iter != NULL && iter->next != NULL){
-						if(iter->seq+iter->payloadlen != iter->next->seq){
-							there_is_hole = true;
-							break;
-						}
-						iter = iter->next;
-					}
-					if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
-						DEBUG("TAIL HOLE (congctrl_fsm)"); // Not a great name...
-						there_is_hole = true;
-					}
-
-					if(there_is_hole){
-						// Set fast retransmit for the first unacked packet
-						tcb->txfirst->txtime = 0; //immediate retransmission
-						
-					}else{
-						DEBUG("No Hole: FAST -> AVOID");
-						LOG_MESSAGE("No Hole: FAST -> AVOID");
-						tcb->cgwin = tcb->ssthreshold;
-						tcb->lta = 0;
-						tcb->cong_st=CONGCTRL_ST_CONG_AVOID;
-						tcb->repeated_acks=0;
-					}
+				if(!is_repeated_ack){
+					tcb->cgwin = tcb->ssthreshold;
+					tcb->lta = 0;
+					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
+					tcb->repeated_acks=0;
 				}
 				break;
         }
@@ -2160,7 +2149,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 
 		tcb->ssthreshold = MAX(tcb->cgwin/2,2*tcb->payload_mss);
 
-		tcb->cgwin = INIT_CGWIN* tcb->payload_mss;
+		tcb->cgwin = INIT_CGWIN * tcb->payload_mss;
 		tcb->timeout = MIN( MAX_TIMEOUT , tcb->timeout*2 );
 		tcb->rtt_e = 0; /* RFC 6298 Note 2 page 6 */
 		tcb->cong_st = CONGCTRL_ST_SLOW_START;
