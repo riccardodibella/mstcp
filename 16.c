@@ -98,8 +98,8 @@ int payload_size_arr[] = {RESP_PAYLOAD_BYTES};
 #define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
 
 
-#define UPLINK_DROP_PROB 0
-#define DOWNLINK_DROP_PROB 0
+//#define UPLINK_DROP_PROB 0
+//#define DOWNLINK_DROP_PROB 0
 
 
 //#define STREAM_DROP_ENABLED
@@ -513,6 +513,8 @@ unsigned char myip[4];
 unsigned char mymac[6];
 unsigned char mask[4];
 unsigned char gateway[4];
+
+unsigned int network_interface_index; // filled with if_nametoindex at startup
 
 /* TXBUFSIZE and INIT_TIMEOUT may be modified at program startup */
 //int TXBUFSIZE = 100000; // #define TXBUFSIZE    ((g_argc<3) ?100000:(atoi(g_argv[2])))  
@@ -1209,6 +1211,7 @@ void raw_socket_setup(){
 }
 
 void load_ifconfig(){
+	network_interface_index = if_nametoindex(INTERFACE_NAME);
 	int temp_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 	if(-1 == temp_socket){
 		ERROR("load_ifconfig fd -1");
@@ -1324,7 +1327,7 @@ int resolve_mac(unsigned int destip, unsigned char * destmac){
 	len = sizeof(sll);
 	bzero(&sll, len);
 	sll.sll_family = AF_PACKET;
-	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
+	sll.sll_ifindex = network_interface_index;
 
 	n=sendto(unique_raw_socket_fd,pkt,14+sizeof(struct arp_packet), 0,(struct sockaddr *)&sll,len);
 	if(n < 0){
@@ -1472,7 +1475,10 @@ bool drop_packet(struct tcp_segment* tcp){
 	return false;
 }
 
+long sendto_call_time = 0;
+long eim_time = 0;
 void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, unsigned char proto){
+	struct timespec t0, t1;
 	int i,t,len ;
 	struct sockaddr_ll sll;
 	unsigned char destmac[6];
@@ -1508,10 +1514,15 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	len=sizeof(sll);
 	bzero(&sll,len);
 	sll.sll_family=AF_PACKET;
-	sll.sll_ifindex = if_nametoindex(INTERFACE_NAME);
+	clock_gettime(CLOCK_REALTIME, &t0);
+	sll.sll_ifindex = network_interface_index;
+
+	clock_gettime(CLOCK_REALTIME, &t1);
+	eim_time = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
 
 	const int num_bytes_sendto = 14+20+payloadlen;
 
+	clock_gettime(CLOCK_REALTIME, &t0);
 	errno = 0;
 	t=sendto(unique_raw_socket_fd, packet,num_bytes_sendto, 0, (struct sockaddr *)&sll,len);
 	if(t != num_bytes_sendto){
@@ -1519,6 +1530,8 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 		perror("sendto");
 		ERROR("t %d != num_bytes_sendto %d errno %d%s", t, num_bytes_sendto, tmp_errno, tmp_errno==EAGAIN?" (EAGAIN)":"");
 	}
+	clock_gettime(CLOCK_REALTIME, &t1);
+	sendto_call_time = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
 }
 #pragma endregion RAW_SOCKET_ACCESS
 
@@ -4651,6 +4664,15 @@ void myio(int ignored){
 	enable_signal_reception(true);
 }
 void mytimer(int ignored){
+	int out_packet_counter = 0;
+	int out_bytes_counter = 0;
+	int resolve_gateway_counter = 0;
+	long send_ip_ns = 0;
+    long update_tcp_header_ns = 0;
+	long sendto_ns = 0;
+	long eim_ns = 0;
+	struct timespec t0, t1;
+
 	disable_signal_reception(true);
 	struct timespec start, end;
 	clock_gettime(CLOCK_REALTIME, &start);
@@ -4662,6 +4684,7 @@ void mytimer(int ignored){
 		resolve_gateway_mac_requested = false;
 		uint8_t dummy_destmac[6];
 		resolve_mac(*((unsigned int*)gateway), dummy_destmac);
+		resolve_gateway_counter++;
 	}
 
 	for(int i=0;i<MAX_FD;i++){
@@ -4750,11 +4773,21 @@ void mytimer(int ignored){
 				txcb->retry++;
 				txcb->txtime = tick;
 
+				clock_gettime(CLOCK_REALTIME, &t0);
 				update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
+				clock_gettime(CLOCK_REALTIME, &t1);
+                update_tcp_header_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
 				if(txcb->seq >= tcb->highest_sent_sequence_number){
 					tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen;
 				}
+				clock_gettime(CLOCK_REALTIME, &t0);
 				send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
+				clock_gettime(CLOCK_REALTIME, &t1);
+                send_ip_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
+				sendto_ns += sendto_call_time;
+				eim_ns += eim_time;
+				out_packet_counter++;
+				out_bytes_counter += txcb->totlen;
 
 				acc += txcb->payloadlen;
 				prev = txcb;
@@ -4769,7 +4802,7 @@ void mytimer(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		//DEBUG("mytimer %ld us", duration_us);
+		//DEBUG("mytimer %ld us\tgw %d out_pkt %d bytes %d |\tuth %ld sip %ld st %ld eim %ld", duration_us, resolve_gateway_counter, out_packet_counter, out_bytes_counter, update_tcp_header_ns / 1000, send_ip_ns / 1000, sendto_ns / 1000, eim_ns / 1000);
 	}
 	enable_signal_reception(true);
 }
