@@ -4643,7 +4643,7 @@ void myio(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		DEBUG("myio %ld us\tt %d h %d in_pay %d in_dmp %d req_ack %d out_ack %d out_dmp %d", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter);
+		//DEBUG("myio %ld us\tt %d h %d in_pay %d in_dmp %d req_ack %d out_ack %d out_dmp %d", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter);
 	}
 
 	check_rx_buffer_drops("myio_end");
@@ -4672,94 +4672,94 @@ void mytimer(int ignored){
 		int fdinfo_backlog_length = fdinfo[i].backlog_length;
 		for(int backlog_index = 0; backlog_index <= fdinfo_backlog_length; backlog_index++){
 		
-		struct tcpctrlblk* tcb;
-		int fd_sid;
+			struct tcpctrlblk* tcb;
+			int fd_sid;
 
-		if(backlog_index == fdinfo[i].backlog_length){
-			// The last iteration is for the "main" TCB
-			tcb = fdinfo[i].tcb;
-			fd_sid = fdinfo[i].sid;
-		}else{
-			tcb = &(fdinfo[i].channel_backlog[backlog_index]);
-			fd_sid = 0; // fd_sid is valid only if tcb->st != 0
-		}
+			if(backlog_index == fdinfo[i].backlog_length){
+				// The last iteration is for the "main" TCB
+				tcb = fdinfo[i].tcb;
+				fd_sid = fdinfo[i].sid;
+			}else{
+				tcb = &(fdinfo[i].channel_backlog[backlog_index]);
+				fd_sid = 0; // fd_sid is valid only if tcb->st != 0
+			}
 
-		if(tcb->st == 0 || tcb->st == TCB_ST_LISTEN || tcb->st == TCB_ST_CLOSED){
-			continue;
-		}
+			if(tcb->st == 0 || tcb->st == TCB_ST_LISTEN || tcb->st == TCB_ST_CLOSED){
+				continue;
+			}
 
-		if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
-			fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
-			continue;
-		}
-		if(fd_sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fd_sid] != 0) && (tcb->stream_fsm_timer[fd_sid] <= tick)){
-			/* Note: If for any reason the stream timeout is used for something different from the opening of streams without anything to transmit, you need to modify
-			in prepare_tcp where the stream_fsm_timer is set to 0 if any segment is transmitted on the stream
-			*/
-			fsm(i, FSM_EVENT_STREAM_TIMEOUT, NULL, NULL);
-			continue;
-		}
-		struct txcontrolbuf* txcb = tcb->txfirst;
-		struct txcontrolbuf* prev = NULL;
-		int acc = 0; // payload bytes accumulator
-		while(txcb != NULL && (acc < tcb->cgwin+tcb->lta || txcb->payloadlen == 0 || txcb->dummy_payload)){
-			// Karn invalidation not handled
-			if(txcb->retry == 0){
-				// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
-				if(!txcb->dummy_payload){
-					tcb->flightsize += txcb->payloadlen;
+			if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
+				fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
+				continue;
+			}
+			if(fd_sid != SID_UNASSIGNED && (tcb->stream_fsm_timer[fd_sid] != 0) && (tcb->stream_fsm_timer[fd_sid] <= tick)){
+				/* Note: If for any reason the stream timeout is used for something different from the opening of streams without anything to transmit, you need to modify
+				in prepare_tcp where the stream_fsm_timer is set to 0 if any segment is transmitted on the stream
+				*/
+				fsm(i, FSM_EVENT_STREAM_TIMEOUT, NULL, NULL);
+				continue;
+			}
+			struct txcontrolbuf* txcb = tcb->txfirst;
+			struct txcontrolbuf* prev = NULL;
+			int acc = 0; // payload bytes accumulator
+			while(txcb != NULL && (acc < tcb->cgwin+tcb->lta || txcb->payloadlen == 0 || txcb->dummy_payload)){
+				// Karn invalidation not handled
+				if(txcb->retry == 0){
+					// This is the first TX attempt for a segment, and at this point I know that there is enough space in the cwnd to send it, so it will be sent
+					if(!txcb->dummy_payload){
+						tcb->flightsize += txcb->payloadlen;
+					}
+				} else if(txcb->txtime > 0 && txcb->txtime+tcb->timeout > tick){
+					acc += txcb->payloadlen;
+					prev = txcb;
+					txcb = txcb->next;
+					continue;
 				}
-			} else if(txcb->txtime > 0 && txcb->txtime+tcb->timeout > tick){
+				if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment->flags == ACK){
+					// If this is only an ACK without payload it does not need to be RETXed
+					// we remove txcb from the TX queue
+					free(txcb->segment);
+					if(prev != NULL){
+						prev->next = txcb->next;
+					}else{
+						tcb->txfirst = txcb->next;
+					}
+					if(tcb->txlast == txcb){
+						tcb->txlast = prev;
+					}
+					free(txcb);
+					txcb = prev != NULL? prev->next : tcb->txfirst;
+					continue;
+				}
+				bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
+				if(txcb->retry > 0){
+					if(!is_fast_transmit){
+						congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
+						LOG_RTO(tcb->timeout);
+					}
+
+					// Reset the TX time of all other segments in the tx queue, otherwise they could trigger a timeout soon after this
+					struct txcontrolbuf* cursor = txcb->next;
+					while(cursor != NULL){
+						if(cursor->retry > 0 && cursor->txtime > 0){
+							cursor->txtime = tick;
+						}
+						cursor = cursor->next;
+					}
+				}
+				txcb->retry++;
+				txcb->txtime = tick;
+
+				update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
+				if(txcb->seq >= tcb->highest_sent_sequence_number){
+					tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen;
+				}
+				send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
+
 				acc += txcb->payloadlen;
 				prev = txcb;
 				txcb = txcb->next;
-				continue;
 			}
-			if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment->flags == ACK){
-				// If this is only an ACK without payload it does not need to be RETXed
-				// we remove txcb from the TX queue
-				free(txcb->segment);
-				if(prev != NULL){
-					prev->next = txcb->next;
-				}else{
-					tcb->txfirst = txcb->next;
-				}
-				if(tcb->txlast == txcb){
-					tcb->txlast = prev;
-				}
-				free(txcb);
-				txcb = prev != NULL? prev->next : tcb->txfirst;
-				continue;
-			}
-			bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
-			if(txcb->retry > 0){
-				if(!is_fast_transmit){
-					congctrl_fsm(tcb,FSM_EVENT_TIMEOUT,NULL,0,0);
-					LOG_RTO(tcb->timeout);
-				}
-
-				// Reset the TX time of all other segments in the tx queue, otherwise they could trigger a timeout soon after this
-				struct txcontrolbuf* cursor = txcb->next;
-				while(cursor != NULL){
-					if(cursor->retry > 0 && cursor->txtime > 0){
-						cursor->txtime = tick;
-					}
-					cursor = cursor->next;
-				}
-			}
-			txcb->retry++;
-			txcb->txtime = tick;
-
-			update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
-			if(txcb->seq >= tcb->highest_sent_sequence_number){
-				tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen;
-			}
-			send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
-
-			acc += txcb->payloadlen;
-			prev = txcb;
-			txcb = txcb->next;
-		}
 
 
 		}
