@@ -27,8 +27,8 @@
 /* DEFINE MACROS */
 
 //#define NODEBUG
-//#define NOLOGS
-#define SHORTLOGS
+#define NOLOGS
+//#define SHORTLOGS
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -4094,7 +4094,63 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 	}
 	printf("NULL\n");
 }
+
+struct ack_generation_queue_node{
+	struct ack_generation_queue_node* next;
+	int fd;
+	int backlog_index;
+
+	/*
+	Counts how many acks have been requested.
+	We can use this to generate more than 1 ack, according to some delayed ack policy (e.g. we transmit 1 ack every 2 packets).
+	If congestion control works with ABC, we could just send 1 ack regardless of how many have been requested (hoping that this single ACK is not lost).
+	This does not include dupACKs, that are handled differently.
+	*/
+	uint32_t requested_acks;
+};
+
+struct ack_generation_queue{
+	struct ack_generation_queue_node* head;
+};
+
+void add_ack_request_to_queue(struct ack_generation_queue* queue_ptr, int fd, int backlog_index){
+	// https://claude.ai/share/f8ab5c6c-3185-4d46-8ce6-27bb37144ae9
+
+    // Search if there is already a request in the queue for that (fd, backlog_index) combination
+    struct ack_generation_queue_node* current = queue_ptr->head;
+    while(current != NULL){
+        if(current->fd == fd && current->backlog_index == backlog_index){
+            // Found existing node: increment requested_acks and return
+            current->requested_acks++;
+            return;
+        }
+        current = current->next;
+    }
+
+    // No existing node found: allocate and initialize a new one
+    struct ack_generation_queue_node* new_node = malloc(sizeof(struct ack_generation_queue_node));
+    new_node->fd             = fd;
+    new_node->backlog_index  = backlog_index;
+    new_node->requested_acks = 1;
+    new_node->next           = NULL;
+
+    // Enqueue at the tail so requests are processed in FIFO order
+    if(queue_ptr->head == NULL){
+        queue_ptr->head = new_node;
+        return;
+    }
+    struct ack_generation_queue_node* tail = queue_ptr->head;
+    while(tail->next != NULL){
+        tail = tail->next;
+    }
+    tail->next = new_node;
+}
+
 void myio(int ignored){
+	int total_counter = 0;
+	int handled_counter = 0;
+	int ack_counter = 0;
+
 	disable_signal_reception(true);
 	struct timespec start, end;
 	clock_gettime(CLOCK_REALTIME, &start);
@@ -4118,6 +4174,8 @@ void myio(int ignored){
 
 	check_rx_buffer_drops("myio_start");
 
+	struct ack_generation_queue requested_acks_queue = {.head = NULL};
+
 	int received_packet_size; // mytcp: size
 	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
 		if(received_packet_size < 0){
@@ -4128,6 +4186,7 @@ void myio(int ignored){
 			DEBUG("low received_packet_size %d < %lu", received_packet_size, sizeof(struct ethernet_frame));
 			continue;
 		}
+		total_counter++;
 		struct timespec start2, end2;
 		clock_gettime(CLOCK_REALTIME, &start2);
 		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
@@ -4181,6 +4240,7 @@ void myio(int ignored){
 				// The packet is not for me
 				continue; // go to the processing of the next received packet, if any
 			}
+			handled_counter++;
 
 			LOG_TCP_SEGMENT("IN", (uint8_t*) tcp, htons(ip->totlen) - (ip->ver_ihl&0xF)*4);
 
@@ -4596,13 +4656,12 @@ void myio(int ignored){
 				}
 
 				if(!tcb->ms_option_enabled){
-					//if(tcb->txfirst==NULL){
-					
-					// Generate an ACK without MS Option
-					//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-					fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-
-					//}
+					if(!in_order_for_channel){
+						fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+						ack_counter++;
+					}else{
+						add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
+					}
 				}else{
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
@@ -4637,10 +4696,12 @@ void myio(int ignored){
 							}
 						}
 						else{
-							// Generic ACK
-							//ERROR("Inviare subito, non accodare!");
-							//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-							fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+							if(!in_order_for_channel){
+								fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+								ack_counter++;
+							}else{
+								add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
+							}
 						}
 					}else{
 						DEBUG("Unexpected packet with payload but no MSTCP option:");
@@ -4681,13 +4742,26 @@ void myio(int ignored){
 		//printf("pkt %ld us                                                \r", duration_us);
 	}//packet reception while end
 
+	// Generation of enqueued fast ACKs
+	while(requested_acks_queue.head != NULL){
+		struct ack_generation_queue_node* request_node = requested_acks_queue.head;
+
+		// Generate a single ACK regardless of the number of requests
+		fast_send_tcp(request_node->fd, request_node->backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+		ack_counter++;
+
+
+		requested_acks_queue.head = requested_acks_queue.head->next;
+		free(request_node);
+	}
+
 	assert_handler_lock_acquired("myio end");
 
 	clock_gettime(CLOCK_REALTIME, &end);
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		//DEBUG("myio %ld us", duration_us);
+		DEBUG("myio %ld us tot %d hdl %d ack %d", duration_us, total_counter, handled_counter, ack_counter);
 	}
 
 	check_rx_buffer_drops("myio_end");
@@ -4819,6 +4893,7 @@ void mytimer(int ignored){
 }
 
 
+// To be used in user code
 void* safe_malloc(size_t sz){
 	disable_signal_reception(false);
 	void* ret = malloc(sz);
@@ -4830,6 +4905,7 @@ void* safe_malloc(size_t sz){
 	return ret;
 }
 
+// To be used in user code
 void safe_free(void* ptr){
 	disable_signal_reception(false);
 	if(ptr == NULL){
@@ -5887,7 +5963,7 @@ void full_duplex_server_app(int listening_socket){
 				*strend= '\0';
 				char* end_of_headers_substr = strstr(clients[i].req_arr, "\r\n\r\n"); 
 				if(end_of_headers_substr != NULL){
-					DEBUG(clients[i].req_arr);
+					//DEBUG(clients[i].req_arr);
 
 					char* requested_ptr = strstr(clients[i].req_arr, "/")+1;
 					char* str_end = requested_ptr;
