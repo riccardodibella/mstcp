@@ -2512,149 +2512,26 @@ void stream_holes_scheduler(int s){
 
 
 
-int circular_starting_sid = 0;
-void circular_start_scheduler(int s){
-	if(s < 3 || s >= MAX_FD){
-		ERROR("unfair_congestion_scheduler invalid fd %d", s);
-	}
-	struct tcpctrlblk* tcb = fdinfo[s].tcb;
-	if(tcb == NULL){
-		ERROR("unfair_congestion_scheduler tcb NULL");
-	}
-	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = malloc(max_payload_length);
-	for(int sid_counter = 0; sid_counter < TOT_SID; sid_counter++){
-		int sid = (sid_counter + circular_starting_sid) % TOT_SID;
-		if(tcb->stream_state[sid] == STREAM_STATE_OPENED){
-			// We can transmit some more data on the stream
-			int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
-
-			int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
-			if((available_bytes == 0 || cong_control_allowed_bytes == 0) && tcb->write_side_close_state[sid] != WR_CLOSE_ST_LSS_REQUESTED){
-				// We can do nothing for this stream
-				// we cannot send data, and we cannot enqueue the LSS(/FIN), so we skip it
-				continue;
-			}
-
-			#if false
-			/* FLOW CONTROL START */
-			int in_flight_bytes = 0; // Note: this is not equal to tcb->flightsize, because that is for all the streams, this is for only one stream
-			bool small_in_flight = false;
-			struct txcontrolbuf* tx_cursor = tcb->txfirst;
-			while(tx_cursor != NULL){
-				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
-						small_in_flight = true;
-					}
-					in_flight_bytes += tx_cursor->payloadlen;
-				}
-				tx_cursor = tx_cursor->next;
-			}
-			int flow_control_allowed_bytes = tcb->radwin[sid] - in_flight_bytes; // Must always be >= 0
-			if(flow_control_allowed_bytes < 0){
-				ERROR("flow_control_allowed_bytes %d < 0 (tcb->radwin[%d] %u in_flight_bytes %d)", flow_control_allowed_bytes, sid, tcb->radwin[sid], in_flight_bytes);
-			}
-
-			int allowed_bytes = MIN(flow_control_allowed_bytes, cong_control_allowed_bytes);
-			int current_transfer_bytes = MIN(available_bytes, allowed_bytes);
-			LOG_SCHEDULER_BYTES(sid, available_bytes, flow_control_allowed_bytes, cong_control_allowed_bytes);
-			/* FLOW CONTROL END */
-			#else
-			bool small_in_flight = false;
-			struct txcontrolbuf* tx_cursor = tcb->txfirst;
-			while(tx_cursor != NULL){
-				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
-						small_in_flight = true;
-					}
-				}
-				tx_cursor = tx_cursor->next;
-			}
-			int current_transfer_bytes = available_bytes;
-			LOG_SCHEDULER_BYTES(sid, available_bytes, RX_VIRTUAL_BUFFER_SIZE, cong_control_allowed_bytes);
-			#endif
-
-			while(current_transfer_bytes > 0){
-				int payload_length = MIN(current_transfer_bytes, max_payload_length);
-				if(payload_length < max_payload_length && small_in_flight){
-					break;
-				}
-
-				/*
-				for(int i=0; i<payload_length; i++){
-					temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
-					tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
-					tcb->txfree[sid]++;
-					current_transfer_bytes--;
-				}
-				*/
-				int first_chunk = payload_length, second_chunk = 0;
-				if(first_chunk > (TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid])){
-					second_chunk = first_chunk -(TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid]);
-					first_chunk -= second_chunk;
-				}
-				memcpy(temp_payload_buf, tcb->stream_tx_buffer[sid] + tcb->tx_buffer_occupied_region_start[sid], first_chunk);
-				memcpy(temp_payload_buf + first_chunk, tcb->stream_tx_buffer[sid], second_chunk);
-				tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid] + payload_length) % TX_BUFFER_SIZE;
-				tcb->txfree[sid] += payload_length;
-				current_transfer_bytes -= payload_length;
-
-				if(!tcb->ms_option_enabled){
-					prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-				}else{
-					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
-					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-					
-					// Stream update
-					opt[2] = sid<<2 | (((tcb->next_ssn[sid])>>8) & 0x03);
-					opt[3] = (tcb->next_ssn[sid]) & 0xFF;
-					update_next_ssn(&(tcb->next_ssn[sid]));
-
-					prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, opt, optlen);
-					free(opt);
-				}
-			}
-
-			if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_REQUESTED){
-				if(tcb->txfree[sid] == TX_BUFFER_SIZE){
-					if(!tcb->ms_option_enabled){
-						prepare_tcp(s, -1, ACK | FIN, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-					}else{
-						// Enqueue LSS segment
-						int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-						uint8_t* opt = malloc(optlen);
-						memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-						
-						// Stream update
-						opt[2] = (0b1 << 7) | sid<<2 | ((tcb->next_ssn[sid] >> 8)&0x3);
-						opt[3] = (tcb->next_ssn[sid])&0xFF;
-						update_next_ssn(&(tcb->next_ssn[sid]));
-
-						uint8_t* dummy_payload = malloc(1); // value doesn't matter
-
-						prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-						free(dummy_payload);
-						free(opt);
-					}
-
-					tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_TXED;
-				}
-			}
-		}
-	}
-	free(temp_payload_buf);
-	circular_starting_sid = (circular_starting_sid+1) % TOT_SID;
-}
-
-
 // Abstract scheduler stub to call one of the different scheduler implementations
 void scheduler(int s /* socket fd */){
 	assert_handler_lock_acquired("scheduler");
-	// circular_start_scheduler(s);
 	stream_holes_scheduler(s);
 }
 
+bool is_dmp_ack_needed(struct tcpctrlblk* tcb, int sid){
+	if(tcb == NULL){
+		ERROR("is_dmp_ack_needed tcb NULL");
+	}
+	if(sid < 0 || sid > MAX_SID){
+		ERROR("is_dmp_ack_needed invalid sid %d", sid);
+	}
+	// This is an easy policy.
+	// We could also check from the start to the end to see if we find any segment yet to be transmitted for the same SID
+	// that would for sure be transmitted before the new one
+	// Note: If we do this optimization, it must have been never transmitted, it is not enough that it is about to be transmitted now
+	// because otherwise it could be acked in the meanwhile and the DMP ack would never be TXed
+	return tcb->txfirst == NULL || tcb->txlast->retry != 0 || tcb->txlast->sid != sid;
+}
 
 
 
@@ -3968,20 +3845,22 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		if(!tcb->ms_option_enabled){
 			fast_send_tcp(s, -1, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 		}else{
-			int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-			uint8_t* opt = malloc(optlen);
-			memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-			
-			// Stream update
-			opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
-			opt[3] = (tcb->next_ssn[sid])&0xFF;
-			update_next_ssn(&(tcb->next_ssn[sid]));
+			if(is_dmp_ack_needed(tcb, sid)){
+				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+				uint8_t* opt = malloc(optlen);
+				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+				
+				// Stream update
+				opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
+				opt[3] = (tcb->next_ssn[sid])&0xFF;
+				update_next_ssn(&(tcb->next_ssn[sid]));
 
-			uint8_t* dummy_payload = malloc(1); // value doesn't matter
+				uint8_t* dummy_payload = malloc(1); // value doesn't matter
 
-			prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-			free(dummy_payload);
-			free(opt);
+				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
+				free(dummy_payload);
+				free(opt);
+			}
 		}
 	}else{
 		ERROR("adwin not increased during myread consumption");
@@ -4149,7 +4028,11 @@ void add_ack_request_to_queue(struct ack_generation_queue* queue_ptr, int fd, in
 void myio(int ignored){
 	int total_counter = 0;
 	int handled_counter = 0;
-	int ack_counter = 0;
+	int out_ack_counter = 0;
+	int req_ack_counter = 0;
+	int dmp_counter = 0;
+	int payload_counter = 0;
+	int out_dmp_counter = 0;
 
 	disable_signal_reception(true);
 	struct timespec start, end;
@@ -4475,6 +4358,12 @@ void myio(int ignored){
 					}
 				}
 
+				if(dummy_payload){
+					dmp_counter++;
+				}else{
+					payload_counter++;
+				}
+
 				bool in_order_for_channel = true; // Updated later in the code
 
 				uint32_t channel_offset = ntohl(tcp->seq)-tcb->ack_offs; // Position of this segment in the channel stream, without the initial random offset
@@ -4658,25 +4547,17 @@ void myio(int ignored){
 				if(!tcb->ms_option_enabled){
 					if(!in_order_for_channel){
 						fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-						ack_counter++;
+						out_ack_counter++;
 					}else{
 						add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
+						req_ack_counter++;
 					}
 				}else{
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload && in_order_for_channel){
-							bool new_dmp_ack_needed = false;
-
-							// This is an easy policy.
-							// We could also check from the start to the end to see if we find any segment yet to be transmitted for the same SID
-							// that would for sure be transmitted before the new one
-							// Note: If we do this optimization, it must have been never transmitted, it is not enough that it is about to be transmitted now
-							// because otherwise it could be acked in the meanwhile and the DMP ack would never be TXed
-							
-							
-							new_dmp_ack_needed = tcb->txfirst == NULL || tcb->txlast->retry != 0 /*|| tcb->txlast->sid != sid*/;
-							if(new_dmp_ack_needed){
+							if(is_dmp_ack_needed(tcb, sid)){
+								out_dmp_counter++;
 								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
 								int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -4698,9 +4579,10 @@ void myio(int ignored){
 						else{
 							if(!in_order_for_channel){
 								fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-								ack_counter++;
+								out_ack_counter++;
 							}else{
 								add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
+								req_ack_counter++;
 							}
 						}
 					}else{
@@ -4748,7 +4630,7 @@ void myio(int ignored){
 
 		// Generate a single ACK regardless of the number of requests
 		fast_send_tcp(request_node->fd, request_node->backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
-		ack_counter++;
+		out_ack_counter++;
 
 
 		requested_acks_queue.head = requested_acks_queue.head->next;
@@ -4761,7 +4643,7 @@ void myio(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		DEBUG("myio %ld us tot %d hdl %d ack %d", duration_us, total_counter, handled_counter, ack_counter);
+		DEBUG("myio %ld us\tt %d h %d in_pay %d in_dmp %d req_ack %d out_ack %d out_dmp %d", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter);
 	}
 
 	check_rx_buffer_drops("myio_end");
