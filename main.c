@@ -2356,7 +2356,7 @@ bool does_stream_have_hole(int s, int sid){
 	return false;
 }
 
-void stream_holes_scheduler(int s){
+void stream_holes_scheduler(int s){// TODOFC
 	if(s < 3 || s >= MAX_FD){
 		ERROR("unfair_congestion_scheduler invalid fd %d", s);
 	}
@@ -2458,14 +2458,6 @@ void stream_holes_scheduler(int s){
 				break;
 			}
 
-			/*
-			for(int i=0; i<payload_length; i++){
-				temp_payload_buf[i] = tcb->stream_tx_buffer[sid][tcb->tx_buffer_occupied_region_start[sid]];
-				tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid]+1)%TX_BUFFER_SIZE;
-				tcb->txfree[sid]++;
-				current_transfer_bytes--;
-			}
-			*/
 			int first_chunk = payload_length, second_chunk = 0;
 			if(first_chunk > (TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid])){
 				second_chunk = first_chunk -(TX_BUFFER_SIZE - tcb->tx_buffer_occupied_region_start[sid]);
@@ -3402,7 +3394,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(!lss && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
-							//tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -4216,10 +4208,10 @@ void myio(int ignored){
 								sid = 0;
 							}
 
-							if(tcb->radwin[sid] < temp->payloadlen){
+							if(tcb->radwin[sid] < temp->payloadlen){ // TODOFC
 								//ERROR("tcb->radwin[%d] would become < 0", sid);
 							}
-							//tcb->radwin[sid] -= temp->payloadlen;
+							//tcb->radwin[sid] -= temp->payloadlen; // TODOFC
 						}
 
 						int sid = -1;
@@ -4296,6 +4288,7 @@ void myio(int ignored){
 										// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
 										fdinfo[i].tcb->flightsize-=cursor->payloadlen;
 
+										// TODOFC
 										/*
 										if(tcb->radwin[cursor->sid] < cursor->payloadlen){
 											ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
@@ -4383,9 +4376,10 @@ void myio(int ignored){
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
-					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor); // TODOFC
 					if(new_radwin >= tcb->radwin[sid]){
 						//tcb->radwin[sid] = new_radwin;
+						// TODOFC
 					}
 
 					struct channel_rx_queue_node* newrx = NULL;
@@ -4406,7 +4400,7 @@ void myio(int ignored){
 
 							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
 
-							//tcb->radwin[sid] = new_radwin;
+							//tcb->radwin[sid] = new_radwin;// TODOFC
 						}else{
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
@@ -4431,7 +4425,7 @@ void myio(int ignored){
 					if(newrx != NULL){
 						// new node has been inserted in the channel queue
 
-						//in_order_for_channel = false;
+						in_order_for_channel = false;
 
 						if(tcb->ms_option_enabled){
 							bool newrx_in_order_for_stream = true;
