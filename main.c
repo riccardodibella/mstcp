@@ -1997,6 +1997,10 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 
 
 void fast_retransmit_holes(struct tcpctrlblk* tcb){
+	if(tcb == NULL){
+		ERROR("fast_retransmit_holes NULL tcb");
+	}
+	
 	bool there_is_hole = false;
 	struct txcontrolbuf* iter = tcb->txfirst;
 	while(iter != NULL && iter->next != NULL){
@@ -2013,9 +2017,6 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 		return;
 	}
 	
-	if(tcb == NULL){
-		ERROR("fast_retransmit_holes NULL tcb");
-	}
 	if(tcb->txfirst == NULL || tcb->txlast == NULL){
 		ERROR("fast_retransmit_holes txfirst / txlast NULL");
 	}
@@ -2040,6 +2041,7 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 				region_end = region_end->next;
 			}
 
+			/* This "!" is intentional: we exit from the loop only when there is no next hole, so we retransmit what is in all holes, not only in the first one */
 			if(!found_next_hole){
 				break; // Exit from the infinite loop
 			}
