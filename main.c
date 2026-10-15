@@ -23,6 +23,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <stdalign.h>
 
 /* DEFINE MACROS */
 
@@ -95,7 +96,7 @@ int payload_size_arr[] = {RESP_PAYLOAD_BYTES};
 #endif
 
 #define REQ_BUF_SIZE 100
-#define RESP_BUF_SIZE 100+RESP_PAYLOAD_BYTES
+#define RESP_BUF_SIZE (100+RESP_PAYLOAD_BYTES)
 
 
 //#define UPLINK_DROP_PROB 0
@@ -595,6 +596,112 @@ void DEBUG(char* c, ...){
 	#endif
 }
 
+#define MYMALLOC_AVAILABLE_MB 64
+#define MYMALLOC_CHUNK_SIZE 16
+
+
+#define MYMALLOC_AVAILABLE_BYTES (MYMALLOC_AVAILABLE_MB*1024*1024) 
+#define MYMALLOC_NUM_CHUNKS (MYMALLOC_AVAILABLE_BYTES / MYMALLOC_CHUNK_SIZE)
+
+uint32_t mymalloc_region_extensions[MYMALLOC_NUM_CHUNKS] = {0};
+alignas(MYMALLOC_CHUNK_SIZE) uint8_t mymalloc_buffer[MYMALLOC_AVAILABLE_BYTES];
+
+void* mymalloc(size_t size){
+	// return malloc(size);
+
+	if(size==0){
+		return NULL;
+	}
+	if(size > UINT32_MAX){
+		ERROR("mymalloc size %u > max %u", size, UINT32_MAX);
+	}
+
+	uint32_t requested_chunks = size / MYMALLOC_CHUNK_SIZE + (size % MYMALLOC_CHUNK_SIZE != 0);
+	int current_first_free = 0;
+	while(true){
+		if(current_first_free >= MYMALLOC_NUM_CHUNKS){
+			ERROR("mymalloc out of memory (requested size %lu chunks %u)", size, requested_chunks);
+			myerrno=ENOMEM;
+			return NULL;
+		}
+		if(mymalloc_region_extensions[current_first_free] != 0){
+			current_first_free+=mymalloc_region_extensions[current_first_free];
+			continue;
+		}
+		bool all_free=true;
+		for(int i=1; i<requested_chunks; i++){
+			if(current_first_free + i >= MYMALLOC_NUM_CHUNKS){
+				current_first_free += i;
+				all_free=false;
+				break;
+			}
+			if(mymalloc_region_extensions[current_first_free+i] != 0){
+				current_first_free += i;
+				all_free=false;
+				break;
+			}
+		}
+		if(!all_free){
+			// current_first_free already updated
+			continue;
+		}
+
+		// Found free region at current_first_free
+		mymalloc_region_extensions[current_first_free] = requested_chunks;
+		return (void*) &(mymalloc_buffer[current_first_free*MYMALLOC_CHUNK_SIZE]);
+	}
+}
+void myfree(void* p){
+	// free(p); return;
+
+	if(p == NULL){
+		return;
+	}
+
+	ssize_t buffer_pos = ((uint8_t*)p - mymalloc_buffer);
+	if(buffer_pos < 0 || buffer_pos >= MYMALLOC_AVAILABLE_BYTES || buffer_pos % MYMALLOC_CHUNK_SIZE != 0){
+		ERROR("myfree invalid buffer_pos %lu", buffer_pos);
+	}
+	uint32_t chunk_number = buffer_pos / MYMALLOC_CHUNK_SIZE;
+	if(mymalloc_region_extensions[chunk_number] == 0){
+		ERROR("myfree mymalloc_region_extensions[%u] == 0", chunk_number);
+	}
+	mymalloc_region_extensions[chunk_number] = 0;
+}
+void* myrealloc(void *ptr, size_t size){
+	if(ptr==NULL){
+		return mymalloc(size);
+	}
+	if(size == 0){
+		myfree(ptr);
+		return NULL;
+	}
+	if(size > UINT32_MAX){
+		ERROR("myrealloc size %u > max %u", size, UINT32_MAX);
+	}
+	ssize_t buffer_pos = ((uint8_t*)ptr - mymalloc_buffer);
+	if(buffer_pos < 0 || buffer_pos >= MYMALLOC_AVAILABLE_BYTES || buffer_pos % MYMALLOC_CHUNK_SIZE != 0){
+		ERROR("myrealloc invalid buffer_pos %lu", buffer_pos);
+	}
+	uint32_t chunk_number = buffer_pos / MYMALLOC_CHUNK_SIZE;
+	if(mymalloc_region_extensions[chunk_number] == 0){
+		ERROR("myrealloc mymalloc_region_extensions[%u] == 0", chunk_number);
+	}
+	uint32_t src_chunks = mymalloc_region_extensions[chunk_number];
+	uint32_t dst_chunks = size / MYMALLOC_CHUNK_SIZE + (size % MYMALLOC_CHUNK_SIZE != 0);
+	if(dst_chunks <= src_chunks){
+		mymalloc_region_extensions[chunk_number] = dst_chunks;
+		return ptr;
+	}
+	void* to_return = mymalloc(size);
+	if(to_return == NULL){
+		ERROR("myrealloc mymalloc returned NULL");
+	}
+	memcpy(to_return, ptr, src_chunks*MYMALLOC_CHUNK_SIZE);
+	myfree(ptr);
+	return to_return;
+}
+
 int64_t get_timestamp_ns(){
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -741,7 +848,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 	}
 	#ifndef SHORTLOGS
 	if(payload_length > 0 && !dmp){
-		char* str = malloc(payload_length + 1);
+		char* str = mymalloc(payload_length + 1);
 		memcpy(str, ((uint8_t*)tcp->payload) + FIXED_OPTIONS_LENGTH, payload_length);
 		str[payload_length] = 0;
 		for(int i=0; i<payload_length; i++){
@@ -750,7 +857,7 @@ void LOG_TCP_SEGMENT(char* direction, uint8_t* segment_buf, int len){
 			}
 		}
 		LOG_FIELD("payload_str", "\"%s\"", str);
-		free(str);
+		myfree(str);
 	}
 	#endif
 	int ts_index = search_tcp_option(tcp, OPT_KIND_TIMESTAMPS);
@@ -1249,7 +1356,7 @@ void load_ifconfig(){
 		exit(EXIT_FAILURE);
 	}
 	
-	char* gw_str = malloc(1024);
+	char* gw_str = mymalloc(1024);
 	if (fgets(gw_str, 1024, gw_file) != NULL) {
 		// Remove possible newline at the end of the string
 		for(int i=0; i<strlen(gw_str); i++){
@@ -1264,7 +1371,7 @@ void load_ifconfig(){
 		perror("fgets gateway load_ifconfig");
 		exit(EXIT_FAILURE);
 	}
-	free(gw_str);
+	myfree(gw_str);
 	pclose(gw_file);
 
 	if(close(temp_socket) == -1){
@@ -1557,7 +1664,7 @@ int prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, u
 		ERROR("prepare_tcp incompatible tcb state %d", tcb->st);
 	}
 
-	struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof(struct txcontrolbuf));
+	struct txcontrolbuf * txcb = (struct txcontrolbuf*) mymalloc(sizeof(struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
@@ -1567,7 +1674,7 @@ int prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, u
 	txcb->dummy_payload = flags & DMP;
 	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
 	txcb->retry = 0;
-	struct tcp_segment * tcp = txcb->segment = (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
+	struct tcp_segment * tcp = txcb->segment = (struct tcp_segment *) mymalloc(sizeof(struct tcp_segment));
 	tcp->s_port = fdinfo[s].l_port;
 	tcp->d_port = tcb->r_port;
 	tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
@@ -1875,7 +1982,7 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 	}
 
 	struct tcpctrlblk*tcb = fdinfo[s].tcb;
-	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) malloc(sizeof( struct txcontrolbuf));
+	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) mymalloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
 		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
@@ -1892,7 +1999,7 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 		ERROR("cannot use DMP with fast_send_tcp");
 	}
 	
-	struct tcp_segment * tcp = /*txcb->segment =*/ (struct tcp_segment *) malloc(sizeof(struct tcp_segment));
+	struct tcp_segment * tcp = /*txcb->segment =*/ (struct tcp_segment *) mymalloc(sizeof(struct tcp_segment));
 	tcp->s_port = fdinfo[s].l_port;
 	tcp->d_port = tcb->r_port;
 	// tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
@@ -2225,7 +2332,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 		lss = (tcp->payload[ms_index+2]>>7);
 	}
 
-	struct channel_rx_queue_node* to_return = malloc(sizeof(struct channel_rx_queue_node));
+	struct channel_rx_queue_node* to_return = mymalloc(sizeof(struct channel_rx_queue_node));
 	to_return->prev = prev;
 	to_return->next = next;
 	to_return->channel_offset = channel_offset;
@@ -2242,7 +2349,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 		*/
 		ERROR("create_channel_rx_queue_node invalid length payload %d segment %d", to_return->payload_length, to_return->total_segment_length);
 	}
-	to_return->segment = malloc(to_return->total_segment_length);
+	to_return->segment = mymalloc(to_return->total_segment_length);
 	memcpy(to_return->segment, tcp, to_return->total_segment_length);
 	return to_return;
 }
@@ -2268,7 +2375,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 		ERROR("create_stream_rx_queue_node segment NULL");
 	}
 	
-	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) malloc(sizeof(struct stream_rx_queue_node));
+	struct stream_rx_queue_node* to_return = (struct stream_rx_queue_node*) mymalloc(sizeof(struct stream_rx_queue_node));
 	to_return->next = NULL; // Always inserted at the end of the stream queue
 
 	int ms_index = search_tcp_option(ch_node->segment, OPT_KIND_MS_TCP);
@@ -2367,7 +2474,7 @@ void stream_holes_scheduler(int s){// TODOFC
 		ERROR("unfair_congestion_scheduler tcb NULL");
 	}
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = malloc(max_payload_length);
+	uint8_t* temp_payload_buf = mymalloc(max_payload_length);
 
 
 	int sids_list[TOT_SID];
@@ -2475,7 +2582,7 @@ void stream_holes_scheduler(int s){// TODOFC
 				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 			}else{
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = malloc(optlen);
+				uint8_t* opt = mymalloc(optlen);
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -2484,7 +2591,7 @@ void stream_holes_scheduler(int s){// TODOFC
 				update_next_ssn(&(tcb->next_ssn[sid]));
 
 				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, opt, optlen);
-				free(opt);
+				myfree(opt);
 			}
 		}
 
@@ -2495,7 +2602,7 @@ void stream_holes_scheduler(int s){// TODOFC
 				}else{
 					// Enqueue LSS segment
 					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = malloc(optlen);
+					uint8_t* opt = mymalloc(optlen);
 					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 					
 					// Stream update
@@ -2503,18 +2610,18 @@ void stream_holes_scheduler(int s){// TODOFC
 					opt[3] = (tcb->next_ssn[sid])&0xFF;
 					update_next_ssn(&(tcb->next_ssn[sid]));
 
-					uint8_t* dummy_payload = malloc(1); // value doesn't matter
+					uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
 
 					prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-					free(dummy_payload);
-					free(opt);
+					myfree(dummy_payload);
+					myfree(opt);
 				}
 
 				tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_TXED;
 			}
 		}
 	}
-	free(temp_payload_buf);
+	myfree(temp_payload_buf);
 }
 
 
@@ -2698,7 +2805,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				return -1;
 			}
 
-			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) mymalloc(sizeof(struct tcpctrlblk));
 			bzero(tcb, sizeof(struct tcpctrlblk));
 			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 			fdinfo[s].sid = 0;
@@ -2767,7 +2874,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			int opt_len;
 
 			opt_len = 19;
-			opt_ptr = malloc(opt_len);
+			opt_ptr = mymalloc(opt_len);
 
 			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 			opt_ptr[1] = 4; // MSS Length
@@ -2791,7 +2898,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
-			free(opt_ptr);
+			myfree(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
 			
@@ -2835,7 +2942,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						continue;
 					}
 					
-					// At this point the connection is a good candidate: search for a free stream
+					// At this point the connection is a good candidate: search for a myfree stream
 					for(int stream = 0; stream < TOT_SID; stream++){
 						if(tcb->stream_state[stream] == STREAM_STATE_UNUSED){
 							// Free stream found
@@ -2849,9 +2956,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].tcb->txfree[stream] = TX_BUFFER_SIZE;
 							fdinfo[s].tcb->tx_buffer_occupied_region_start[stream] = fdinfo[s].tcb->tx_buffer_occupied_region_end[stream] = 0;
 							if(fdinfo[s].tcb->stream_tx_buffer[stream] != NULL){
-								ERROR("stream_tx_buffer != NULL before malloc");
+								ERROR("stream_tx_buffer != NULL before mymalloc");
 							}
-							fdinfo[s].tcb->stream_tx_buffer[stream] = malloc(TX_BUFFER_SIZE);
+							fdinfo[s].tcb->stream_tx_buffer[stream] = mymalloc(TX_BUFFER_SIZE);
 							fdinfo[s].tcb->adwin[stream] = RX_VIRTUAL_BUFFER_SIZE;
 							fdinfo[s].tcb->stream_fsm_timer[stream] = tick + STREAM_OPEN_TIMEOUT;
 							fdinfo[s].tcb->write_side_close_state[stream] = WR_CLOSE_ST_OPEN;
@@ -2864,9 +2971,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 									ERROR("non-DMP remaining segment during fsm flush");
 								}
 								if(tmp->segment != NULL){
-									free(tmp->segment);
+									myfree(tmp->segment);
 								}
-								free(tmp);
+								myfree(tmp);
 							}
 							
 							fdinfo[s].tcb->stream_rx_queue[stream] = fdinfo[s].tcb->stream_rx_queue_tail[stream] = NULL;
@@ -2893,7 +3000,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}
 
 			// Open a new connection, requesting MS option
-			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			struct tcpctrlblk* tcb = fdinfo[s].tcb = (struct tcpctrlblk*) mymalloc(sizeof(struct tcpctrlblk));
 			bzero(tcb, sizeof(struct tcpctrlblk));
 			fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 			fdinfo[s].sid = 0;
@@ -2960,7 +3067,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			int opt_len;
 
 			opt_len = 23;
-			opt_ptr = malloc(opt_len);
+			opt_ptr = mymalloc(opt_len);
 
 			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 			opt_ptr[1] = 4; // MSS Length
@@ -2988,7 +3095,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
-			free(opt_ptr);
+			myfree(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
 
@@ -3011,8 +3118,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				if((tcp->flags&SYN) && (tcp->flags&ACK) && (htonl(tcp->ack)==tcb->seq_offs + 1)){
 					tcb->seq_offs++;
 					tcb->ack_offs = htonl(tcp->seq) + 1;	
-					free(tcb->txfirst->segment);
-					free(tcb->txfirst);
+					myfree(tcb->txfirst->segment);
+					myfree(tcb->txfirst);
 					tcb->txfirst = tcb->txlast = NULL;
 					
 					bool ms_received = false;
@@ -3097,9 +3204,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->txfree[0] = TX_BUFFER_SIZE;
 					tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 					if(tcb->stream_tx_buffer[0] != NULL){
-						ERROR("stream_tx_buffer != NULL before malloc");
+						ERROR("stream_tx_buffer != NULL before mymalloc");
 					}
-					tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
+					tcb->stream_tx_buffer[0] = mymalloc(TX_BUFFER_SIZE);
 					if(tcb->stream_rx_queue[0] != NULL){
 						// This should never happen, it is just to check that this field is reset correctly
 						ERROR("TCB_ST_SYN_SENT FSM_EVENT_PKT_RCV tcb->stream_rx_queue[0]!=NULL");
@@ -3143,8 +3250,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 					if(htonl(tcp->ack) == tcb->seq_offs + 1){
 						// Passive open connection establishment
-						free(tcb->txfirst->segment);
-						free(tcb->txfirst);
+						myfree(tcb->txfirst->segment);
+						myfree(tcb->txfirst);
 						tcb->txfirst = tcb->txlast = NULL;
 						tcb->seq_offs++;
 						tcb->ack_offs=htonl(tcp->seq);
@@ -3161,7 +3268,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						/* Initialization of the stream-specific fields and buffers */
 
 						tcb->stream_state[0] = STREAM_STATE_READY;
-						tcb->stream_tx_buffer[0] = malloc(TX_BUFFER_SIZE);
+						tcb->stream_tx_buffer[0] = mymalloc(TX_BUFFER_SIZE);
 						tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = NULL;
 						//tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
 						tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
@@ -3257,7 +3364,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				if(cursor_index == fdinfo[s].backlog_length){
 					ERROR("insufficient backlog size; the connection request should be ignored or RSTed");
 				}
-				struct tcpctrlblk* backlog_tcb = fdinfo[s].channel_backlog + cursor_index; // free tcb in the backlog
+				struct tcpctrlblk* backlog_tcb = fdinfo[s].channel_backlog + cursor_index; // myfree tcb in the backlog
 				memcpy(backlog_tcb, tcb, sizeof(struct tcpctrlblk));
 
 				tcb = backlog_tcb;
@@ -3299,7 +3406,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				int opt_len;
 				if(tcb->ms_option_enabled){
 					opt_len = 23;
-					opt_ptr = malloc(opt_len);
+					opt_ptr = mymalloc(opt_len);
 
 					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 					opt_ptr[1] = 4; // MSS Length
@@ -3328,7 +3435,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->next_rx_ssn[0] = 1; // SSN 0 was received in the SYN
 				}else{
 					opt_len = 19;
-					opt_ptr = malloc(opt_len);
+					opt_ptr = mymalloc(opt_len);
 
 					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 					opt_ptr[1] = 4; // MSS Length
@@ -3354,7 +3461,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				assert_handler_lock_acquired("SYN|ACK");
 				//ERROR("Non va bene! Il segmento va aggiunto alla coda del TCB nella backlog, non a quello in stato LISTEN");
 				prepare_tcp(s, cursor_index, SYN|ACK, NULL, 0, opt_ptr, opt_len);
-				free(opt_ptr);
+				myfree(opt_ptr);
 			}
 			break;
 		case TCB_ST_ESTABLISHED:
@@ -3366,7 +3473,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				int sid = fdinfo[s].sid;
 				int ssn = fdinfo[s].tcb->next_ssn[sid];
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = malloc(optlen);
+				uint8_t* opt = mymalloc(optlen);
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -3375,12 +3482,12 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				update_next_ssn(&(fdinfo[s].tcb->next_ssn[sid]));
 
-				uint8_t* dummy_payload = malloc(1); // value doesn't matter
+				uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
 
 				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 
-				free(dummy_payload);
-				free(opt);
+				myfree(dummy_payload);
+				myfree(opt);
 				break;
 			}
 			if(event == FSM_EVENT_PKT_RCV){
@@ -3400,9 +3507,9 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
-								ERROR("stream_tx_buffer != NULL before malloc");
+								ERROR("stream_tx_buffer != NULL before mymalloc");
 							}
-							tcb->stream_tx_buffer[sid] = malloc(TX_BUFFER_SIZE);
+							tcb->stream_tx_buffer[sid] = mymalloc(TX_BUFFER_SIZE);
 							tcb->stream_rx_queue[sid] = tcb->stream_rx_queue_tail[sid] = NULL;
 							tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE;
 							// tcb->next_rx_ssn[sid] not incremented because it will be incremented in myio when the packet is inserted in stream RX queue
@@ -3415,7 +3522,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							while(cursor->next != NULL){
 								cursor = cursor->next;
 							}
-							cursor->next = (struct stream_backlog_node*) malloc(sizeof(struct stream_backlog_node));
+							cursor->next = (struct stream_backlog_node*) mymalloc(sizeof(struct stream_backlog_node));
 							cursor->next->sid = sid;
 							cursor->next->tcb = tcb;
 							cursor->next->next = NULL;
@@ -3515,13 +3622,13 @@ int mylisten(int s, int bl){
 		myerrno=EBADF; 
 		return -1;
 	}
-	fdinfo[s].tcb = (struct tcpctrlblk *) malloc (sizeof(struct tcpctrlblk));
+	fdinfo[s].tcb = (struct tcpctrlblk *) mymalloc (sizeof(struct tcpctrlblk));
 	bzero(fdinfo[s].tcb,sizeof(struct tcpctrlblk));
 	fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 	fdinfo[s].tcb->st = TCB_ST_LISTEN;
 	fdinfo[s].tcb->is_active_side = false;
 	fdinfo[s].tcb->listening_fd = s;
-	fdinfo[s].channel_backlog = (struct tcpctrlblk*) malloc(bl * sizeof(struct tcpctrlblk));
+	fdinfo[s].channel_backlog = (struct tcpctrlblk*) mymalloc(bl * sizeof(struct tcpctrlblk));
 	bzero(fdinfo[s].channel_backlog, bl * sizeof(struct tcpctrlblk));
 	fdinfo[s].ready_streams = 0;
 	fdinfo[s].ready_channels = 0;
@@ -3578,7 +3685,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 
 		// At this point we are sure that there is something that can be returned
 		int free_fd; // mytcp: j
-		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for free fd
+		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for myfree fd
 		if(free_fd == MAX_FD){
 			myerrno=ENFILE; 
 			enable_signal_reception(false);
@@ -3592,7 +3699,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 			if(cursor_index == fdinfo[s].backlog_length){
 				ERROR("myaccept ready_channels > 0 but no TCB found in the backlog");
 			}
-			struct tcpctrlblk* tcb = (struct tcpctrlblk*) malloc(sizeof(struct tcpctrlblk));
+			struct tcpctrlblk* tcb = (struct tcpctrlblk*) mymalloc(sizeof(struct tcpctrlblk));
 			memcpy(tcb, fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 			bzero(fdinfo[s].channel_backlog + cursor_index, sizeof(struct tcpctrlblk));
 
@@ -3751,8 +3858,8 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				tcb->stream_rx_queue_tail[sid] = NULL;
 			}
 			// tcb->adwin[sid] does not account for dmp segments
-			free(dmp_node->segment);
-			free(dmp_node);
+			myfree(dmp_node->segment);
+			myfree(dmp_node);
 			continue;
 		}
 		switch(myread_mode){
@@ -3796,8 +3903,8 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				if(tcb->stream_rx_queue[sid] == NULL){
 					tcb->stream_rx_queue_tail[sid] = NULL;
 				}
-				free(dmp_node->segment);
-				free(dmp_node);
+				myfree(dmp_node->segment);
+				myfree(dmp_node);
 
 				tcb->lss_consumed[sid] = true;
 
@@ -3818,9 +3925,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				tcb->stream_rx_queue_tail[sid] = NULL;
 			}
 			// tcb->adwin[sid] does not account for dmp segments
-			// free dmp_node and its segment
-			free(dmp_node->segment);
-			free(dmp_node);
+			// myfree dmp_node and its segment
+			myfree(dmp_node->segment);
+			myfree(dmp_node);
 
 			continue;
 		}
@@ -3843,9 +3950,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				tcb->stream_rx_queue_tail[sid] = NULL;
 			}
 
-			// free dmp_node and its segment
-			free(dmp_node->segment);
-			free(dmp_node);
+			// myfree dmp_node and its segment
+			myfree(dmp_node->segment);
+			myfree(dmp_node);
 		}
 	}
 	if(adwin_increased){
@@ -3854,7 +3961,7 @@ int myread(int s, unsigned char *buffer, int maxlen){
 		}else{
 			if(is_dmp_ack_needed(tcb, sid)){
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = malloc(optlen);
+				uint8_t* opt = mymalloc(optlen);
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -3862,11 +3969,11 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				opt[3] = (tcb->next_ssn[sid])&0xFF;
 				update_next_ssn(&(tcb->next_ssn[sid]));
 
-				uint8_t* dummy_payload = malloc(1); // value doesn't matter
+				uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
 
 				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-				free(dummy_payload);
-				free(opt);
+				myfree(dummy_payload);
+				myfree(opt);
 			}
 		}
 	}else{
@@ -3913,16 +4020,16 @@ void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 				ERROR("non-DMP remaining segment during stream_close_handler flush");
 			}
 			if(tmp->segment != NULL){
-				free(tmp->segment);
+				myfree(tmp->segment);
 			}
-			free(tmp);
+			myfree(tmp);
 		}
 
 		tcb->stream_state[sid] = STREAM_STATE_UNUSED;
 		tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 		tcb->radwin[sid] = tcb->init_radwin; 
 		if(tcb->stream_tx_buffer[sid] != NULL){
-			free(tcb->stream_tx_buffer[sid]);
+			myfree(tcb->stream_tx_buffer[sid]);
 			tcb->stream_tx_buffer[sid] = NULL;
 		}
 		tcb->txfree[sid] = TX_BUFFER_SIZE;
@@ -4014,7 +4121,7 @@ void add_ack_request_to_queue(struct ack_generation_queue* queue_ptr, int fd, in
     }
 
     // No existing node found: allocate and initialize a new one
-    struct ack_generation_queue_node* new_node = malloc(sizeof(struct ack_generation_queue_node));
+    struct ack_generation_queue_node* new_node = mymalloc(sizeof(struct ack_generation_queue_node));
     new_node->fd             = fd;
     new_node->backlog_index  = backlog_index;
     new_node->requested_acks = 1;
@@ -4231,8 +4338,8 @@ void myio(int ignored){
 							}
 						}
 
-						free(temp->segment);
-						free(temp);
+						myfree(temp->segment);
+						myfree(temp);
 						if(tcb->txfirst	== NULL){
 							tcb->txlast = NULL;
 						}
@@ -4320,8 +4427,8 @@ void myio(int ignored){
 										if(tcb->txfirst == NULL){
 											tcb->txlast = NULL; // The list is now empty
 										}
-										free(cursor->segment);
-										free(cursor);
+										myfree(cursor->segment);
+										myfree(cursor);
 										cursor = tcb->txfirst;
 										if(tcb->txfirst == NULL){
 											break;
@@ -4331,8 +4438,8 @@ void myio(int ignored){
 										if(tcb->txlast == cursor){
 											tcb->txlast = prev;
 										}
-										free(cursor->segment);
-										free(cursor);
+										myfree(cursor->segment);
+										myfree(cursor);
 										cursor = prev->next;
 									}
 								}else{
@@ -4547,7 +4654,7 @@ void myio(int ignored){
 								// We are deleting the last element in the unack queue: clear unack_tail accordingly
 								tcb->unack_tail = NULL;
 							}
-							free(tcb->unack);
+							myfree(tcb->unack);
 							tcb->unack = next;
 						}
 					}
@@ -4570,7 +4677,7 @@ void myio(int ignored){
 								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
 								int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-								uint8_t* opt = malloc(optlen);
+								uint8_t* opt = mymalloc(optlen);
 								memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 								
 								// Stream update
@@ -4578,11 +4685,11 @@ void myio(int ignored){
 								opt[3] = (tcb->next_ssn[sid])&0xFF;
 								update_next_ssn(&(tcb->next_ssn[sid]));
 
-								uint8_t* dummy_payload = malloc(1); // value doesn't matter
+								uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
 
 								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
-								free(dummy_payload);
-								free(opt);
+								myfree(dummy_payload);
+								myfree(opt);
 							}
 						}
 						else{
@@ -4643,7 +4750,7 @@ void myio(int ignored){
 
 
 		requested_acks_queue.head = requested_acks_queue.head->next;
-		free(request_node);
+		myfree(request_node);
 	}
 
 	assert_handler_lock_acquired("myio end");
@@ -4737,7 +4844,7 @@ void mytimer(int ignored){
 				if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment->flags == ACK){
 					// If this is only an ACK without payload it does not need to be RETXed
 					// we remove txcb from the TX queue
-					free(txcb->segment);
+					myfree(txcb->segment);
 					if(prev != NULL){
 						prev->next = txcb->next;
 					}else{
@@ -4746,7 +4853,7 @@ void mytimer(int ignored){
 					if(tcb->txlast == txcb){
 						tcb->txlast = prev;
 					}
-					free(txcb);
+					myfree(txcb);
 					txcb = prev != NULL? prev->next : tcb->txfirst;
 					continue;
 				}
@@ -4805,24 +4912,21 @@ void mytimer(int ignored){
 
 
 // To be used in user code
-void* safe_malloc(size_t sz){
+void* safe_mymalloc(size_t sz){
 	disable_signal_reception(false);
-	void* ret = malloc(sz);
-	if(ret == NULL){
-		perror("malloc");
-		ERROR("safe_malloc %u failed", sz);
+	void* ret = mymalloc(sz);
+	if(ret == NULL && sz != 0){
+		myperror("mymalloc");
+		ERROR("safe_mymalloc %u failed", sz);
 	}
 	enable_signal_reception(false);
 	return ret;
 }
 
 // To be used in user code
-void safe_free(void* ptr){
+void safe_myfree(void* ptr){
 	disable_signal_reception(false);
-	if(ptr == NULL){
-		ERROR("safe_free NULL param");
-	}
-	free(ptr);
+	myfree(ptr);
 	enable_signal_reception(false);
 }
 
@@ -4847,7 +4951,7 @@ void parse_html(char* html, int length){
 		start_ptr = found + strlen(img_tag_seq);
 	}
 
-	img_list = safe_malloc(num_images * sizeof(char*));
+	img_list = safe_mymalloc(num_images * sizeof(char*));
 
 	start_ptr = html;
 	int cur_img = 0;
@@ -4869,7 +4973,7 @@ void parse_html(char* html, int length){
 
 		int img_name_len = img_name_end - img_name_start;
 
-		img_list[cur_img] = safe_malloc(img_name_len + 1);
+		img_list[cur_img] = safe_mymalloc(img_name_len + 1);
 		memcpy(img_list[cur_img], img_name_start, img_name_len);
 		img_list[cur_img][img_name_len] = 0;
 
@@ -4905,7 +5009,7 @@ void main_client_app(){
 		myperror("myconnect");
 		exit(EXIT_FAILURE);
 	}
-	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
+	char* data = safe_mymalloc(RESP_BUF_SIZE); // both req and resp
 	sprintf(data, "GET /index.html HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
@@ -4958,7 +5062,7 @@ void main_client_app(){
 		}
 	}
 	parse_html(data, content_length);
-	safe_free(data);
+	safe_myfree(data);
 
 
 
@@ -4985,7 +5089,7 @@ void main_client_app(){
 	client_connected[0] = true;
 	client_active[0] = true;
 	cl_st[0] = CLIENT_ST_IDLE;
-	client_buffer[0] = safe_malloc(RESP_BUF_SIZE);
+	client_buffer[0] = safe_mymalloc(RESP_BUF_SIZE);
 	
 	for(int i=1; i<NUM_CLIENTS; i++){
 		s = mysocket(AF_INET,SOCK_STREAM,0);
@@ -5018,7 +5122,7 @@ void main_client_app(){
 				client_connected[i] = true;
 				client_active[i] = true;
 				cl_st[i] = CLIENT_ST_IDLE;
-				client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+				client_buffer[i] = safe_mymalloc(RESP_BUF_SIZE);
 				continue;
 			}
 			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
@@ -5034,7 +5138,7 @@ void main_client_app(){
 			client_connected[i] = true;
 			client_active[i] = true;
 			cl_st[i] = CLIENT_ST_IDLE;
-			client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+			client_buffer[i] = safe_mymalloc(RESP_BUF_SIZE);
 		}
 
 		uint32_t rand_i_base = sample_uint32() % NUM_CLIENTS;
@@ -5153,7 +5257,7 @@ void main_client_app(){
 				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 					myclose(client_sockets[i]);
 					client_active[i] = false;
-					safe_free(client_buffer[i]);
+					safe_myfree(client_buffer[i]);
 					DEBUG("close %d", i);
 				}
 			}
@@ -5204,7 +5308,7 @@ void main_client_app(){
 		myperror("myconnect");
 		exit(EXIT_FAILURE);
 	}
-	char* data = safe_malloc(RESP_BUF_SIZE); // both req and resp
+	char* data = safe_mymalloc(RESP_BUF_SIZE); // both req and resp
 	sprintf(data, "GET /%d HTTP/1.1\r\nX-Client-ID: %d\r\nX-Req-Num: %d\r\n\r\n", MIN(RESP_PAYLOAD_BYTES,1000), 0, -1);
 	int sent = 0, missing = strlen(data);
 	while(missing > 0){
@@ -5258,7 +5362,7 @@ void main_client_app(){
 		}
 		//nanosleep(&short_sleep, NULL); 
 	}
-	safe_free(data);
+	safe_myfree(data);
 
 
 	int test_num_bytes = payload_size_arr[sample_uint32() % (sizeof(payload_size_arr)/sizeof(payload_size_arr[0]))];
@@ -5317,7 +5421,7 @@ void main_client_app(){
 	client_connected[0] = true;
 	client_active[0] = true;
 	cl_st[0] = CLIENT_ST_IDLE;
-	client_buffer[0] = safe_malloc(RESP_BUF_SIZE);
+	client_buffer[0] = safe_mymalloc(RESP_BUF_SIZE);
 	
 	for(int i=1; i<num_clients_test; i++){
 		s = mysocket(AF_INET,SOCK_STREAM,0);
@@ -5350,7 +5454,7 @@ void main_client_app(){
 				client_connected[i] = true;
 				client_active[i] = true;
 				cl_st[i] = CLIENT_ST_IDLE;
-				client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+				client_buffer[i] = safe_mymalloc(RESP_BUF_SIZE);
 				continue;
 			}
 			ret = myconnect(client_sockets[i],(struct sockaddr * )&addr,sizeof(struct sockaddr_in));
@@ -5365,7 +5469,7 @@ void main_client_app(){
 			client_connected[i] = true;
 			client_active[i] = true;
 			cl_st[i] = CLIENT_ST_IDLE;
-			client_buffer[i] = safe_malloc(RESP_BUF_SIZE);
+			client_buffer[i] = safe_mymalloc(RESP_BUF_SIZE);
 		}
 
 		uint32_t rand_i_base = sample_uint32() % num_clients_test;
@@ -5490,7 +5594,7 @@ void main_client_app(){
 				if(client_active[i] && cl_st[i] == CLIENT_ST_IDLE){
 					myclose(client_sockets[i]);
 					client_active[i] = false;
-					safe_free(client_buffer[i]);
+					safe_myfree(client_buffer[i]);
 				}
 			}
 		}
@@ -5839,13 +5943,13 @@ void full_duplex_server_app(int listening_socket){
 		int new_client_socket = myaccept(listening_socket, (struct sockaddr*) &remote_addr, &len);
 		if(new_client_socket >= 0){
 			//DEBUG("myaccept client %d", num_clients);
-			struct single_srv_data* new_arr = safe_malloc(sizeof(struct single_srv_data)*(num_clients+1));
+			struct single_srv_data* new_arr = safe_mymalloc(sizeof(struct single_srv_data)*(num_clients+1));
 			if((num_clients == 0) != (clients == NULL)){
 				ERROR("full_duplex_server_app invalid state num_clients client_sockets");
 			}
 			if(clients != NULL){
 				memcpy(new_arr, clients, sizeof(struct single_srv_data)*num_clients);
-				safe_free(clients);
+				safe_myfree(clients);
 			}
 			clients = new_arr;
 			memset(&clients[num_clients], 0, sizeof(clients[num_clients]));
@@ -5999,7 +6103,7 @@ void full_duplex_server_app(int listening_socket){
 				if(num_clients == 0){
 					clients = NULL;
 				}else{
-					clients = realloc(clients, sizeof(struct single_srv_data)*num_clients);
+					clients = myrealloc(clients, sizeof(struct single_srv_data)*num_clients);
 				}
 			}else{
 				cur++;
