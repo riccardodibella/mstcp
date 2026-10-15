@@ -597,7 +597,7 @@ void DEBUG(char* c, ...){
 }
 
 #define MYMALLOC_AVAILABLE_MB 64
-#define MYMALLOC_CHUNK_SIZE 16
+#define MYMALLOC_CHUNK_SIZE 128
 
 
 #define MYMALLOC_AVAILABLE_BYTES (MYMALLOC_AVAILABLE_MB*1024*1024) 
@@ -606,6 +606,7 @@ void DEBUG(char* c, ...){
 uint32_t mymalloc_region_extensions[MYMALLOC_NUM_CHUNKS] = {0};
 alignas(MYMALLOC_CHUNK_SIZE) uint8_t mymalloc_buffer[MYMALLOC_AVAILABLE_BYTES];
 
+uint32_t next_chunk_hint = 0;
 void* mymalloc(size_t size){
 	// return malloc(size);
 
@@ -617,12 +618,19 @@ void* mymalloc(size_t size){
 	}
 
 	uint32_t requested_chunks = size / MYMALLOC_CHUNK_SIZE + (size % MYMALLOC_CHUNK_SIZE != 0);
-	int current_first_free = 0;
+	int current_first_free = next_chunk_hint;
+	bool started_from_beginning = (next_chunk_hint == 0);
 	while(true){
 		if(current_first_free >= MYMALLOC_NUM_CHUNKS){
-			ERROR("mymalloc out of memory (requested size %lu chunks %u)", size, requested_chunks);
-			myerrno=ENOMEM;
-			return NULL;
+			if(!started_from_beginning){
+				current_first_free = 0;
+				started_from_beginning = true;
+				continue;
+			}else{
+				ERROR("mymalloc out of memory (requested size %lu chunks %u)", size, requested_chunks);
+				myerrno=ENOMEM;
+				return NULL;
+			}
 		}
 		if(mymalloc_region_extensions[current_first_free] != 0){
 			current_first_free+=mymalloc_region_extensions[current_first_free];
@@ -636,7 +644,7 @@ void* mymalloc(size_t size){
 				break;
 			}
 			if(mymalloc_region_extensions[current_first_free+i] != 0){
-				current_first_free += i;
+				current_first_free += i + mymalloc_region_extensions[current_first_free+i];
 				all_free=false;
 				break;
 			}
@@ -647,6 +655,7 @@ void* mymalloc(size_t size){
 		}
 
 		// Found free region at current_first_free
+		next_chunk_hint = current_first_free + requested_chunks;
 		mymalloc_region_extensions[current_first_free] = requested_chunks;
 		return (void*) &(mymalloc_buffer[current_first_free*MYMALLOC_CHUNK_SIZE]);
 	}
