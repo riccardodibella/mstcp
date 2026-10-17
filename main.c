@@ -1605,7 +1605,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 	if(proto == TCP_PROTO){
 		if(drop_packet((struct tcp_segment*)payload)){
 			DEBUG("Packet dropped! <======================");
-			print_ip(payload);
+			// print_ip(payload);
 			LOG_TCP_SEGMENT("DROP", payload, payloadlen);
 			return;
 		}
@@ -1659,7 +1659,7 @@ void send_ip(unsigned char * payload, unsigned char * targetip, int payloadlen, 
 
 
 // see update_tcp_header for backlog_entry_index
-int prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
+void prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* payload, int payloadlen, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("prepare_tcp");
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 
@@ -2120,15 +2120,18 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 	bool there_is_hole = false;
 	struct txcontrolbuf* iter = tcb->txfirst;
 	while(iter != NULL && iter->next != NULL){
-		if(iter->seq+iter->payloadlen != iter->next->seq){
+		if(iter->segment == NULL && iter->next->segment != NULL){
 			there_is_hole = true;
 			break;
 		}
 		iter = iter->next;
 	}
+	/*
+	// No longer needed since SACK drops only segment part and not whole txcontrolbuf entry; this condition would be caught in the previous loop
 	if(!there_is_hole && tcb->txlast != NULL && tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
 		there_is_hole = true;
 	}
+	*/
 	if(!there_is_hole){
 		return;
 	}
@@ -2136,6 +2139,7 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 	if(tcb->txfirst == NULL || tcb->txlast == NULL){
 		ERROR("fast_retransmit_holes txfirst / txlast NULL");
 	}
+	/*
 	struct txcontrolbuf* unacked_region_start = tcb->txfirst;
 	if(tcb->txlast->seq + tcb->txlast->payloadlen != tcb->seq_offs+tcb->sequence){
 		// Tail hole: everything that is currently in the TX queue needs to be retransmitted
@@ -2157,15 +2161,33 @@ void fast_retransmit_holes(struct tcpctrlblk* tcb){
 				region_end = region_end->next;
 			}
 
-			/* This "!" is intentional: we exit from the loop only when there is no next hole, so we retransmit what is in all holes, not only in the first one */
+			// This "!" is intentional: we exit from the loop only when there is no next hole, so we retransmit what is in all holes, not only in the first one
 			if(!found_next_hole){
 				break; // Exit from the infinite loop
 			}
 		}
 		// unacked_region_start now has the correct value
 	}
+	*/
+	struct txcontrolbuf* unacked_region_start = NULL;
+	bool last_was_SACK = true;
+	struct txcontrolbuf* cursor = tcb->txfirst;
+	while(cursor != NULL){
+		if(cursor->segment == NULL){
+			unacked_region_start = NULL;
+			last_was_SACK = true;
+		}else{
+			if(last_was_SACK){
+				unacked_region_start = cursor;
+			}
+			last_was_SACK = false;
+		}
+		cursor = cursor->next;
+	}
 	for(struct txcontrolbuf* cursor = tcb->txfirst; cursor != unacked_region_start; cursor = cursor->next){
-		cursor->txtime = 0;
+		if(cursor->segment != NULL){
+			cursor->txtime = 0;
+		}
 	}
 }
 
@@ -2264,6 +2286,8 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 
 			case CONGCTRL_ST_FAST_RECOV:
 				if(!is_repeated_ack){
+					DEBUG("ACK: FAST -> AVOID");
+					LOG_MESSAGE("ACK: FAST -> AVOID");
 					tcb->cgwin = tcb->ssthreshold;
 					tcb->lta = 0;
 					tcb->cong_st = CONGCTRL_ST_CONG_AVOID;
@@ -2288,7 +2312,7 @@ void congctrl_fsm(struct tcpctrlblk * tcb, int event, struct tcp_segment * tcp, 
 
 		struct txcontrolbuf* cursor = tcb->txfirst->next;
 		while(cursor != NULL){
-			if(cursor->txtime >= 0){
+			if(cursor->txtime >= 0 && cursor->segment != NULL){
 				cursor->txtime = -MAX_TIMEOUT;
 				cursor->retry = 0;
 			}
@@ -2415,6 +2439,8 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 /*
+	--- This comment was written before changing SACK segment drop behaviour, so it may be outdated. ---
+
 	Returns true if there is a "hole" in the TX queue for the stream, false otherwise.
 	
 	For each stream we traverse the channel tx queue, that contains the segments that need to be transmitted
@@ -2456,11 +2482,14 @@ bool does_stream_have_hole(int s, int sid){
 			}else{
 				if(iter->ssn != next_ssn){
 					// We have found a hole!
-					// Some segment in the middle was acked, but this one wasn't so this is a hole
+					// Some segment in the middle was SACKed, but this one wasn't so this is a hole
 					return true;
 				}
 			}
-			update_next_ssn(&next_ssn);
+			if(iter->segment != NULL){
+				// We update only if not SACKed
+				update_next_ssn(&next_ssn);
+			}
 		}
 		iter = iter->next;
 	}
@@ -2562,8 +2591,10 @@ void stream_holes_scheduler(int s){
 		struct txcontrolbuf* tx_cursor = tcb->txfirst;
 		while(tx_cursor != NULL){
 			if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-				if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
-					small_in_flight = true;
+				if(tx_cursor->segment != NULL){ // We ignore SACKed segments for Nagle on a stream
+					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
+						small_in_flight = true;
+					}
 				}
 			}
 			tx_cursor = tx_cursor->next;
@@ -4306,9 +4337,9 @@ void myio(int ignored){
 				}
 
 				// TODO ho tolto il controllo per il FIN, va rimesso se si sistema la chiusura delle connessioni
-				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= htonl(tcb->txlast->segment->seq) + ((uint32_t)tcb->txlast->payloadlen) - shifter)){
+				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= tcb->txlast->seq + ((uint32_t)tcb->txlast->payloadlen) - shifter)){ 
 					bool send_window_advanced = false;
-					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (htonl(tcb->txfirst->segment->seq)-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen						
+					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (tcb->txfirst->seq-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen				
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
 						
@@ -4331,22 +4362,25 @@ void myio(int ignored){
 							}
 						}
 
-						int sid = -1;
-						bool lss = false;
-						int ms_index = search_tcp_option(temp->segment, OPT_KIND_MS_TCP);
-						if(ms_index>=0){
-							sid = (temp->segment->payload[ms_index+2]>>2) & 0x1F;
-							lss = temp->segment->payload[ms_index+2]>>7;
-						}
-						if(sid >= 0){
-							// MS option is present
-							if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
-								tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
-								stream_close_handler(tcb, sid);
+						if(temp->segment != NULL){
+							int sid = -1;
+							bool lss = false;
+							int ms_index = search_tcp_option(temp->segment, OPT_KIND_MS_TCP);
+							if(ms_index>=0){
+								sid = (temp->segment->payload[ms_index+2]>>2) & 0x1F;
+								lss = temp->segment->payload[ms_index+2]>>7;
 							}
-						}
+							if(sid >= 0){
+								// MS option is present
+								if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
+									tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
+									stream_close_handler(tcb, sid);
+								}
+							}
 
-						myfree(temp->segment);
+							myfree(temp->segment);
+							temp->segment = NULL;
+						}
 						myfree(temp);
 						if(tcb->txfirst	== NULL){
 							tcb->txlast = NULL;
@@ -4392,60 +4426,41 @@ void myio(int ignored){
 
 							//DEBUG("%u - %u (src %u - %u)", left_shifted_seq, right_shifted_seq, block_left_edge_seq,block_right_edge_seq);
 
-							struct txcontrolbuf *cursor = tcb->txfirst, *prev = NULL;
+							struct txcontrolbuf *cursor = tcb->txfirst;
 							while(cursor != NULL){
-								uint32_t cursor_shifted_seq = cursor->seq - shifter;
-								uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
+								if(cursor->segment != NULL){
+									uint32_t cursor_shifted_seq = cursor->seq - shifter;
+									uint32_t cursor_shifted_end = cursor_shifted_seq + cursor->payloadlen;
 
-								if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
-									//DEBUG("Something removed");
-									// Remove the node from the tx queue
+									if(left_shifted_seq <= cursor_shifted_seq && cursor_shifted_end <= right_shifted_seq){
+										//DEBUG("Something removed");
+										// Remove the node from the tx queue
 
-									if(!cursor->dummy_payload && cursor->payloadlen > 0){
-										// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
-										fdinfo[i].tcb->flightsize-=cursor->payloadlen;
-									}
-
-									int sid = -1;
-									bool lss = false;
-									int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
-									if(ms_index>=0){
-										sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
-										lss = cursor->segment->payload[ms_index+2]>>7;
-									}
-									if(sid >= 0){
-										// MS option is present in cursor segment
-										if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
-											tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
-											stream_close_handler(tcb, sid);
+										if(!cursor->dummy_payload && cursor->payloadlen > 0){
+											fdinfo[i].tcb->flightsize-=cursor->payloadlen;
 										}
-									}
 
-
-									if(prev == NULL){
-										tcb->txfirst = cursor->next;
-										if(tcb->txfirst == NULL){
-											tcb->txlast = NULL; // The list is now empty
+										int sid = -1;
+										bool lss = false;
+										int ms_index = search_tcp_option(cursor->segment, OPT_KIND_MS_TCP);
+										if(ms_index>=0){
+											sid = (cursor->segment->payload[ms_index+2]>>2) & 0x1F;
+											lss = cursor->segment->payload[ms_index+2]>>7;
 										}
+										if(sid >= 0){
+											// MS option is present in cursor segment
+											if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
+												tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
+												stream_close_handler(tcb, sid);
+											}
+										}
+
 										myfree(cursor->segment);
-										myfree(cursor);
-										cursor = tcb->txfirst;
-										if(tcb->txfirst == NULL){
-											break;
-										}
-									}else{
-										prev->next = cursor->next;
-										if(tcb->txlast == cursor){
-											tcb->txlast = prev;
-										}
-										myfree(cursor->segment);
-										myfree(cursor);
-										cursor = prev->next;
+										cursor->segment = NULL;
 									}
-								}else{
-									prev = cursor;
-									cursor = cursor->next;
 								}
+								
+								cursor = cursor->next;
 							}
 						}
 					}
@@ -4853,13 +4868,15 @@ void mytimer(int ignored){
 					if(!txcb->dummy_payload){
 						tcb->flightsize += txcb->payloadlen;
 					}
-				} else if(txcb->txtime > 0 && txcb->txtime+tcb->timeout > tick){
+				} else if(txcb->txtime > 0 && txcb->txtime+tcb->timeout > tick && txcb->segment != NULL){
+					// txcb->segment != NULL ensures that we consider only non-SACKed segments for congestion control
+					
 					acc += txcb->payloadlen;
 					prev = txcb;
 					txcb = txcb->next;
 					continue;
 				}
-				if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment->flags == ACK){
+				if(txcb->retry > 0 && txcb->payloadlen == 0 && txcb->segment != NULL && txcb->segment->flags == ACK){
 					// If this is only an ACK without payload it does not need to be RETXed
 					// we remove txcb from the TX queue
 					myfree(txcb->segment);
@@ -4873,6 +4890,12 @@ void mytimer(int ignored){
 					}
 					myfree(txcb);
 					txcb = prev != NULL? prev->next : tcb->txfirst;
+					continue;
+				}
+				if(txcb->segment == NULL){
+					// we don't update acc for SACKed segments
+					prev = txcb;
+					txcb = txcb->next;
 					continue;
 				}
 				bool is_fast_transmit = (txcb->txtime == 0); // Fast retransmit (when dupACKs are received) is done by setting txtime=0
