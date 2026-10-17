@@ -393,7 +393,7 @@ struct stream_rx_queue_node{
 struct tcpctrlblk{
 	int stream_state[TOT_SID];
 	uint32_t adwin[TOT_SID];
-	uint32_t radwin[TOT_SID];
+	uint32_t scheduler_tokens[TOT_SID]; // mytcp: radwin
 	unsigned char* stream_tx_buffer[TOT_SID]; // not present in mytcp
 	//unsigned char* stream_rx_buffer[TOT_SID]; // mytcp: rxbuffer
 	//unsigned int rx_win_start[TOT_SID]; // Index at which we can read the next byte in the RX buffer
@@ -2474,7 +2474,7 @@ bool does_stream_have_hole(int s, int sid){
 	return false;
 }
 
-void stream_holes_scheduler(int s){// TODOFC
+void stream_holes_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
 		ERROR("unfair_congestion_scheduler invalid fd %d", s);
 	}
@@ -2555,8 +2555,9 @@ void stream_holes_scheduler(int s){// TODOFC
 			continue;
 		}
 
-		// Flow control removed; kept only nagle check
+		int flow_control_allowed_bytes = tcb->scheduler_tokens[sid];
 
+		// Nagle check
 		bool small_in_flight = false;
 		struct txcontrolbuf* tx_cursor = tcb->txfirst;
 		while(tx_cursor != NULL){
@@ -2567,8 +2568,10 @@ void stream_holes_scheduler(int s){// TODOFC
 			}
 			tx_cursor = tx_cursor->next;
 		}
-		int current_transfer_bytes = available_bytes;
-		LOG_SCHEDULER_BYTES(sid, available_bytes, RX_VIRTUAL_BUFFER_SIZE, cong_control_allowed_bytes);
+
+		LOG_SCHEDULER_BYTES(sid, available_bytes, flow_control_allowed_bytes, cong_control_allowed_bytes);
+		int current_transfer_bytes = MIN(available_bytes, MIN(cong_control_allowed_bytes, flow_control_allowed_bytes));
+		
 
 		while(current_transfer_bytes > 0){
 			int payload_length = MIN(current_transfer_bytes, max_payload_length);
@@ -2586,6 +2589,7 @@ void stream_holes_scheduler(int s){// TODOFC
 			tcb->tx_buffer_occupied_region_start[sid] = (tcb->tx_buffer_occupied_region_start[sid] + payload_length) % TX_BUFFER_SIZE;
 			tcb->txfree[sid] += payload_length;
 			current_transfer_bytes -= payload_length;
+			tcb->scheduler_tokens[sid] -= payload_length;
 
 			if(!tcb->ms_option_enabled){
 				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
@@ -2864,7 +2868,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				*/
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
@@ -2961,7 +2965,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].l_addr = fdinfo[other_s].l_addr;
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
 							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
-							fdinfo[s].tcb->radwin[stream] = fdinfo[s].tcb->init_radwin;
+							fdinfo[s].tcb->scheduler_tokens[stream] = fdinfo[s].tcb->init_radwin;
 							fdinfo[s].tcb->txfree[stream] = TX_BUFFER_SIZE;
 							fdinfo[s].tcb->tx_buffer_occupied_region_start[stream] = fdinfo[s].tcb->tx_buffer_occupied_region_end[stream] = 0;
 							if(fdinfo[s].tcb->stream_tx_buffer[stream] != NULL){
@@ -3060,7 +3064,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-				tcb->radwin[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 				tcb->next_ssn[i] = 0;
@@ -3209,7 +3213,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					fdinfo[s].sid = 0; // The first opened stream is always stream 0
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
-					tcb->init_radwin = tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+					tcb->init_radwin = tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 					tcb->txfree[0] = TX_BUFFER_SIZE;
 					tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 					if(tcb->stream_tx_buffer[0] != NULL){
@@ -3280,7 +3284,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						tcb->stream_tx_buffer[0] = mymalloc(TX_BUFFER_SIZE);
 						tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = NULL;
 						//tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
-						tcb->radwin[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+						tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 						tcb->txfree[0] = TX_BUFFER_SIZE;
 						tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 						tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
@@ -3292,7 +3296,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_tx_buffer[i] = NULL;
 							tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 							tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
-							tcb->radwin[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
+							tcb->scheduler_tokens[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
 							tcb->txfree[i] = 0;
 							tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 							tcb->next_ssn[i] = 0;
@@ -3512,7 +3516,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						if(!lss && tcb->stream_state[sid] == STREAM_STATE_UNUSED){ // LSS segments are leftovers from the previous use of the same stream
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
-							tcb->radwin[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+							tcb->scheduler_tokens[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -4036,7 +4040,7 @@ void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 
 		tcb->stream_state[sid] = STREAM_STATE_UNUSED;
 		tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-		tcb->radwin[sid] = tcb->init_radwin; 
+		tcb->scheduler_tokens[sid] = tcb->init_radwin; 
 		if(tcb->stream_tx_buffer[sid] != NULL){
 			myfree(tcb->stream_tx_buffer[sid]);
 			tcb->stream_tx_buffer[sid] = NULL;
@@ -4325,11 +4329,6 @@ void myio(int ignored){
 							if(!tcb->ms_option_enabled){
 								sid = 0;
 							}
-
-							if(tcb->radwin[sid] < temp->payloadlen){ // TODOFC
-								//ERROR("tcb->radwin[%d] would become < 0", sid);
-							}
-							//tcb->radwin[sid] -= temp->payloadlen; // TODOFC
 						}
 
 						int sid = -1;
@@ -4405,14 +4404,6 @@ void myio(int ignored){
 									if(!cursor->dummy_payload && cursor->payloadlen > 0){
 										// Sono abbastanza sicuro della modifica della flightsize, ma non di quella della radwin
 										fdinfo[i].tcb->flightsize-=cursor->payloadlen;
-
-										// TODOFC
-										/*
-										if(tcb->radwin[cursor->sid] < cursor->payloadlen){
-											ERROR("tcb->radwin[%d] would become < 0 (SACK)", cursor->sid);
-										}
-										tcb->radwin[cursor->sid] -= cursor->payloadlen;
-										*/
 									}
 
 									int sid = -1;
@@ -4494,10 +4485,32 @@ void myio(int ignored){
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
-					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor); // TODOFC
-					if(new_radwin >= tcb->radwin[sid]){
-						//tcb->radwin[sid] = new_radwin;
-						// TODOFC
+					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+					int64_t calculated_scheduler_tokens = new_radwin; // signed to handle negative values in weird edge cases
+					// We traverse the TX queue to look for all segments of that stream. 
+					// If we found some segments (that will be after this cumulative ack) for the same stream without DMP, we decrease the number
+					// of tokens to allocate. If we don't find any, we use new_radwin as the new token count directly
+					struct txcontrolbuf* tx_queue_cursor = tcb->txfirst;
+					while(tx_queue_cursor != NULL){
+						if(tx_queue_cursor->sid == sid && !tx_queue_cursor->dummy_payload){
+							calculated_scheduler_tokens -= tx_queue_cursor->payloadlen;
+						}
+						tx_queue_cursor = tx_queue_cursor->next;
+					}
+
+					if(calculated_scheduler_tokens > tcb->scheduler_tokens[sid]){
+						/*
+						We update the token count only if it increases, ensuring that it does not decrease.
+						This is because, otherwise, this condition could happen, leading to a final value 
+						of scheduler_tokens lower than it should be.
+						- A sends a DMP segment with ACK X, SEQ Y, and Window 100
+						- A consumes something more
+						- A sends a DMP segment with ACK X, SEQ Y+1, Window 200
+						- Over the wire, the packet with SEQ Y gets delayed, and arrives after Y+1
+						- When Y+1 arrives, scheduler_tokens gets set to 200
+						- If we don't do this check, when Y arrives scheduler_tokens is set to 100
+						*/
+						tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
 					}
 
 					struct channel_rx_queue_node* newrx = NULL;
@@ -4515,10 +4528,6 @@ void myio(int ignored){
 							// We traversed the whole queue without finding any segment with a higher channel offset: insert the new one at the end of the queue
 							newrx = create_channel_rx_queue_node(channel_offset, ip, tcp, prev, NULL);
 							tcb->unack_tail = prev->next = newrx;
-
-							// If we insert a segment at the end of its stream RX queue, we use it to update radwin
-
-							//tcb->radwin[sid] = new_radwin;// TODOFC
 						}else{
 							// Now cursor is either NULL or has a channel_offset <= to that of the RXed segment
 							if(cursor->channel_offset != channel_offset){
