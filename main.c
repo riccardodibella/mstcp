@@ -215,9 +215,9 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define FSM_EVENT_APP_ACTIVE_OPEN 1
 #define FSM_EVENT_APP_PASSIVE_OPEN 2
 #define FSM_EVENT_PKT_RCV 3
-#define FSM_EVENT_APP_CLOSE 4
-#define FSM_EVENT_TIMEOUT 5 // Channel timeout (connection closing)
-#define FSM_EVENT_STREAM_TIMEOUT 6 // Stream timeout (no data has been sent upon stream opening, so a dummy byte is sent on that stream to open it)
+#define FSM_EVENT_TIMEOUT 4 // Channel timeout (connection closing)
+#define FSM_EVENT_STREAM_TIMEOUT 5 // Stream timeout (no data has been sent upon stream opening, so a dummy byte is sent on that stream to open it)
+#define FSM_EVENT_DO_CHANNEL_CLOSE 6
 
 #define TCB_ST_CLOSED 10 // initial state
 #define TCB_ST_LISTEN 11  // represents waiting for a connection request from any remote TCP and port.
@@ -226,7 +226,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define TCB_ST_ESTABLISHED 14 // represents an open connection, data received can be delivered to the user.  The normal state for the data transfer phase of the connection.
 #define TCB_ST_FIN_WAIT_1 15 // waiting for a connection termination request from the remote TCP, or an acknowledgment of the conne
 #define TCB_ST_FIN_WAIT_2 16 // waiting for a connection termination request from the remote TCP.
-#define TCB_ST_CLOSE_WAIT 17 // waiting for a connection termination request from the local user.
+#define TCB_ST_CLOSE_WAIT 17 // waiting for a connection termination request from the local user. // unreachable with MS-TCP
 #define TCB_ST_CLOSING 18  // waiting for a connection termination request acknowledgment from the remote TCP.
 #define TCB_ST_LAST_ACK 19 // waiting for an acknowledgment of the connection termination request previously sent to the remote TCP
 #define TCB_ST_TIME_WAIT 20 // waiting for enough time to pass to be sure the remote TCP received the acknowledgment of its connecti
@@ -238,7 +238,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 
 // The following is not true! State CLOSED is never used, instead it returns to UNUSED when these conditions are true
 // Transitions to state CLOSED must be managed in 2 points: when write_side_close_state becomes LSS_ACKED, and where the flag lss_received is set, during myio
-#define STREAM_STATE_CLOSED 3
+// #define STREAM_STATE_CLOSED 3 // commented out because this state is never reached
 // Transition back to state UNUSED may be done after a timeout, but this is TBD; After coming back to state unused, an endpoint must still discard segments with LSS flag set, because they are window updates of the old stream
 
 
@@ -353,6 +353,7 @@ struct txcontrolbuf{
 struct txcontrolbuf{ // mytcp: txcontrolbuf
 	struct txcontrolbuf* next;
 	uint32_t seq; // channel sequence
+	bool fin;
 	int sid;
 	int ssn;
 	int payloadlen;
@@ -370,6 +371,7 @@ struct channel_rx_queue_node{
 	uint32_t channel_offset; // sequence number - tcb->ack_offs
 	int total_segment_length;
 	int payload_length;
+	bool fin;
 	int sid;
 	bool lss;
 	bool dummy_payload;
@@ -438,7 +440,7 @@ struct tcpctrlblk{
 	unsigned int mss; // Channel property
 	unsigned int payload_mss; // mss - FIXED_OPTIONS_LENGTH
 	unsigned int stream_end; // Channel property (bad name) - unused
-	unsigned int fsm_timer; // Channel property - unused
+	uint64_t fsm_timer; // Channel property
 	uint32_t init_radwin; // Used in MS-TCP as a default value for radwin of new streams
 
 	bool is_active_side; // Channel property
@@ -1693,6 +1695,7 @@ void prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, 
 
 	txcb->txtime = -MAX_TIMEOUT;
 	txcb->payloadlen = payloadlen;
+	txcb->fin = flags & FIN;
 	txcb->dummy_payload = flags & DMP;
 	txcb->totlen = payloadlen + 20 + FIXED_OPTIONS_LENGTH;
 	txcb->retry = 0;
@@ -1723,7 +1726,7 @@ void prepare_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, 
 		tcb->txlast->next = txcb; 
 		tcb->txlast = tcb->txlast->next; // tcb->txlast = txcb;
 	}
-	tcb->sequence += payloadlen;
+	tcb->sequence += payloadlen + (txcb->fin ? 1 : 0);
 
 	/* Calculation of new txcb fields */
 	txcb->seq = ntohl(tcp->seq);
@@ -1995,7 +1998,7 @@ void update_tcp_header(int s /* main TCB file descriptor */, int backlog_entry_i
 // Just send it! Used for ACKs (in particular dupACKs)
 // Same signature as prepare_tcp but without the payload
 void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
-	assert_handler_lock_acquired("send_tcp");
+	assert_handler_lock_acquired("fast_send_tcp");
 
 	if(backlog_entry_index != -1){
 		ERROR("fast_send_tcp not implemented for backlog_entry_index >= 0"); // TODO
@@ -2387,8 +2390,9 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	to_return->lss = sid;
 	to_return->payload_length = to_return->total_segment_length - (tcp->d_offs_res>>4)*4;
 	to_return->dummy_payload = tcp->d_offs_res & 0x01;
-	if(to_return->payload_length <= 0 || to_return->total_segment_length <= 0){
-		/* 
+	to_return->fin = tcp->flags & FIN;
+	if((to_return->payload_length <= 0 || to_return->total_segment_length <= 0) && !to_return->fin){
+		/*
 		The case == 0 is used to ensure that we are not inserting a segment with no payload (like a DupACK) in the queue. This should be avoided
 		in the caller function, and we should never get here.
 		The case < 0 is used to try to catch errors related to invalid pointers passed to this function. 
@@ -3525,8 +3529,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			if(event ==FSM_EVENT_PKT_RCV && (tcp->flags & SYN)){
 				// The SYN+ACK has been retransmitted (ignored)
 				break;
-			}
-			if(event == FSM_EVENT_STREAM_TIMEOUT){
+			}else if(event == FSM_EVENT_STREAM_TIMEOUT){
 				int sid = fdinfo[s].sid;
 				int ssn = fdinfo[s].tcb->next_ssn[sid];
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
@@ -3546,8 +3549,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				myfree(dummy_payload);
 				myfree(opt);
 				break;
-			}
-			if(event == FSM_EVENT_PKT_RCV){
+			} else if(event == FSM_EVENT_PKT_RCV){
 				int sid = 0;
 				int ssn = 0;
 				bool lss = false;
@@ -3587,6 +3589,156 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						}
 					}
 				}
+				if(tcp->flags & FIN){
+					if(tcb->ms_option_enabled){
+						// With MS-TCP, we send the FIN+ACK immediately
+						prepare_tcp(s, -1, FIN|ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+						tcb->st = TCB_ST_LAST_ACK;
+						DEBUG("TCB_ST_ESTABLISHED -> TCB_ST_LAST_ACK");
+						LOG_MESSAGE("TCB_ST_ESTABLISHED -> TCB_ST_LAST_ACK");
+					}else{
+						ERROR("Transition TCB_ST_ESTABLISHED -> TCB_STATE_CLOSE_WAIT not yet handled for non-MS connections");
+					}
+				}
+			}else if(event == FSM_EVENT_DO_CHANNEL_CLOSE){
+				prepare_tcp(s, -1, FIN|ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+				tcb->st = TCB_ST_FIN_WAIT_1;
+				DEBUG("TCB_ST_ESTABLISHED -> TCB_ST_FIN_WAIT_1");
+				LOG_MESSAGE("TCB_ST_ESTABLISHED -> TCB_ST_FIN_WAIT_1");
+				break;
+			}
+			break;
+		case TCB_ST_FIN_WAIT_1:
+			if(event == FSM_EVENT_PKT_RCV){
+				if(tcb->txlast == NULL){
+					ERROR("TX queue empty but we are still in TCB_ST_FIN_WAIT_1");
+				}
+				if(tcb->txlast->segment == NULL){
+					ERROR("txlast should not be acked/sacked in TCB_ST_FIN_WAIT_1");
+				}
+				if(!(tcb->txlast->fin)){
+					ERROR("txlast should be the FIN in TCB_ST_FIN_WAIT_1");
+				}
+				if(tcb->txlast->payloadlen != 0){
+					ERROR("txlast should be 0-length in TCB_ST_FIN_WAIT_1");
+				}
+				bool fin_acked = (tcp->ack == htonl(ntohl(tcb->txlast->segment->seq)+1));
+				bool fin_received = ((tcp->flags)&FIN);
+				DEBUG("FSM_EVENT_PKT_RCV TCB_ST_FIN_WAIT_1 fin_acked %d fin_received %d", fin_acked, fin_received);
+				if(fin_acked && fin_received){
+					// Direct transition to TIME_WAIT (RFC 9293, 3.3.2, Note 2)
+					tcb->fsm_timer = tick + tcb->timeout * 4;
+					tcb->st = TCB_ST_TIME_WAIT;
+					DEBUG("TCB_ST_FIN_WAIT_1 -> TCB_ST_TIME_WAIT");
+					LOG_MESSAGE("TCB_ST_FIN_WAIT_1 -> TCB_ST_TIME_WAIT");
+				}else if(fin_acked && !fin_received){
+					tcb->st = TCB_ST_FIN_WAIT_2;
+					DEBUG("TCB_ST_FIN_WAIT_1 -> TCB_ST_FIN_WAIT_2");
+					LOG_MESSAGE("TCB_ST_FIN_WAIT_1 -> TCB_ST_FIN_WAIT_2");
+				}else if(fin_received && !fin_acked){
+					if(tcb->ms_option_enabled){
+						ERROR("Transition FIN_WAIT_1 to CLOSING cannot happen with MSTCP");
+					}
+					tcb->st = TCB_ST_CLOSING;
+					DEBUG("TCB_ST_FIN_WAIT_1 -> TCB_ST_CLOSING");
+					LOG_MESSAGE("TCB_ST_FIN_WAIT_1 -> TCB_ST_CLOSING");
+				}else{
+					// stay in FIN_WAIT_1
+				}
+			}
+			break;
+		case TCB_ST_FIN_WAIT_2:
+			if(event == FSM_EVENT_PKT_RCV){
+				bool fin_received = ((tcp->flags)&FIN);
+				if(fin_received){
+					tcb->fsm_timer = tick + tcb->timeout * 4;
+					tcb->st = TCB_ST_TIME_WAIT;
+					DEBUG("TCB_ST_FIN_WAIT_2 -> TCB_ST_TIME_WAIT (timeout %d)", tcb->timeout * 4);
+					LOG_MESSAGE("TCB_ST_FIN_WAIT_2 -> TCB_ST_TIME_WAIT");
+				}
+			}
+			break;
+		case TCB_ST_LAST_ACK:
+			if(event == FSM_EVENT_PKT_RCV){
+				bool fin_acked = (tcp->ack == htonl(ntohl(tcb->txlast->segment->seq)+1));
+				if(fin_acked){
+					// Go into time wait, but exit immediately
+					// This is to avoid duplication of the TIME_WAIT cleanup code, but there should be no
+					// timeout in this case according to RFC 9293
+					tcb->fsm_timer = tick + 0;
+					tcb->st = TCB_ST_TIME_WAIT;
+					DEBUG("TCB_ST_LAST_ACK -> TCB_ST_TIME_WAIT (timeout 0)");
+					LOG_MESSAGE("TCB_ST_LAST_ACK -> TCB_ST_TIME_WAIT");
+				}
+			}
+		case TCB_ST_TIME_WAIT:
+			if(event == FSM_EVENT_TIMEOUT){
+				// TX queue (segment may be NULL)
+				while(tcb->txfirst != NULL){
+					struct txcontrolbuf* next = tcb->txfirst->next;
+					if(tcb->txfirst->segment != NULL){
+						myfree(tcb->txfirst->segment);
+					}
+					myfree(tcb->txfirst);
+					tcb->txfirst = next;
+				}
+
+				// Channel RX queue (segment is NULL if it was moved to a stream queue)
+				while(tcb->unack != NULL){
+					struct channel_rx_queue_node* next = tcb->unack->next;
+					if(tcb->unack->segment != NULL){
+						myfree(tcb->unack->segment);
+					}
+					myfree(tcb->unack);
+					tcb->unack = next;
+				}
+
+				// Per-stream resources
+				for(int sid = 0; sid <= MAX_SID; sid++){
+
+					// Stream RX queue
+					while(tcb->stream_rx_queue[sid] != NULL){
+						struct stream_rx_queue_node* next = tcb->stream_rx_queue[sid]->next;
+						if(tcb->stream_rx_queue[sid]->segment != NULL){
+							myfree(tcb->stream_rx_queue[sid]->segment);
+						}
+						myfree(tcb->stream_rx_queue[sid]);
+						tcb->stream_rx_queue[sid] = next;
+					}
+
+					if(tcb->stream_tx_buffer[sid] != NULL){
+						myfree(tcb->stream_tx_buffer[sid]);
+						tcb->stream_tx_buffer[sid] = NULL;
+					}
+				}
+
+				// Passive side: check that there is nothing in the ready backlog for the current tcb
+				if(!tcb->is_active_side){
+					if(tcb->listening_fd < 3 || tcb->listening_fd >= MAX_FD){
+						ERROR("invalid tcb->listening_fd during TCB_ST_TIME_WAIT cleanup");
+					}
+					struct stream_backlog_node* prev = &(fdinfo[tcb->listening_fd].stream_backlog_head);
+					while(prev->next != NULL){
+						if(prev->next->tcb == tcb){
+							ERROR("there should not be any ready stream for the closing TCB in TCB_ST_TIME_WAIT cleanup");
+						}else{
+							prev = prev->next;
+						}
+					}
+				}
+
+				// Release every fd that shares this TCB
+				for(int f = 3; f < MAX_FD; f++){
+					if(fdinfo[f].st == FDINFO_ST_TCB_CREATED && fdinfo[f].tcb == tcb){
+						bzero(&fdinfo[f], sizeof(struct socket_info)); // st = FDINFO_ST_FREE (0)
+						fdinfo[f].st=FDINFO_ST_FREE;
+					}
+				}
+
+				// Free the TCB itself
+				myfree(tcb);
+
+				DEBUG("Connection closed, resources freed");
 			}
 			break;
 		default:
@@ -4070,7 +4222,7 @@ void prepare_sid_for_reuse(struct tcpctrlblk* tcb, int sid){
 		struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[sid];
 		tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
 		if(!tmp->dummy_payload){
-			ERROR("non-DMP remaining segment during stream_close_handler flush");
+			ERROR("non-DMP remaining segment during prepare_sid_for_reuse flush");
 		}
 		if(tmp->segment != NULL){
 			myfree(tmp->segment);
@@ -4092,15 +4244,35 @@ void prepare_sid_for_reuse(struct tcpctrlblk* tcb, int sid){
 	//DEBUG("Stream %d ready for reuse", sid);
 }
 
-void stream_close_handler(struct tcpctrlblk* tcb, int sid){
+bool all_streams_unused(struct tcpctrlblk* tcb){
+	if(tcb == NULL){
+		ERROR("all_streams_unused tcb NULL");
+	}
+	for(int sid = 0; sid <= MAX_SID; sid++){
+		if(tcb->stream_state[sid] != STREAM_STATE_UNUSED){
+			return false;
+		}
+	}
+	return true;
+}
+
+void stream_close_handler(int s, int sid){
+	if(s < 3 || s > MAX_FD){
+		ERROR("stream_close_handler invalid fd %d", s);
+	}
+	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	if(tcb == NULL){
 		ERROR("stream_close_handler tcb NULL");
 	}
-	if(sid < 0){
+	if(sid < 0 || sid > MAX_SID){
 		ERROR("stream_close_handler invalid sid");
 	}
 	if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_ACKED && tcb->lss_received[sid]){
 		prepare_sid_for_reuse(tcb, sid);
+		if(tcb->is_active_side && all_streams_unused(tcb)){
+			DEBUG("all streams closed");
+			fsm(s, FSM_EVENT_DO_CHANNEL_CLOSE, NULL, NULL);
+		}
 	}
 	return;
 }
@@ -4336,6 +4508,7 @@ void myio(int ignored){
 			}
 
 			int payload_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4 - (tcp->d_offs_res>>4)*4;
+			bool fin = tcp->flags & FIN;
 
 			int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment
 
@@ -4356,10 +4529,9 @@ void myio(int ignored){
 					}
 				}
 
-				// TODO ho tolto il controllo per il FIN, va rimesso se si sistema la chiusura delle connessioni
-				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= tcb->txlast->seq + ((uint32_t)tcb->txlast->payloadlen) - shifter)){ 
+				if((htonl(tcp->ack) >= shifter) && (htonl(tcp->ack)-shifter <= tcb->txlast->seq + ((uint32_t)tcb->txlast->payloadlen) + ((tcb->st > TCB_ST_ESTABLISHED && tcb->st != TCB_ST_CLOSE_WAIT)?1U:0U) - shifter)){
 					bool send_window_advanced = false;
-					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (tcb->txfirst->seq-shifter + tcb->txfirst->payloadlen))){ //Ack>=Seq+payloadlen				
+					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (tcb->txfirst->seq - shifter + tcb->txfirst->payloadlen + (tcb->txfirst->fin ? 1 : 0)))){ //Ack>=Seq+payloadlen
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
 						
@@ -4394,7 +4566,7 @@ void myio(int ignored){
 								// MS option is present
 								if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
 									tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
-									stream_close_handler(tcb, sid);
+									stream_close_handler(i, sid);
 								}
 							}
 
@@ -4471,7 +4643,7 @@ void myio(int ignored){
 											// MS option is present in cursor segment
 											if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_TXED && lss){
 												tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_ACKED;
-												stream_close_handler(tcb, sid);
+												stream_close_handler(i, sid);
 											}
 										}
 
@@ -4487,18 +4659,17 @@ void myio(int ignored){
 				}
 
 				congctrl_fsm(tcb,FSM_EVENT_PKT_RCV,tcp,payload_length, acked_size);
-
 			}
 
 
 			
 
-			if(payload_length > 0){
+			if(payload_length > 0 || fin){
 				int sid = 0;
 				int ssn = 0;
 				bool dummy_payload = false;
 				bool ms_option_included = false;
-				if(tcb->ms_option_enabled){
+				if(tcb->ms_option_enabled && !fin){
 					int ms_index = search_tcp_option(tcp, OPT_KIND_MS_TCP);
 					if(ms_index >= 0){
 						sid = (tcp->payload[ms_index+2]>>2) & 0x1F;
@@ -4521,49 +4692,51 @@ void myio(int ignored){
 					// This segment is not a duplicate of something already cumulative-acked
 
 
-					/* 
-					We don't use segments that are with an ACK which is not the most advanced one, because if we use those segments naively
-					we could make mistakes in the calculation of "calculated_scheduler_tokens".
-					The problem could be that a segment arrives with an ACK number that include in the flow control calculation some segments
-					that are not in the TX queue anymore (because cumulativeACK already went past them with some other segments received before
-					this one), and we can no longer know their size.
-					We could do some tricks and upper-bound this, so instead of just ignoring the incoming out-of-order segment we could use a
-					received advertised window reduced by the difference between the incoming ack and the most recent ack. However, this situation
-					can arise only in case segments are reordered over the network, so for now this is just ignored.
-					*/
-					uint32_t highest_received_ack_shifted_network_order = htonl(tcb->seq_offs+tcb->sequence);
-					if(tcb->txfirst != NULL){
-						if(tcb->txfirst->segment == NULL){
-							ERROR("There is something wrong with SACK, the first segment in the tx queue can never be a sacked segment");
-						}
-						highest_received_ack_shifted_network_order = tcb->txfirst->segment->seq;
-					}
-					if(tcp->ack == highest_received_ack_shifted_network_order){
-						uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-						int64_t calculated_scheduler_tokens = new_radwin; // signed to handle negative values in weird edge cases
-						// We traverse the TX queue to look for all segments of that stream. 
-						// If we found some segments (that will be after this cumulative ack) for the same stream without DMP, we decrease the number
-						// of tokens to allocate. If we don't find any, we use new_radwin as the new token count directly
-						struct txcontrolbuf* tx_queue_cursor = tcb->txfirst;
-						while(tx_queue_cursor != NULL){
-							if(tx_queue_cursor->sid == sid && !tx_queue_cursor->dummy_payload){
-								calculated_scheduler_tokens -= tx_queue_cursor->payloadlen;
+					if(ntohs(tcp->window) != 0){
+						/* 
+						We don't use segments that are with an ACK which is not the most advanced one, because if we use those segments naively
+						we could make mistakes in the calculation of "calculated_scheduler_tokens".
+						The problem could be that a segment arrives with an ACK number that include in the flow control calculation some segments
+						that are not in the TX queue anymore (because cumulativeACK already went past them with some other segments received before
+						this one), and we can no longer know their size.
+						We could do some tricks and upper-bound this, so instead of just ignoring the incoming out-of-order segment we could use a
+						received advertised window reduced by the difference between the incoming ack and the most recent ack. However, this situation
+						can arise only in case segments are reordered over the network, so for now this is just ignored.
+						*/
+						uint32_t highest_received_ack_shifted_network_order = htonl(tcb->seq_offs+tcb->sequence);
+						if(tcb->txfirst != NULL){
+							if(tcb->txfirst->segment == NULL){
+								ERROR("There is something wrong with SACK, the first segment in the tx queue can never be a sacked segment");
 							}
-							tx_queue_cursor = tx_queue_cursor->next;
+							highest_received_ack_shifted_network_order = tcb->txfirst->segment->seq;
 						}
-						if(calculated_scheduler_tokens > tcb->scheduler_tokens[sid]){
-							/*
-							We update the token count only if it increases, ensuring that it does not decrease.
-							This is because, otherwise, this condition could happen, leading to a final value 
-							of scheduler_tokens lower than it should be.
-							- A sends a DMP segment with ACK X, SEQ Y, and Window 100
-							- A consumes something more
-							- A sends a DMP segment with ACK X, SEQ Y+1, Window 200
-							- Over the wire, the packet with SEQ Y gets delayed, and arrives after Y+1
-							- When Y+1 arrives, scheduler_tokens gets set to 200
-							- If we don't do this check, when Y arrives scheduler_tokens is set to 100
-							*/
-							tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
+						if(tcp->ack == highest_received_ack_shifted_network_order){
+							uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+							int64_t calculated_scheduler_tokens = new_radwin; // signed to handle negative values in weird edge cases
+							// We traverse the TX queue to look for all segments of that stream. 
+							// If we found some segments (that will be after this cumulative ack) for the same stream without DMP, we decrease the number
+							// of tokens to allocate. If we don't find any, we use new_radwin as the new token count directly
+							struct txcontrolbuf* tx_queue_cursor = tcb->txfirst;
+							while(tx_queue_cursor != NULL){
+								if(tx_queue_cursor->sid == sid && !tx_queue_cursor->dummy_payload){
+									calculated_scheduler_tokens -= tx_queue_cursor->payloadlen;
+								}
+								tx_queue_cursor = tx_queue_cursor->next;
+							}
+							if(calculated_scheduler_tokens > tcb->scheduler_tokens[sid]){
+								/*
+								We update the token count only if it increases, ensuring that it does not decrease.
+								This is because, otherwise, this condition could happen, leading to a final value 
+								of scheduler_tokens lower than it should be.
+								- A sends a DMP segment with ACK X, SEQ Y, and Window 100
+								- A consumes something more
+								- A sends a DMP segment with ACK X, SEQ Y+1, Window 200
+								- Over the wire, the packet with SEQ Y gets delayed, and arrives after Y+1
+								- When Y+1 arrives, scheduler_tokens gets set to 200
+								- If we don't do this check, when Y arrives scheduler_tokens is set to 100
+								*/
+								tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
+							}
 						}
 					}
 
@@ -4609,7 +4782,7 @@ void myio(int ignored){
 
 						in_order_for_channel = false;
 
-						if(tcb->ms_option_enabled){
+						if(tcb->ms_option_enabled && !newrx->fin){
 							bool newrx_in_order_for_stream = true;
 							struct channel_rx_queue_node* c = tcb->unack;
 							while(c != NULL && c != newrx){
@@ -4631,7 +4804,7 @@ void myio(int ignored){
 									if(newrx_stream->lss & !tcb->lss_received[sid]){
 										first_lss_segment = true;
 										tcb->lss_received[sid] = true;
-										stream_close_handler(tcb, sid);
+										stream_close_handler(i, sid);
 									}
 
 									if(!(tcb->lss_received[sid] && newrx_stream->lss && !first_lss_segment)){
@@ -4680,18 +4853,25 @@ void myio(int ignored){
 
 							if(tcb->ms_option_enabled){
 								if(tcb->unack->segment != NULL){
-									DEBUG("Last received packet before error:");
-									print_l2_packet(l2_rx_buf);
-									DEBUG("unack:");
-									print_tcp_segment(tcb->unack->segment);
-									DEBUG("unack channel_offset: %u", tcb->unack->channel_offset);
-									DEBUG("unack payload length %d", tcb->unack->payload_length);
-									DEBUG("next_rx_ssn %d received %d", tcb->next_rx_ssn[sid], ssn);
-									ERROR("in-order segment not consumed from channel queue");
+									if(tcb->unack->fin){
+										// The FIN segment is not enqueued for any stream
+										myfree(tcb->unack->segment);
+										tcb->unack->segment = NULL;
+									}else{
+										DEBUG("Last received packet before error:");
+										print_l2_packet(l2_rx_buf);
+										DEBUG("unack:");
+										print_tcp_segment(tcb->unack->segment);
+										DEBUG("unack channel_offset: %u", tcb->unack->channel_offset);
+										DEBUG("unack payload length %d", tcb->unack->payload_length);
+										DEBUG("next_rx_ssn %d received %d", tcb->next_rx_ssn[sid], ssn);
+										ERROR("in-order segment not consumed from channel queue");
+									}
 								}
 							}else{
 								// For non-MS connections, we can do here the insertion in the stream RX queue
 								if(tcb->unack->segment == NULL){
+									// This error is wrong after the SACK modification, this can happen if something is SACKed
 									ERROR("There is no segment to place in the stream queue (non-MS)");
 								}
 								if(tcb->unack->dummy_payload){
@@ -4711,8 +4891,8 @@ void myio(int ignored){
 								}
 							}
 
-							tcb->cumulativeack += tcb->unack->payload_length;
-							if(!tcb->unack->dummy_payload){
+							tcb->cumulativeack += tcb->unack->payload_length + (tcb->unack->fin ? 1 : 0);
+							if(!tcb->unack->dummy_payload && !tcb->unack->fin){
 								tcb->adwin[tcb->unack->sid] -= tcb->unack->payload_length;
 							}
 
@@ -4758,10 +4938,10 @@ void myio(int ignored){
 								opt[3] = (tcb->next_ssn[sid])&0xFF;
 								update_next_ssn(&(tcb->next_ssn[sid]));
 
-								uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
+								uint8_t* dummy_payload_ptr = mymalloc(1); // value doesn't matter
 
-								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
-								myfree(dummy_payload);
+								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload_ptr, 1, opt, optlen);
+								myfree(dummy_payload_ptr);
 								myfree(opt);
 							}
 						}
@@ -4775,9 +4955,14 @@ void myio(int ignored){
 							}
 						}
 					}else{
-						DEBUG("Unexpected packet with payload but no MSTCP option:");
-						print_l2_packet(l2_rx_buf);
-						ERROR("Should we generate an ACK for this packet?");
+						if(fin){
+							fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
+							out_ack_counter++;
+						}else{
+							DEBUG("Unexpected packet with payload but no MSTCP option or FIN flag:");
+							print_l2_packet(l2_rx_buf);
+							ERROR("Should we generate an ACK for this packet?");
+						}
 					}
 				}
 			}
@@ -4887,7 +5072,7 @@ void mytimer(int ignored){
 				continue;
 			}
 
-			if((tcb->fsm_timer!=0 ) && (tcb->fsm_timer < tick)){
+			if((tcb->fsm_timer!=0) && (tcb->fsm_timer < tick)){
 				fsm(i, FSM_EVENT_TIMEOUT, NULL, NULL);
 				continue;
 			}
@@ -4962,7 +5147,7 @@ void mytimer(int ignored){
 				clock_gettime(CLOCK_REALTIME, &t1);
                 update_tcp_header_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
 				if(txcb->seq >= tcb->highest_sent_sequence_number){
-					tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen;
+					tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen + (txcb->fin?1:0);
 				}
 				clock_gettime(CLOCK_REALTIME, &t0);
 				send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
@@ -5696,7 +5881,8 @@ void main_client_app(){
 	DEBUG("Total:  %.2f KB/s (%.2f Mbps) DL  |  %.2f KB/s UL  (%"PRId64" ms, %.2f s)", ((double)dl_sum) / meas_dur, ((double)dl_sum) / meas_dur * 8 / 1000, ((double)ul_sum) / meas_dur, meas_dur, ((double)(meas_dur)/1000));
 	DEBUG("#################################################################");
 	DEBUG("wait...");
-	persistent_nanosleep(0, 200000000); // wait 200 ms
+	// persistent_nanosleep(0, 200000000); // wait 200 ms
+	persistent_nanosleep(5, 0);
 	DEBUG("main_client_app end");
 	
 
