@@ -31,6 +31,8 @@
 #define NOLOGS
 //#define SHORTLOGS
 
+//#define USE_CUSTOM_MALLOC
+
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
 
@@ -596,6 +598,7 @@ void DEBUG(char* c, ...){
 	#endif
 }
 
+#ifdef USE_CUSTOM_MALLOC
 #define MYMALLOC_AVAILABLE_MB 64
 #define MYMALLOC_CHUNK_SIZE 128
 
@@ -607,9 +610,11 @@ uint32_t mymalloc_region_extensions[MYMALLOC_NUM_CHUNKS] = {0};
 alignas(MYMALLOC_CHUNK_SIZE) uint8_t mymalloc_buffer[MYMALLOC_AVAILABLE_BYTES];
 
 uint32_t next_chunk_hint = 0;
+#endif
 void* mymalloc(size_t size){
-	// return malloc(size);
-
+	#ifndef USE_CUSTOM_MALLOC
+	return malloc(size);
+	#else
 	if(size==0){
 		return NULL;
 	}
@@ -659,10 +664,13 @@ void* mymalloc(size_t size){
 		mymalloc_region_extensions[current_first_free] = requested_chunks;
 		return (void*) &(mymalloc_buffer[current_first_free*MYMALLOC_CHUNK_SIZE]);
 	}
+	ERROR("we should never arrive after the free in mymalloc");
+	#endif
 }
 void myfree(void* p){
-	// free(p); return;
-
+	#ifndef USE_CUSTOM_MALLOC
+	free(p); return;
+	#else
 	if(p == NULL){
 		return;
 	}
@@ -676,8 +684,12 @@ void myfree(void* p){
 		ERROR("myfree mymalloc_region_extensions[%u] == 0", chunk_number);
 	}
 	mymalloc_region_extensions[chunk_number] = 0;
+	#endif
 }
 void* myrealloc(void *ptr, size_t size){
+	#ifndef USE_CUSTOM_MALLOC
+	return realloc(ptr, size);
+	#else
 	if(ptr==NULL){
 		return mymalloc(size);
 	}
@@ -709,6 +721,7 @@ void* myrealloc(void *ptr, size_t size){
 	memcpy(to_return, ptr, src_chunks*MYMALLOC_CHUNK_SIZE);
 	myfree(ptr);
 	return to_return;
+	#endif
 }
 
 int64_t get_timestamp_ns(){
@@ -4546,7 +4559,7 @@ void myio(int ignored){
 							tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
 						}
 					}
-					
+
 
 					struct channel_rx_queue_node* newrx = NULL;
 					if(tcb->unack == NULL){
