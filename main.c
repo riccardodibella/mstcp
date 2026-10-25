@@ -4500,33 +4500,53 @@ void myio(int ignored){
 				if(channel_offset >= tcb->cumulativeack){
 					// This segment is not a duplicate of something already cumulative-acked
 
-					uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-					int64_t calculated_scheduler_tokens = new_radwin; // signed to handle negative values in weird edge cases
-					// We traverse the TX queue to look for all segments of that stream. 
-					// If we found some segments (that will be after this cumulative ack) for the same stream without DMP, we decrease the number
-					// of tokens to allocate. If we don't find any, we use new_radwin as the new token count directly
-					struct txcontrolbuf* tx_queue_cursor = tcb->txfirst;
-					while(tx_queue_cursor != NULL){
-						if(tx_queue_cursor->sid == sid && !tx_queue_cursor->dummy_payload){
-							calculated_scheduler_tokens -= tx_queue_cursor->payloadlen;
-						}
-						tx_queue_cursor = tx_queue_cursor->next;
-					}
 
-					if(calculated_scheduler_tokens > tcb->scheduler_tokens[sid]){
-						/*
-						We update the token count only if it increases, ensuring that it does not decrease.
-						This is because, otherwise, this condition could happen, leading to a final value 
-						of scheduler_tokens lower than it should be.
-						- A sends a DMP segment with ACK X, SEQ Y, and Window 100
-						- A consumes something more
-						- A sends a DMP segment with ACK X, SEQ Y+1, Window 200
-						- Over the wire, the packet with SEQ Y gets delayed, and arrives after Y+1
-						- When Y+1 arrives, scheduler_tokens gets set to 200
-						- If we don't do this check, when Y arrives scheduler_tokens is set to 100
-						*/
-						tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
+					/* 
+					We don't use segments that are with an ACK which is not the most advanced one, because if we use those segments naively
+					we could make mistakes in the calculation of "calculated_scheduler_tokens".
+					The problem could be that a segment arrives with an ACK number that include in the flow control calculation some segments
+					that are not in the TX queue anymore (because cumulativeACK already went past them with some other segments received before
+					this one), and we can no longer know their size.
+					We could do some tricks and upper-bound this, so instead of just ignoring the incoming out-of-order segment we could use a
+					received advertised window reduced by the difference between the incoming ack and the most recent ack. However, this situation
+					can arise only in case segments are reordered over the network, so for now this is just ignored.
+					*/
+					uint32_t highest_received_ack_shifted_network_order = htonl(tcb->seq_offs+tcb->sequence);
+					if(tcb->txfirst != NULL){
+						if(tcb->txfirst->segment == NULL){
+							ERROR("There is something wrong with SACK, the first segment in the tx queue can never be a sacked segment");
+						}
+						highest_received_ack_shifted_network_order = tcb->txfirst->segment->seq;
 					}
+					if(tcp->ack == highest_received_ack_shifted_network_order){
+						uint32_t new_radwin = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+						int64_t calculated_scheduler_tokens = new_radwin; // signed to handle negative values in weird edge cases
+						// We traverse the TX queue to look for all segments of that stream. 
+						// If we found some segments (that will be after this cumulative ack) for the same stream without DMP, we decrease the number
+						// of tokens to allocate. If we don't find any, we use new_radwin as the new token count directly
+						struct txcontrolbuf* tx_queue_cursor = tcb->txfirst;
+						while(tx_queue_cursor != NULL){
+							if(tx_queue_cursor->sid == sid && !tx_queue_cursor->dummy_payload){
+								calculated_scheduler_tokens -= tx_queue_cursor->payloadlen;
+							}
+							tx_queue_cursor = tx_queue_cursor->next;
+						}
+						if(calculated_scheduler_tokens > tcb->scheduler_tokens[sid]){
+							/*
+							We update the token count only if it increases, ensuring that it does not decrease.
+							This is because, otherwise, this condition could happen, leading to a final value 
+							of scheduler_tokens lower than it should be.
+							- A sends a DMP segment with ACK X, SEQ Y, and Window 100
+							- A consumes something more
+							- A sends a DMP segment with ACK X, SEQ Y+1, Window 200
+							- Over the wire, the packet with SEQ Y gets delayed, and arrives after Y+1
+							- When Y+1 arrives, scheduler_tokens gets set to 200
+							- If we don't do this check, when Y arrives scheduler_tokens is set to 100
+							*/
+							tcb->scheduler_tokens[sid] = calculated_scheduler_tokens;
+						}
+					}
+					
 
 					struct channel_rx_queue_node* newrx = NULL;
 					if(tcb->unack == NULL){
