@@ -4057,6 +4057,41 @@ int myclose(int s){
 	return 0;
 }
 
+void prepare_sid_for_reuse(struct tcpctrlblk* tcb, int sid){
+	if(!(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_ACKED && tcb->lss_received[sid])){
+		ERROR("prepare_sid_for_reuse sid %d not ready for reuse (%d %d)", sid, tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_ACKED, tcb->lss_received[sid]);
+	}
+	/*
+	We do not go throught STREAM_STATE_CLOSED. Another solution could be to go to state STREAM_STATE_CLOSED here, set a timer, and after that timer
+	elapses reset the stream and prepare it for reuse. With the current version of the program there is only the close() operation, so there is no risk
+	that if the LSS has been received the other peer is still reading or using the structures for this stream.
+	*/
+	while(tcb->stream_rx_queue[sid] != NULL){
+		struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[sid];
+		tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
+		if(!tmp->dummy_payload){
+			ERROR("non-DMP remaining segment during stream_close_handler flush");
+		}
+		if(tmp->segment != NULL){
+			myfree(tmp->segment);
+		}
+		myfree(tmp);
+	}
+
+	tcb->stream_state[sid] = STREAM_STATE_UNUSED;
+	tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
+	tcb->scheduler_tokens[sid] = tcb->init_radwin; 
+	if(tcb->stream_tx_buffer[sid] != NULL){
+		myfree(tcb->stream_tx_buffer[sid]);
+		tcb->stream_tx_buffer[sid] = NULL;
+	}
+	tcb->txfree[sid] = TX_BUFFER_SIZE;
+	tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
+	tcb->stream_fsm_timer[sid] = 0;
+
+	//DEBUG("Stream %d ready for reuse", sid);
+}
+
 void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 	if(tcb == NULL){
 		ERROR("stream_close_handler tcb NULL");
@@ -4065,35 +4100,7 @@ void stream_close_handler(struct tcpctrlblk* tcb, int sid){
 		ERROR("stream_close_handler invalid sid");
 	}
 	if(tcb->write_side_close_state[sid] == WR_CLOSE_ST_LSS_ACKED && tcb->lss_received[sid]){
-		/*
-		We do not go throught STREAM_STATE_CLOSED. Another solution could be to go to state STREAM_STATE_UNUSED here, set a timer, and after that timer
-		elapses reset the stream and prepare it for reuse. With the current version of the program there is only the close() operation, so there is no risk
-		that if the LSS has been received the other peer is still reading or using the structures for this stream.
-		*/
-		while(tcb->stream_rx_queue[sid] != NULL){
-			struct stream_rx_queue_node* tmp = tcb->stream_rx_queue[sid];
-			tcb->stream_rx_queue[sid] = tcb->stream_rx_queue[sid]->next;
-			if(!tmp->dummy_payload){
-				ERROR("non-DMP remaining segment during stream_close_handler flush");
-			}
-			if(tmp->segment != NULL){
-				myfree(tmp->segment);
-			}
-			myfree(tmp);
-		}
-
-		tcb->stream_state[sid] = STREAM_STATE_UNUSED;
-		tcb->adwin[sid] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
-		tcb->scheduler_tokens[sid] = tcb->init_radwin; 
-		if(tcb->stream_tx_buffer[sid] != NULL){
-			myfree(tcb->stream_tx_buffer[sid]);
-			tcb->stream_tx_buffer[sid] = NULL;
-		}
-		tcb->txfree[sid] = TX_BUFFER_SIZE;
-		tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
-		tcb->stream_fsm_timer[sid] = 0;
-
-		//DEBUG("Stream %d ready for reuse", sid);
+		prepare_sid_for_reuse(tcb, sid);
 	}
 	return;
 }
