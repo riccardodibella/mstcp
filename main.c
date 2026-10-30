@@ -362,7 +362,7 @@ struct txcontrolbuf{ // mytcp: txcontrolbuf
 	struct tcp_segment* segment;
 
 	int64_t txtime;
-	int retry;
+	unsigned int retry;
 };
 
 struct channel_rx_queue_node{
@@ -2387,7 +2387,7 @@ struct channel_rx_queue_node* create_channel_rx_queue_node(uint32_t channel_offs
 	to_return->channel_offset = channel_offset;
 	to_return->total_segment_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4;
 	to_return->sid = sid;
-	to_return->lss = sid;
+	to_return->lss = lss;
 	to_return->payload_length = to_return->total_segment_length - (tcp->d_offs_res>>4)*4;
 	to_return->dummy_payload = tcp->d_offs_res & 0x01;
 	to_return->fin = tcp->flags & FIN;
@@ -2455,23 +2455,6 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 
-/*
-	--- This comment was written before changing SACK segment drop behaviour, so it may be outdated. ---
-
-	Returns true if there is a "hole" in the TX queue for the stream, false otherwise.
-	
-	For each stream we traverse the channel tx queue, that contains the segments that need to be transmitted
-	and are not yet acked. Until the firs segment that we find for the stream we will certainly not have a hole,
-	because up to that segment they all have been acked on that stream. After that segment, we will check the
-	continuity of the SSNs, so we will check that all the segments after that one are still in the channel queue
-	and they have not been removed. If we arrive at the end of the queue without finding any discontinuity on that
-	stream, then there are no holes. If we found a segment that has a SSN different than what we expect, this means
-	that on that stream there was something that was acked after the first unacked segment, so we have a hole.
-	There is another possibility: maybe all the segments for that stream after the first one that was acked are also
-	acked. This is still a hole, and we can detect this by comparing the next ssn that we would expect in the loop
-	with the next_ssn field of the tcb. If they are different, this means that there was some segment transmitted
-	after the last one that we found and it was acked.
-*/
 bool does_stream_have_hole(int s, int sid){
 	if(s < 3 || s >= MAX_FD){
 		ERROR("does_stream_have_hole invalid fd %d", s);
@@ -2488,36 +2471,23 @@ bool does_stream_have_hole(int s, int sid){
 	}
 
 	struct txcontrolbuf* iter = tcb->txfirst;
-	uint16_t next_ssn;
-	bool first_ssn_found = false;
+	bool found_non_sacked = false;
 	while(iter != NULL){
 		if(iter->sid == sid){
-			if(!first_ssn_found){
-				// This is the first segment that we find for this stream
-				next_ssn == iter->ssn;
-				first_ssn_found = true;
+			bool is_sacked = (iter->segment == NULL);
+			if(!is_sacked){
+				found_non_sacked = true;
 			}else{
-				if(iter->ssn != next_ssn){
-					// We have found a hole!
-					// Some segment in the middle was SACKed, but this one wasn't so this is a hole
-					return true;
+				if(found_non_sacked){
+					// This segment is SACKed but a segment before this was not SACKed so we have a hole
+					return true; // this stream has a hole
 				}
-			}
-			if(iter->segment != NULL){
-				// We update only if not SACKed
-				update_next_ssn(&next_ssn);
 			}
 		}
 		iter = iter->next;
 	}
 
-	if(first_ssn_found && next_ssn != tcb->next_ssn[sid]){
-		// There was some segment that was already transmitted and acked after the last one that we saw.
-		// This is still a hole!
-		return true;
-	}
-
-	return false;
+	return false; // this stream does not have a hole
 }
 
 void stream_holes_scheduler(int s){
