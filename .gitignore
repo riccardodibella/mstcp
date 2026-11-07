@@ -8,3 +8,4 @@ aggregate_test_*.csv
 last_port.txt
 website_folder/*
 venv
+annotated_*.*

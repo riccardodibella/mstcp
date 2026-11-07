@@ -282,7 +282,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define CONGCTRL_ST_CONG_AVOID 1
 #define CONGCTRL_ST_FAST_RECOV 2
 #define INIT_CGWIN 10 //in MSS
-#define INIT_THRESH 500000 //in MSS
+#define INIT_THRESH 1000000 //in MSS
 #define FAST_RETX_DUPACK_THRESH 3 // How many consecutive dupACKs trigger a transition to fast retransmit (defined to 3 in RFC 5681)
 
 /* STRUCT DEFINITIONS */
@@ -2503,68 +2503,57 @@ bool does_stream_have_hole(int s, int sid){
 
 void stream_holes_scheduler(int s){
 	if(s < 3 || s >= MAX_FD){
-		ERROR("unfair_congestion_scheduler invalid fd %d", s);
+		ERROR("stream_holes_scheduler invalid fd %d", s);
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	if(tcb == NULL){
-		ERROR("unfair_congestion_scheduler tcb NULL");
+		ERROR("stream_holes_scheduler tcb NULL");
 	}
 	const int max_payload_length = TCP_MSS - FIXED_OPTIONS_LENGTH;
-	uint8_t* temp_payload_buf = mymalloc(max_payload_length);
+	uint8_t temp_payload_buf[max_payload_length];
 
 
 	int sids_list[TOT_SID];
-	int sids_list_length = TOT_SID;
+	int sids_list_length = 0;
 	static int circular_start_sid = 0;
-	for(int i=0; i<sids_list_length; i++){
-		sids_list[i] = (circular_start_sid + i) % TOT_SID;
+
+	// Only insert opened streams in the list
+	for (int i = 0; i < TOT_SID; i++) {
+		int sid = (circular_start_sid + i) % TOT_SID;
+		if (tcb->stream_state[sid] == STREAM_STATE_OPENED) {
+			sids_list[sids_list_length] = sid;
+			sids_list_length++;
+		}
 	}
 	circular_start_sid = (circular_start_sid + 1) % TOT_SID;
 
-	// Remove streams with state != STREAM_STATE_OPENED
-	for(int i=0; i<sids_list_length; i++){
-		int sid = sids_list[i];
-		if(sid >= 0 && tcb->stream_state[sid] != STREAM_STATE_OPENED){
-			sids_list[i] = -1;
-		}
-	}
-	for(int i=0; i<sids_list_length; i++){
-		if(sids_list[i]<0){
-			// Move current element to position sids_list_length - 1
-			for(int j = i; j < sids_list_length-1; j++){
-				int tmp = sids_list[j+1];
-				sids_list[j+1]=sids_list[j];
-				sids_list[j] = tmp;
-			}
-
-			sids_list_length -= 1;
-			i--; // restarts the next iteration from the same point
-		}
-	}
-
 	// Move all the sids that have at least 1 hole to the end of the list
-	{
-		int no_hole_list_last = sids_list_length - 1;
-		for(int sid_list_i = 0; sid_list_i < no_hole_list_last; sid_list_i++){ // No need to iterate over the last element
-			int sid = sids_list[sid_list_i];
+	int temp_list[TOT_SID];
+	int without_holes_counter = 0;
+	int with_holes_counter = 0;
 
-			// Does this sid have a hole?
-			bool hole = does_stream_have_hole(s, sid);
+	for (int sid_list_i = 0; sid_list_i < sids_list_length; sid_list_i++) {
+		int sid = sids_list[sid_list_i];
 
-			if(hole){
-				// Move it at the end of the "no hole" list
-				for(int j = sid_list_i; j < no_hole_list_last; j++){
-					int tmp = sids_list[j+1];
-					sids_list[j+1]=sids_list[j];
-					sids_list[j] = tmp;
-				}
-				// Shorten the "no hole" list (the element placed at the end will now be outside the list)
-				no_hole_list_last--;
-
-				sid_list_i--; // In the next iteration we will look at what we have moved in this position
-			}
+		// Does this sid have a hole?
+		const bool hole = does_stream_have_hole(s, sid);
+		if (hole) {
+			temp_list[sids_list_length - 1 - with_holes_counter] = sid;  // Place hole streams from the back
+			with_holes_counter++;
+		} else {
+			temp_list[without_holes_counter] = sid; // Place normal streams from the front
+			without_holes_counter++;
 		}
 	}
+	if(without_holes_counter + with_holes_counter != sids_list_length){
+		ERROR("Error during holes reordering %d + %d != %d", without_holes_counter, with_holes_counter, sids_list_length);
+	}
+    for (int i = 0; i < without_holes_counter; i++) {
+        sids_list[i] = temp_list[i];
+    }
+    for (int i = 0; i < with_holes_counter; i++) {
+        sids_list[without_holes_counter + i] = temp_list[sids_list_length - 1 - i];
+    }
 
 
 
@@ -2592,6 +2581,7 @@ void stream_holes_scheduler(int s){
 				if(tx_cursor->segment != NULL){ // We ignore SACKed segments for Nagle on a stream
 					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
 						small_in_flight = true;
+						break;
 					}
 				}
 			}
@@ -2624,7 +2614,7 @@ void stream_holes_scheduler(int s){
 				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 			}else{
 				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = mymalloc(optlen);
+				uint8_t opt[sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS)];
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -2633,7 +2623,6 @@ void stream_holes_scheduler(int s){
 				update_next_ssn(&(tcb->next_ssn[sid]));
 
 				prepare_tcp(s, -1, ACK, temp_payload_buf, payload_length, opt, optlen);
-				myfree(opt);
 			}
 		}
 
@@ -2644,7 +2633,7 @@ void stream_holes_scheduler(int s){
 				}else{
 					// Enqueue LSS segment
 					int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-					uint8_t* opt = mymalloc(optlen);
+					uint8_t opt[sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS)];
 					memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 					
 					// Stream update
@@ -2652,18 +2641,15 @@ void stream_holes_scheduler(int s){
 					opt[3] = (tcb->next_ssn[sid])&0xFF;
 					update_next_ssn(&(tcb->next_ssn[sid]));
 
-					uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
+					uint8_t dummy_payload[1] = {0}; // value doesn't matter
 
 					prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-					myfree(dummy_payload);
-					myfree(opt);
 				}
 
 				tcb->write_side_close_state[sid] = WR_CLOSE_ST_LSS_TXED;
 			}
 		}
 	}
-	myfree(temp_payload_buf);
 }
 
 
@@ -2912,11 +2898,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 
 			// send SYN without MS option
-			uint8_t* opt_ptr = NULL;
-			int opt_len;
-
-			opt_len = 19;
-			opt_ptr = mymalloc(opt_len);
+			const int opt_len = 19;
+			uint8_t opt_ptr[19];
 
 			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 			opt_ptr[1] = 4; // MSS Length
@@ -2940,7 +2923,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
-			myfree(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
 			
@@ -3105,11 +3087,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 
 			// send SYN with MS option
-			uint8_t* opt_ptr = NULL;
-			int opt_len;
-
-			opt_len = 23;
-			opt_ptr = mymalloc(opt_len);
+			const int opt_len = 23;
+			uint8_t opt_ptr[23];
 
 			opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 			opt_ptr[1] = 4; // MSS Length
@@ -3137,7 +3116,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 			hs_time_start = get_timestamp_ms();
 			prepare_tcp(s, -1, SYN,NULL,0,opt_ptr,opt_len);
-			myfree(opt_ptr);
 
 			tcb->st = TCB_ST_SYN_SENT;
 
@@ -3444,11 +3422,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->st = TCB_ST_SYN_RECEIVED; // state of the TCB in the backlog. The listening socket TCB remains in state LISTEN
 
 
-				uint8_t* opt_ptr = NULL;
 				int opt_len;
+				uint8_t opt_ptr[23];
 				if(tcb->ms_option_enabled){
 					opt_len = 23;
-					opt_ptr = mymalloc(opt_len);
 
 					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 					opt_ptr[1] = 4; // MSS Length
@@ -3477,7 +3454,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->next_rx_ssn[0] = 1; // SSN 0 was received in the SYN
 				}else{
 					opt_len = 19;
-					opt_ptr = mymalloc(opt_len);
 
 					opt_ptr[0] = OPT_KIND_MSS; // MSS Kind
 					opt_ptr[1] = 4; // MSS Length
@@ -3503,7 +3479,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				assert_handler_lock_acquired("SYN|ACK");
 				//ERROR("Non va bene! Il segmento va aggiunto alla coda del TCB nella backlog, non a quello in stato LISTEN");
 				prepare_tcp(s, cursor_index, SYN|ACK, NULL, 0, opt_ptr, opt_len);
-				myfree(opt_ptr);
 			}
 			break;
 		case TCB_ST_ESTABLISHED:
@@ -3513,8 +3488,8 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			}else if(event == FSM_EVENT_STREAM_TIMEOUT){
 				int sid = fdinfo[s].sid;
 				int ssn = fdinfo[s].tcb->next_ssn[sid];
-				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = mymalloc(optlen);
+				const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+				uint8_t opt[optlen];
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -3523,12 +3498,10 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				update_next_ssn(&(fdinfo[s].tcb->next_ssn[sid]));
 
-				uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
+				uint8_t dummy_payload[1] = {0}; // value doesn't matter
 
 				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
 
-				myfree(dummy_payload);
-				myfree(opt);
 				break;
 			} else if(event == FSM_EVENT_PKT_RCV){
 				int sid = 0;
@@ -3719,7 +3692,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				// Free the TCB itself
 				myfree(tcb);
 
-				DEBUG("Connection closed, resources freed");
+				DEBUG("TCB_ST_TIME_WAIT TIMEOUT: connection closed, resources freed");
 			}
 			break;
 		default:
@@ -3812,7 +3785,7 @@ int mylisten(int s, int bl){
 		myerrno=EBADF; 
 		return -1;
 	}
-	fdinfo[s].tcb = (struct tcpctrlblk *) mymalloc (sizeof(struct tcpctrlblk));
+	fdinfo[s].tcb = (struct tcpctrlblk *) mymalloc(sizeof(struct tcpctrlblk));
 	bzero(fdinfo[s].tcb,sizeof(struct tcpctrlblk));
 	fdinfo[s].st = FDINFO_ST_TCB_CREATED;
 	fdinfo[s].tcb->st = TCB_ST_LISTEN;
@@ -4150,8 +4123,8 @@ int myread(int s, unsigned char *buffer, int maxlen){
 			fast_send_tcp(s, -1, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 		}else{
 			if(is_dmp_ack_needed(tcb, sid)){
-				int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-				uint8_t* opt = mymalloc(optlen);
+				const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+				uint8_t opt[optlen];
 				memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 				
 				// Stream update
@@ -4159,11 +4132,9 @@ int myread(int s, unsigned char *buffer, int maxlen){
 				opt[3] = (tcb->next_ssn[sid])&0xFF;
 				update_next_ssn(&(tcb->next_ssn[sid]));
 
-				uint8_t* dummy_payload = mymalloc(1); // value doesn't matter
+				uint8_t dummy_payload[1] = {0}; // value doesn't matter
 
 				prepare_tcp(s, -1, ACK | DMP, dummy_payload, 1, opt, optlen);
-				myfree(dummy_payload);
-				myfree(opt);
 			}
 		}
 	}else{
@@ -4910,8 +4881,8 @@ void myio(int ignored){
 								out_dmp_counter++;
 								// Allocate a new SSN and send an ACK on the stream with the DMP flag
 
-								int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-								uint8_t* opt = mymalloc(optlen);
+								const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+								uint8_t opt[optlen];
 								memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
 								
 								// Stream update
@@ -4919,11 +4890,9 @@ void myio(int ignored){
 								opt[3] = (tcb->next_ssn[sid])&0xFF;
 								update_next_ssn(&(tcb->next_ssn[sid]));
 
-								uint8_t* dummy_payload_ptr = mymalloc(1); // value doesn't matter
+								uint8_t dummy_payload[1] = {0}; // value doesn't matter
 
-								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload_ptr, 1, opt, optlen);
-								myfree(dummy_payload_ptr);
-								myfree(opt);
+								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
 							}
 						}
 						else{
