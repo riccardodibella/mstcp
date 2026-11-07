@@ -6,3 +6,4 @@ sudo iptables -A OUTPUT -p udp --dport 19000:19999 -j DROP
 # disable segmentation offloading 
 # https://www.ibm.com/docs/en/linux-on-systems?topic=offload-tcp-segmentation
 sudo ethtool -K eth0 tx off sg off tso off
+sudo ethtool -K lo tx off sg off tso off

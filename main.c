@@ -139,14 +139,19 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define MYCONNECT_MODE_NON_BLOCKING 2
 
 #ifdef LOCAL_SERVER
+#define INTERFACE_NAME "lo" // load_ifconfig
+
 #define SERVER_IP_STR "127.0.0.1"
+#define MAIN_LOOP_NANOSLEEP false
 #else
+#define INTERFACE_NAME "eth0" // load_ifconfig
+
 //#define SERVER_IP_STR "88.80.187.84"
 //#define SERVER_IP_STR "172.104.237.69"
 #define SERVER_IP_STR "178.79.147.254"
+#define MAIN_LOOP_NANOSLEEP false
 #endif
 
-#define INTERFACE_NAME "eth0" // load_ifconfig
 #define TIMER_USECS 500
 //#define TIMER_USECS 5000
 #define MAX_ARP 200 // number of lines in the ARP cache
@@ -1423,12 +1428,18 @@ int search_mac_cache(uint8_t* ip){
 	return -1;
 }
 void resolve_gateway_mac(){
+	#ifndef LOCAL_SERVER
 	resolve_gateway_mac_requested = true;
 	while(search_mac_cache(gateway) < 0){
 		pause();
 	}
+	#endif
 }
 int resolve_mac(unsigned int destip, unsigned char * destmac){
+	#ifdef LOCAL_SERVER
+	memset(destmac, 0, 6);
+	return 0;
+	#endif
 	int len,n,i;
 	struct sockaddr_ll sll;
 	clock_t start;
@@ -4165,7 +4176,6 @@ int myread(int s, unsigned char *buffer, int maxlen){
 
 int myclose(int s){
 	int sid = fdinfo[s].sid;
-	//DEBUG("myclose sid %d", sid);
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
 	disable_signal_reception(false);
 	if(tcb->write_side_close_state[sid] > WR_CLOSE_ST_OPEN){
@@ -4379,11 +4389,17 @@ void myio(int ignored){
 
 	struct ack_generation_queue requested_acks_queue = {.head = NULL};
 
+	struct sockaddr_ll from;
+	socklen_t from_len = sizeof(from);
+
 	int received_packet_size; // mytcp: size
-	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0,NULL,NULL))>=0){
+	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0, (struct sockaddr *)&from, &from_len))>=0){
 		if(received_packet_size < 0){
 			perror("recvfrom");
 			ERROR("recvfrom errno %d", errno);
+		}
+		if (from.sll_pkttype == PACKET_OUTGOING) {
+			continue;
 		}
 		if(received_packet_size < sizeof(struct ethernet_frame)){
 			DEBUG("low received_packet_size %d < %lu", received_packet_size, sizeof(struct ethernet_frame));
@@ -4480,7 +4496,7 @@ void myio(int ignored){
 			int payload_length = htons(ip->totlen) - (ip->ver_ihl&0xF)*4 - (tcp->d_offs_res>>4)*4;
 			bool fin = tcp->flags & FIN;
 
-			int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment
+			int acked_size = 0; // Number of (non-DMP) bytes acknowledged by the incoming segment, used by congestion_control_fsm for ABC cgwin increase
 
 			if(tcb->txfirst !=NULL){
 				// Removal from TX queue for the cumulative ACK
@@ -4504,23 +4520,18 @@ void myio(int ignored){
 					while((tcb->txfirst!=NULL) && ((htonl(tcp->ack)-shifter) >= (tcb->txfirst->seq - shifter + tcb->txfirst->payloadlen + (tcb->txfirst->fin ? 1 : 0)))){ //Ack>=Seq+payloadlen
 						struct txcontrolbuf * temp = tcb->txfirst;
 						tcb->txfirst = tcb->txfirst->next;
-						
-						/* 
-						14/01/2025 Ho tolto la modifica di txfree da questo punto perchè lo spazio nel buffer di trasmissione viene liberato quando i dati
-						vengono consumati per creare i segmenti da trasmettere (secondo quanto deciso dallo scheduler, per MS-TCP), quindi una volta che sono
-						nella coda di trasmissione non occupano più spazio nel TX buffer e quindi non devono avere nessun impatto su txfree
-						// fdinfo[i].tcb->txfree[fdinfo[i].sid]+=temp->payloadlen;
-						*/
 
 						// RTT calculation removed
 
 						if(!temp->dummy_payload && temp->payloadlen > 0){
-							fdinfo[i].tcb->flightsize-=temp->payloadlen;
-							acked_size += temp->payloadlen;
+							if(temp->segment != NULL){
+								fdinfo[i].tcb->flightsize-=temp->payloadlen;
 
-							int sid = temp->sid;
-							if(!tcb->ms_option_enabled){
-								sid = 0;
+								/* 
+								It is not clear (to me) if cgwin should be increased only for non-SACKed segments or for all segments cumulatively acked... 
+								Since with a SACK we are most likely in some congestion event it seems more prudent to ignore SACKed segments for acked_size, but I'm not really sure about this
+								*/
+								acked_size += temp->payloadlen;
 							}
 						}
 
@@ -5596,7 +5607,9 @@ void main_client_app(){
 			//DEBUG(data);
 			break;
 		}
-		//nanosleep(&short_sleep, NULL); 
+		if(MAIN_LOOP_NANOSLEEP){
+			nanosleep(&short_sleep, NULL);
+		}
 	}
 	safe_myfree(data);
 
@@ -5667,6 +5680,7 @@ void main_client_app(){
 		}
 		client_sockets[i] = s;
 	}
+	DEBUG("all sockets created");
 
 	while(true){
 
@@ -5678,6 +5692,7 @@ void main_client_app(){
 			}
 		}
 		if(all_stopped){
+			DEBUG("all clients stopped");
 			break;
 		}
 		
@@ -5738,7 +5753,7 @@ void main_client_app(){
 				if(res < 0){
 					if(myerrno == EAGAIN){
 						myerrno = 0;
-						return;
+						continue;
 					}else{
 						myperror("mywrite");
 						ERROR("mywrite error");
@@ -5806,7 +5821,7 @@ void main_client_app(){
 				if(ret == -1 && myerrno == EAGAIN){
 					myerrno = 0;
 					continue;
-				}
+				}	
 				cur_bytes[i] += ret;
 				dl_bytes[i] += ret;
 
@@ -5834,7 +5849,9 @@ void main_client_app(){
 				}
 			}
 		}
-		//nanosleep(&short_sleep, NULL);
+		if(MAIN_LOOP_NANOSLEEP){
+			nanosleep(&short_sleep, NULL);
+		}
 	}
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
@@ -6206,10 +6223,14 @@ void full_duplex_server_app(int listening_socket){
 					goto single_app_return;
 				}
 				if(n == 0){
-					//DEBUG("received close from client %d", i);
+					DEBUG("received close from client %d", i);
 					myclose(clients[i].s);
 					clients[i].srv_st = SERVER_ST_STOPPED;
 					goto single_app_return;
+				}
+				if(n < 0){
+					myperror("myread");
+					ERROR("full_duplex_server_app myread failed for unexpected reasons");
 				}
 				strend += n;
 				*strend= '\0';
@@ -6335,8 +6356,8 @@ void full_duplex_server_app(int listening_socket){
 				for(int cur2 = cur+1; cur2 < num_clients; cur2++){
 					clients[cur2-1] = clients[cur2];
 				}
-				DEBUG("num_clients=%d", num_clients);
 				num_clients--;
+				DEBUG("num_clients=%d", num_clients);
 				if(num_clients == 0){
 					clients = NULL;
 				}else{
@@ -6346,7 +6367,9 @@ void full_duplex_server_app(int listening_socket){
 				cur++;
 			}
 		}
-		//nanosleep(&short_sleep, NULL); 
+		if(MAIN_LOOP_NANOSLEEP){
+			nanosleep(&short_sleep, NULL);
+		}
 	}
 	DEBUG("SERVER - ALL STOPPED");
 	DEBUG("wait...");
