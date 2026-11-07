@@ -415,6 +415,7 @@ struct tcpctrlblk{
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 	struct stream_rx_queue_node* stream_rx_queue[TOT_SID]; // Contains only in-order segments for each stream, ready to be consumed by myread()
 	struct stream_rx_queue_node* stream_rx_queue_tail[TOT_SID];
+	unsigned int requested_acks[TOT_SID];
 
 	// "write" direction
 	int write_side_close_state[TOT_SID]; // WR_CLOSE_ST_OPEN / LSS_REQUESTED / LSS_TXED / LSS_ACKED
@@ -2888,6 +2889,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->requested_acks[i] = 0;
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
@@ -2981,6 +2983,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
 							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
 							fdinfo[s].tcb->scheduler_tokens[stream] = fdinfo[s].tcb->init_radwin;
+							fdinfo[s].tcb->requested_acks[stream] = 0;
 							fdinfo[s].tcb->txfree[stream] = TX_BUFFER_SIZE;
 							fdinfo[s].tcb->tx_buffer_occupied_region_start[stream] = fdinfo[s].tcb->tx_buffer_occupied_region_end[stream] = 0;
 							if(fdinfo[s].tcb->stream_tx_buffer[stream] != NULL){
@@ -3080,6 +3083,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
+				tcb->requested_acks[i] = 0;
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 				tcb->next_ssn[i] = 0;
@@ -3225,6 +3229,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
 					tcb->init_radwin = tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+					tcb->requested_acks[0] = 0;
 					tcb->txfree[0] = TX_BUFFER_SIZE;
 					tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 					if(tcb->stream_tx_buffer[0] != NULL){
@@ -3296,6 +3301,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = NULL;
 						//tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
 						tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+						tcb->requested_acks[0] = 0;
 						tcb->txfree[0] = TX_BUFFER_SIZE;
 						tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 						tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
@@ -3308,6 +3314,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 							tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
 							tcb->scheduler_tokens[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
+							tcb->requested_acks[i] = 0;
 							tcb->txfree[i] = 0;
 							tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 							tcb->next_ssn[i] = 0;
@@ -3521,6 +3528,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
 							tcb->scheduler_tokens[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
+							tcb->requested_acks[sid] = 0;
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -4879,23 +4887,7 @@ void myio(int ignored){
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload && in_order_for_channel){
-							if(is_dmp_ack_needed(tcb, sid)){
-								out_dmp_counter++;
-								// Allocate a new SSN and send an ACK on the stream with the DMP flag
-
-								const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-								uint8_t opt[optlen];
-								memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-								
-								// Stream update
-								opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
-								opt[3] = (tcb->next_ssn[sid])&0xFF;
-								update_next_ssn(&(tcb->next_ssn[sid]));
-
-								uint8_t dummy_payload[1] = {0}; // value doesn't matter
-
-								prepare_tcp(i, backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
-							}
+							tcb->requested_acks[sid]++;
 						}
 						else{
 							if(!in_order_for_channel){
@@ -4971,7 +4963,7 @@ void myio(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		DEBUG("myio %ld us\tt %d h %d in_p %d in_d %d r_ack %d out_ack %d out_dmp %d sched %.0f", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter, scheduler_tot_time_ns/1000.0);
+		//DEBUG("myio %ld us\tt %d h %d in_p %d in_d %d r_ack %d out_ack %d out_dmp %d sched %.0f", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter, scheduler_tot_time_ns/1000.0);
 	}
 
 	check_rx_buffer_drops("myio_end");
@@ -5009,6 +5001,7 @@ void mytimer(int ignored){
 
 		int fdinfo_backlog_length = fdinfo[i].backlog_length;
 		for(int backlog_index = 0; backlog_index <= fdinfo_backlog_length; backlog_index++){
+			int prepare_tcp_backlog_index = backlog_index;
 		
 			struct tcpctrlblk* tcb;
 			int fd_sid;
@@ -5017,6 +5010,7 @@ void mytimer(int ignored){
 				// The last iteration is for the "main" TCB
 				tcb = fdinfo[i].tcb;
 				fd_sid = fdinfo[i].sid;
+				prepare_tcp_backlog_index = -1;
 			}else{
 				tcb = &(fdinfo[i].channel_backlog[backlog_index]);
 				fd_sid = 0; // fd_sid is valid only if tcb->st != 0
@@ -5040,6 +5034,7 @@ void mytimer(int ignored){
 			struct txcontrolbuf* txcb = tcb->txfirst;
 			struct txcontrolbuf* prev = NULL;
 			int acc = 0; // payload bytes accumulator
+			bool something_sent_now[TOT_SID] = {false};
 			while(txcb != NULL && (acc < tcb->cgwin+tcb->lta || txcb->payloadlen == 0 || txcb->dummy_payload)){
 				// Karn invalidation not handled
 				if(txcb->retry == 0){
@@ -5095,6 +5090,9 @@ void mytimer(int ignored){
 				}
 				txcb->retry++;
 				txcb->txtime = tick;
+				if(txcb->sid >= 0){
+					something_sent_now[txcb->sid] = true;
+				}
 
 				clock_gettime(CLOCK_REALTIME, &t0);
 				update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
@@ -5116,8 +5114,67 @@ void mytimer(int ignored){
 				prev = txcb;
 				txcb = txcb->next;
 			}
+			if(txcb == NULL){
+				/* ACTUALLY we could just send a normal ack, and generate DMPs only in myread */
 
 
+				// we arrived at the end, so we can transmit DMP segments
+				bool something_added = false;
+				for(int sid = 0; sid<TOT_SID; sid++){
+					if(tcb->requested_acks[sid] > 0){
+						if(!something_sent_now[sid]){
+							const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
+							uint8_t opt[optlen];
+							memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
+							
+							// Stream update
+							opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
+							opt[3] = (tcb->next_ssn[sid])&0xFF;
+							update_next_ssn(&(tcb->next_ssn[sid]));
+
+							uint8_t dummy_payload[1] = {0}; // value doesn't matter
+
+							prepare_tcp(i, prepare_tcp_backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
+							something_added = true;
+						}
+						tcb->requested_acks[sid] = 0;
+					}
+				}
+				if(something_added){
+					while(txcb!=NULL){
+						if(!txcb->dummy_payload || txcb->retry != 0){
+							ERROR("Something went wrong with requested_acks processing");
+						}
+						txcb->retry++;
+						txcb->txtime = tick;
+
+						clock_gettime(CLOCK_REALTIME, &t0);
+						update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
+						clock_gettime(CLOCK_REALTIME, &t1);
+						update_tcp_header_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
+						if(txcb->seq >= tcb->highest_sent_sequence_number){
+							tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen + (txcb->fin?1:0);
+						}
+						clock_gettime(CLOCK_REALTIME, &t0);
+						send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
+						clock_gettime(CLOCK_REALTIME, &t1);
+						send_ip_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
+						sendto_ns += sendto_call_time;
+						eim_ns += eim_time;
+						out_packet_counter++;
+						out_bytes_counter += txcb->totlen;
+
+						acc += txcb->payloadlen;
+						prev = txcb;
+						txcb = txcb->next;
+					}
+				}
+			}else{
+				// we cannot transmit acks now, so we might as well ignore them completely...
+				for(int sid = 0; sid<TOT_SID; sid++){
+					tcb->requested_acks[sid] = 0;
+				}
+			}
 		}
 	}
 
