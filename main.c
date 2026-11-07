@@ -206,6 +206,7 @@ const int DROP_TARGET_STREAMS[] = {1, 5};
 #define FIXED_OPTIONS_LENGTH 40
 #define MAX_SEGMENT_PAYLOAD (TCP_MSS - FIXED_OPTIONS_LENGTH) // 1420, may be used for congestion control
 
+#define MIN_FD 3 // fds 0, 1 and 2 are left empty
 
 // SID = Stream ID
 #define SID_UNASSIGNED -1
@@ -2467,7 +2468,7 @@ struct stream_rx_queue_node* create_stream_rx_queue_node(struct channel_rx_queue
 
 
 bool does_stream_have_hole(int s, int sid){
-	if(s < 3 || s >= MAX_FD){
+	if(s < MIN_FD || s >= MAX_FD){
 		ERROR("does_stream_have_hole invalid fd %d", s);
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
@@ -2502,7 +2503,7 @@ bool does_stream_have_hole(int s, int sid){
 }
 
 void stream_holes_scheduler(int s){
-	if(s < 3 || s >= MAX_FD){
+	if(s < MIN_FD || s >= MAX_FD){
 		ERROR("stream_holes_scheduler invalid fd %d", s);
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
@@ -2556,8 +2557,6 @@ void stream_holes_scheduler(int s){
     }
 
 
-
-
 	for(int sid_list_i = 0; sid_list_i < sids_list_length; sid_list_i++){
 		int sid = sids_list[sid_list_i];
 
@@ -2565,31 +2564,36 @@ void stream_holes_scheduler(int s){
 		int available_bytes = TX_BUFFER_SIZE-tcb->txfree[sid];
 
 		int cong_control_allowed_bytes = MAX(tcb->cgwin+tcb->lta - tcb->flightsize, 0);
-		if((available_bytes == 0 || cong_control_allowed_bytes == 0) && tcb->write_side_close_state[sid] != WR_CLOSE_ST_LSS_REQUESTED){
+
+		int flow_control_allowed_bytes = tcb->scheduler_tokens[sid];
+
+		if((available_bytes == 0 || cong_control_allowed_bytes == 0 || flow_control_allowed_bytes == 0) && tcb->write_side_close_state[sid] != WR_CLOSE_ST_LSS_REQUESTED){
 			// We can do nothing for this stream
 			// we cannot send data, and we cannot enqueue the LSS(/FIN), so we skip it
 			continue;
 		}
 
-		int flow_control_allowed_bytes = tcb->scheduler_tokens[sid];
-
-		// Nagle check
-		bool small_in_flight = false;
-		struct txcontrolbuf* tx_cursor = tcb->txfirst;
-		while(tx_cursor != NULL){
-			if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
-				if(tx_cursor->segment != NULL){ // We ignore SACKed segments for Nagle on a stream
-					if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
-						small_in_flight = true;
-						break;
-					}
-				}
-			}
-			tx_cursor = tx_cursor->next;
-		}
-
 		LOG_SCHEDULER_BYTES(sid, available_bytes, flow_control_allowed_bytes, cong_control_allowed_bytes);
 		int current_transfer_bytes = MIN(available_bytes, MIN(cong_control_allowed_bytes, flow_control_allowed_bytes));
+
+		bool small_in_flight = false;
+		if(current_transfer_bytes > 0){
+			// Nagle check
+			struct txcontrolbuf* tx_cursor = tcb->txfirst;
+			while(tx_cursor != NULL){
+				if(tx_cursor->sid == sid && !(tx_cursor->dummy_payload)){
+					if(tx_cursor->segment != NULL){ // We ignore SACKed segments for Nagle on a stream
+						if(tx_cursor->payloadlen > 0 && tx_cursor->payloadlen != max_payload_length){
+							small_in_flight = true;
+							break;
+						}
+					}
+				}
+				tx_cursor = tx_cursor->next;
+			}
+		}
+
+
 		
 
 		while(current_transfer_bytes > 0){
@@ -2680,7 +2684,7 @@ bool is_dmp_ack_needed(struct tcpctrlblk* tcb, int sid){
 
 bool port_in_use(unsigned short port){
 	int s;
-	for (s=3; s<MAX_FD; s++){
+	for (s=MIN_FD; s<MAX_FD; s++){
 		if(fdinfo[s].st != FDINFO_ST_FREE && fdinfo[s].st != FDINFO_ST_UNBOUND){
 			if(fdinfo[s].l_port == htons(port)){
 				return true;
@@ -2750,7 +2754,7 @@ int mybind(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EINVAL;
 		return -1;
 	}
-	if(s < 3 || s >= MAX_FD){
+	if(s < MIN_FD || s >= MAX_FD){
 		myerrno = EBADF; 
 		return -1;
 	}
@@ -2780,7 +2784,7 @@ int mysocket(int family, int type, int proto){
 		myerrno = EINVAL; 
 		return -1;
 	}
-	for(i=3; i<MAX_FD && fdinfo[i].st!=FDINFO_ST_FREE;i++){}
+	for(i=MIN_FD; i<MAX_FD && fdinfo[i].st!=FDINFO_ST_FREE;i++){}
 	if(i==MAX_FD) {
 		myerrno = ENFILE; 
 		return -1;
@@ -2804,7 +2808,7 @@ int64_t hs_time_tot = 0;
 
 int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_open_remote_addr){
 	assert_handler_lock_acquired("fsm");
-	if(s < 3 || s >= MAX_FD){
+	if(s < MIN_FD || s >= MAX_FD){
 		ERROR("FSM invalid s %d", s);
 	}
 	if(event == FSM_EVENT_APP_ACTIVE_OPEN){
@@ -3668,7 +3672,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 
 				// Passive side: check that there is nothing in the ready backlog for the current tcb
 				if(!tcb->is_active_side){
-					if(tcb->listening_fd < 3 || tcb->listening_fd >= MAX_FD){
+					if(tcb->listening_fd < MIN_FD || tcb->listening_fd >= MAX_FD){
 						ERROR("invalid tcb->listening_fd during TCB_ST_TIME_WAIT cleanup");
 					}
 					struct stream_backlog_node* prev = &(fdinfo[tcb->listening_fd].stream_backlog_head);
@@ -3682,7 +3686,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				}
 
 				// Release every fd that shares this TCB
-				for(int f = 3; f < MAX_FD; f++){
+				for(int f = MIN_FD; f < MAX_FD; f++){
 					if(fdinfo[f].st == FDINFO_ST_TCB_CREATED && fdinfo[f].tcb == tcb){
 						bzero(&fdinfo[f], sizeof(struct socket_info)); // st = FDINFO_ST_FREE (0)
 						fdinfo[f].st=FDINFO_ST_FREE;
@@ -3709,7 +3713,7 @@ int myconnect(int s, struct sockaddr * addr, int addrlen){
 		myerrno = EINVAL; 
 		return -1;
 	}
-	if ( s < 3 || s >= MAX_FD){
+	if ( s < MIN_FD || s >= MAX_FD){
 		myerrno = EBADF; 
 		return -1;
 	}
@@ -3848,7 +3852,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 
 		// At this point we are sure that there is something that can be returned
 		int free_fd; // mytcp: j
-		for(free_fd=3; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for myfree fd
+		for(free_fd=MIN_FD; free_fd<MAX_FD && fdinfo[free_fd].st!=FDINFO_ST_FREE; free_fd++); // Searching for myfree fd
 		if(free_fd == MAX_FD){
 			myerrno=ENFILE; 
 			enable_signal_reception(false);
@@ -4208,7 +4212,7 @@ bool all_streams_unused(struct tcpctrlblk* tcb){
 }
 
 void stream_close_handler(int s, int sid){
-	if(s < 3 || s > MAX_FD){
+	if(s < MIN_FD || s > MAX_FD){
 		ERROR("stream_close_handler invalid fd %d", s);
 	}
 	struct tcpctrlblk* tcb = fdinfo[s].tcb;
@@ -4334,6 +4338,7 @@ void myio(int ignored){
 	int dmp_counter = 0;
 	int payload_counter = 0;
 	int out_dmp_counter = 0;
+	long scheduler_tot_time_ns = 0;
 
 	disable_signal_reception(true);
 	struct timespec start, end;
@@ -4365,10 +4370,6 @@ void myio(int ignored){
 
 	int received_packet_size; // mytcp: size
 	while((received_packet_size = recvfrom(unique_raw_socket_fd,l2_rx_buf,L2_RX_BUF_SIZE,0, (struct sockaddr *)&from, &from_len))>=0){
-		if(received_packet_size < 0){
-			perror("recvfrom");
-			ERROR("recvfrom errno %d", errno);
-		}
 		if (from.sll_pkttype == PACKET_OUTGOING) {
 			continue;
 		}
@@ -4377,8 +4378,6 @@ void myio(int ignored){
 			continue;
 		}
 		total_counter++;
-		struct timespec start2, end2;
-		clock_gettime(CLOCK_REALTIME, &start2);
 		struct ethernet_frame* eth=(struct ethernet_frame *)l2_rx_buf;
 		if(eth->type == htons(0x0806)){
 			// ARP
@@ -4399,6 +4398,9 @@ void myio(int ignored){
 		}else if(eth->type == htons(0x0800)){
 			// IP
 			struct ip_datagram * ip = (struct ip_datagram *) eth->payload;
+			if(memcmp(&ip->dstaddr, myip, 4) != 0){ // Ignore packets not addressed to us
+				continue;
+			}
 			if(ip->proto != TCP_PROTO){
 				continue;
 			}
@@ -4407,7 +4409,7 @@ void myio(int ignored){
 			struct tcp_segment * tcp = (struct tcp_segment *) ((char*)ip + (ip->ver_ihl&0x0F)*4);
 
 			int i;
-			for(i=0;i<MAX_FD;i++){
+			for(i=MIN_FD;i<MAX_FD;i++){
 				if((fdinfo[i].st == FDINFO_ST_TCB_CREATED) && (tcp->d_port == fdinfo[i].l_port) && (tcp->s_port == fdinfo[i].tcb->r_port) && (ip->srcaddr == fdinfo[i].tcb->r_addr)){
 					break;
 				}
@@ -4420,7 +4422,7 @@ void myio(int ignored){
 				}
 			}
 			if(i == MAX_FD){
-				for(i=0;i<MAX_FD;i++){
+				for(i=MIN_FD;i<MAX_FD;i++){
 					if( (fdinfo[i].st == FDINFO_ST_TCB_CREATED) &&(fdinfo[i].tcb->st == TCB_ST_LISTEN) && (tcp->d_port == fdinfo[i].l_port) ){
 						break;
 					}
@@ -4937,15 +4939,17 @@ void myio(int ignored){
 				tcb->ts_recent = segment_ts_val;
 			}
 
+			struct timespec start_scheduler, end_scheduler;
+			clock_gettime(CLOCK_REALTIME, &start_scheduler);
 			scheduler(i);
+			clock_gettime(CLOCK_REALTIME, &end_scheduler);
+			long scheduler_duration_ns = (end_scheduler.tv_sec - start_scheduler.tv_sec) * 1000000000L + (end_scheduler.tv_nsec - start_scheduler.tv_nsec);
+			scheduler_tot_time_ns += scheduler_duration_ns;
 		}
 
 
 
-		clock_gettime(CLOCK_REALTIME, &end2);
-		long duration_ns = (end2.tv_sec - start2.tv_sec) * 1000000000L + (end2.tv_nsec - start2.tv_nsec);
-		long duration_us = duration_ns / 1000;
-		//printf("pkt %ld us                                                \r", duration_us);
+		
 	}//packet reception while end
 
 	// Generation of enqueued fast ACKs
@@ -4967,7 +4971,7 @@ void myio(int ignored){
 	long duration_ns = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
 	long duration_us = duration_ns / 1000;
 	if(duration_us > TIMER_USECS){
-		//DEBUG("myio %ld us\tt %d h %d in_pay %d in_dmp %d req_ack %d out_ack %d out_dmp %d", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter);
+		DEBUG("myio %ld us\tt %d h %d in_p %d in_d %d r_ack %d out_ack %d out_dmp %d sched %.0f", duration_us, total_counter, handled_counter, payload_counter, dmp_counter, req_ack_counter, out_ack_counter, out_dmp_counter, scheduler_tot_time_ns/1000.0);
 	}
 
 	check_rx_buffer_drops("myio_end");
