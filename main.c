@@ -415,7 +415,6 @@ struct tcpctrlblk{
 	unsigned int stream_fsm_timer[TOT_SID]; // used for stream opening timeout; has to be set to 0 if a packet is sent on that stream
 	struct stream_rx_queue_node* stream_rx_queue[TOT_SID]; // Contains only in-order segments for each stream, ready to be consumed by myread()
 	struct stream_rx_queue_node* stream_rx_queue_tail[TOT_SID];
-	unsigned int requested_acks[TOT_SID];
 
 	// "write" direction
 	int write_side_close_state[TOT_SID]; // WR_CLOSE_ST_OPEN / LSS_REQUESTED / LSS_TXED / LSS_ACKED
@@ -449,6 +448,7 @@ struct tcpctrlblk{
 	unsigned int stream_end; // Channel property (bad name) - unused
 	uint64_t fsm_timer; // Channel property
 	uint32_t init_radwin; // Used in MS-TCP as a default value for radwin of new streams
+	unsigned int requested_acks;
 
 	bool is_active_side; // Channel property
 	int listening_fd; // If it is a passive TCB, this is the fd of the listening socket where streams have to be inserted
@@ -2012,17 +2012,18 @@ void update_tcp_header(int s /* main TCB file descriptor */, int backlog_entry_i
 // Same signature as prepare_tcp but without the payload
 void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/, uint8_t* options, int optlen){
 	assert_handler_lock_acquired("fast_send_tcp");
+	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 
 	if(backlog_entry_index != -1){
-		ERROR("fast_send_tcp not implemented for backlog_entry_index >= 0"); // TODO
-
-		// This should be easy to handle, following what is done in prepare_tcp. This should happen with MS-TCP disabled
+		if(tcb->st != TCB_ST_LISTEN){
+			ERROR("fast_send_tcp backlog_entry_index %d >= 0 with main TCB state not listen", backlog_entry_index);
+		}
+		tcb = &(fdinfo[s].channel_backlog[backlog_entry_index]);
 	}
 
-	struct tcpctrlblk*tcb = fdinfo[s].tcb;
 	//struct txcontrolbuf * txcb = (struct txcontrolbuf*) mymalloc(sizeof( struct txcontrolbuf));
 	if(fdinfo[s].l_port == 0 || tcb->r_port == 0){
-		ERROR("prepare_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
+		ERROR("fast_send_tcp invalid port l %u r %u\n", htons(fdinfo[s].l_port), htons(tcb->r_port));
 	}
 
 	/*
@@ -2872,6 +2873,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
 
 			tcb->unack = tcb->unack_tail = NULL;
+			tcb->requested_acks = 0;
 
 			// Initialization of stream-specific fields
 			for(int i=0; i<TOT_SID; i++){
@@ -2889,7 +2891,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_state[i] = STREAM_STATE_UNUSED;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
-				tcb->requested_acks[i] = 0;
 				tcb->stream_tx_buffer[i] = NULL;
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
@@ -2983,7 +2984,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							fdinfo[s].l_port = fdinfo[other_s].l_port;
 							fdinfo[s].tcb->stream_state[stream] = STREAM_STATE_OPENED;
 							fdinfo[s].tcb->scheduler_tokens[stream] = fdinfo[s].tcb->init_radwin;
-							fdinfo[s].tcb->requested_acks[stream] = 0;
 							fdinfo[s].tcb->txfree[stream] = TX_BUFFER_SIZE;
 							fdinfo[s].tcb->tx_buffer_occupied_region_start[stream] = fdinfo[s].tcb->tx_buffer_occupied_region_end[stream] = 0;
 							if(fdinfo[s].tcb->stream_tx_buffer[stream] != NULL){
@@ -3065,6 +3065,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			tcb->r_addr = active_open_remote_addr->sin_addr.s_addr;
 
 			tcb->unack = tcb->unack_tail = NULL;
+			tcb->requested_acks = 0;
 
 			// Initialization of stream-specific fields
 			for(int i=0; i<TOT_SID; i++){
@@ -3083,7 +3084,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 				tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 				tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX Buffer Size
 				tcb->scheduler_tokens[i] = 0; // This will be initialized with the reception of the SYN+ACK
-				tcb->requested_acks[i] = 0;
 				tcb->txfree[i] = 0;
 				tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 				tcb->next_ssn[i] = 0;
@@ -3229,7 +3229,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 					tcb->stream_state[0] = STREAM_STATE_OPENED;
 
 					tcb->init_radwin = tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-					tcb->requested_acks[0] = 0;
 					tcb->txfree[0] = TX_BUFFER_SIZE;
 					tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 					if(tcb->stream_tx_buffer[0] != NULL){
@@ -3259,7 +3258,7 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 			break;
 		case TCB_ST_LISTEN:
 			if(event == FSM_EVENT_PKT_RCV){
-				if(!(tcp->flags & SYN) && (tcp->flags & ACK)){
+				if((!(tcp->flags & SYN)) && (tcp->flags & ACK)){
 					// ACK of the 3 way handshake: Find the corresponding entry in the backlog, and transition it from SYN_RECEIVED to ESTABLISHED
 
 					int backlog_index;
@@ -3301,7 +3300,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 						tcb->stream_rx_queue[0] = tcb->stream_rx_queue_tail[0] = NULL;
 						//tcb->adwin[0] = RX_VIRTUAL_BUFFER_SIZE; // For stream 0 this is initialized when the SYN is received
 						tcb->scheduler_tokens[0] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-						tcb->requested_acks[0] = 0;
 						tcb->txfree[0] = TX_BUFFER_SIZE;
 						tcb->tx_buffer_occupied_region_start[0] = tcb->tx_buffer_occupied_region_end[0] = 0;
 						tcb->next_ssn[0] = 1; // SSN 0 already sent (SYN)
@@ -3314,7 +3312,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_rx_queue[i] = tcb->stream_rx_queue_tail[i] = NULL;
 							tcb->adwin[i] = RX_VIRTUAL_BUFFER_SIZE; // RX buffer size
 							tcb->scheduler_tokens[i] = 0; // Initialized when the stream is created, based on the remote window for that stream
-							tcb->requested_acks[i] = 0;
 							tcb->txfree[i] = 0;
 							tcb->tx_buffer_occupied_region_start[i] = tcb->tx_buffer_occupied_region_end[i] = 0;
 							tcb->next_ssn[i] = 0;
@@ -3528,7 +3525,6 @@ int fsm(int s, int event, struct ip_datagram * ip, struct sockaddr_in* active_op
 							tcb->stream_state[sid] = STREAM_STATE_READY;
 
 							tcb->scheduler_tokens[sid] = inflate_window_scale(ntohs(tcp->window), tcb->in_window_scale_factor);
-							tcb->requested_acks[sid] = 0;
 							tcb->txfree[sid] = TX_BUFFER_SIZE;
 							tcb->tx_buffer_occupied_region_start[sid] = tcb->tx_buffer_occupied_region_end[sid] = 0;
 							if(tcb->stream_tx_buffer[sid] != NULL){
@@ -4287,56 +4283,6 @@ void print_rx_queue(struct tcpctrlblk* tcb){
 	printf("NULL\n");
 }
 
-struct ack_generation_queue_node{
-	struct ack_generation_queue_node* next;
-	int fd;
-	int backlog_index;
-
-	/*
-	Counts how many acks have been requested.
-	We can use this to generate more than 1 ack, according to some delayed ack policy (e.g. we transmit 1 ack every 2 packets).
-	If congestion control works with ABC, we could just send 1 ack regardless of how many have been requested (hoping that this single ACK is not lost).
-	This does not include dupACKs, that are handled differently.
-	*/
-	uint32_t requested_acks;
-};
-
-struct ack_generation_queue{
-	struct ack_generation_queue_node* head;
-};
-
-void add_ack_request_to_queue(struct ack_generation_queue* queue_ptr, int fd, int backlog_index){
-	// https://claude.ai/share/f8ab5c6c-3185-4d46-8ce6-27bb37144ae9
-
-    // Search if there is already a request in the queue for that (fd, backlog_index) combination
-    struct ack_generation_queue_node* current = queue_ptr->head;
-    while(current != NULL){
-        if(current->fd == fd && current->backlog_index == backlog_index){
-            // Found existing node: increment requested_acks and return
-            current->requested_acks++;
-            return;
-        }
-        current = current->next;
-    }
-
-    // No existing node found: allocate and initialize a new one
-    struct ack_generation_queue_node* new_node = mymalloc(sizeof(struct ack_generation_queue_node));
-    new_node->fd             = fd;
-    new_node->backlog_index  = backlog_index;
-    new_node->requested_acks = 1;
-    new_node->next           = NULL;
-
-    // Enqueue at the tail so requests are processed in FIFO order
-    if(queue_ptr->head == NULL){
-        queue_ptr->head = new_node;
-        return;
-    }
-    struct ack_generation_queue_node* tail = queue_ptr->head;
-    while(tail->next != NULL){
-        tail = tail->next;
-    }
-    tail->next = new_node;
-}
 
 void myio(int ignored){
 	int total_counter = 0;
@@ -4370,8 +4316,6 @@ void myio(int ignored){
 	}
 
 	check_rx_buffer_drops("myio_start");
-
-	struct ack_generation_queue requested_acks_queue = {.head = NULL};
 
 	struct sockaddr_ll from;
 	socklen_t from_len = sizeof(from);
@@ -4879,29 +4823,30 @@ void myio(int ignored){
 					if(!in_order_for_channel){
 						fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						out_ack_counter++;
+						tcb->requested_acks = 0;
 					}else{
-						add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
-						req_ack_counter++;
+						tcb->requested_acks++;
 					}
 				}else{
 					if(ms_option_included){
 						//prepare_tcp(i, ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 						if(!dummy_payload && in_order_for_channel){
-							tcb->requested_acks[sid]++;
+							tcb->requested_acks++;
 						}
 						else{
 							if(!in_order_for_channel){
 								fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 								out_ack_counter++;
+								tcb->requested_acks = 0;
 							}else{
-								add_ack_request_to_queue(&requested_acks_queue, i, backlog_index);
-								req_ack_counter++;
+								tcb->requested_acks++;
 							}
 						}
 					}else{
 						if(fin){
 							fast_send_tcp(i, backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 							out_ack_counter++;
+							tcb->requested_acks = 0;
 						}else{
 							DEBUG("Unexpected packet with payload but no MSTCP option or FIN flag:");
 							print_l2_packet(l2_rx_buf);
@@ -4944,6 +4889,7 @@ void myio(int ignored){
 		
 	}//packet reception while end
 
+	/*
 	// Generation of enqueued fast ACKs
 	while(requested_acks_queue.head != NULL){
 		struct ack_generation_queue_node* request_node = requested_acks_queue.head;
@@ -4956,6 +4902,7 @@ void myio(int ignored){
 		requested_acks_queue.head = requested_acks_queue.head->next;
 		myfree(request_node);
 	}
+	*/
 
 	assert_handler_lock_acquired("myio end");
 
@@ -5034,7 +4981,7 @@ void mytimer(int ignored){
 			struct txcontrolbuf* txcb = tcb->txfirst;
 			struct txcontrolbuf* prev = NULL;
 			int acc = 0; // payload bytes accumulator
-			bool something_sent_now[TOT_SID] = {false};
+			bool something_sent_now = false;
 			while(txcb != NULL && (acc < tcb->cgwin+tcb->lta || txcb->payloadlen == 0 || txcb->dummy_payload)){
 				// Karn invalidation not handled
 				if(txcb->retry == 0){
@@ -5090,9 +5037,7 @@ void mytimer(int ignored){
 				}
 				txcb->retry++;
 				txcb->txtime = tick;
-				if(txcb->sid >= 0){
-					something_sent_now[txcb->sid] = true;
-				}
+				something_sent_now = true;
 
 				clock_gettime(CLOCK_REALTIME, &t0);
 				update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
@@ -5114,67 +5059,11 @@ void mytimer(int ignored){
 				prev = txcb;
 				txcb = txcb->next;
 			}
-			if(txcb == NULL){
-				/* ACTUALLY we could just send a normal ack, and generate DMPs only in myread */
-
-
-				// we arrived at the end, so we can transmit DMP segments
-				bool something_added = false;
-				for(int sid = 0; sid<TOT_SID; sid++){
-					if(tcb->requested_acks[sid] > 0){
-						if(!something_sent_now[sid]){
-							const int optlen = sizeof(PAYLOAD_OPTIONS_TEMPLATE_MS);
-							uint8_t opt[optlen];
-							memcpy(opt, PAYLOAD_OPTIONS_TEMPLATE_MS, optlen);
-							
-							// Stream update
-							opt[2] = sid<<2 | (tcb->next_ssn[sid] >> 8)&0x3;
-							opt[3] = (tcb->next_ssn[sid])&0xFF;
-							update_next_ssn(&(tcb->next_ssn[sid]));
-
-							uint8_t dummy_payload[1] = {0}; // value doesn't matter
-
-							prepare_tcp(i, prepare_tcp_backlog_index, ACK | DMP, dummy_payload, 1, opt, optlen);
-							something_added = true;
-						}
-						tcb->requested_acks[sid] = 0;
-					}
-				}
-				if(something_added){
-					while(txcb!=NULL){
-						if(!txcb->dummy_payload || txcb->retry != 0){
-							ERROR("Something went wrong with requested_acks processing");
-						}
-						txcb->retry++;
-						txcb->txtime = tick;
-
-						clock_gettime(CLOCK_REALTIME, &t0);
-						update_tcp_header(i, backlog_index == fdinfo_backlog_length ? -1 : backlog_index, txcb);
-						clock_gettime(CLOCK_REALTIME, &t1);
-						update_tcp_header_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
-						if(txcb->seq >= tcb->highest_sent_sequence_number){
-							tcb->highest_sent_sequence_number = txcb->seq + txcb->payloadlen + (txcb->fin?1:0);
-						}
-						clock_gettime(CLOCK_REALTIME, &t0);
-						send_ip((unsigned char*) txcb->segment, (unsigned char*) &(tcb->r_addr), txcb->totlen, TCP_PROTO);
-						clock_gettime(CLOCK_REALTIME, &t1);
-						send_ip_ns += (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
-						sendto_ns += sendto_call_time;
-						eim_ns += eim_time;
-						out_packet_counter++;
-						out_bytes_counter += txcb->totlen;
-
-						acc += txcb->payloadlen;
-						prev = txcb;
-						txcb = txcb->next;
-					}
-				}
-			}else{
-				// we cannot transmit acks now, so we might as well ignore them completely...
-				for(int sid = 0; sid<TOT_SID; sid++){
-					tcb->requested_acks[sid] = 0;
-				}
+			if(!something_sent_now && tcb->requested_acks){
+				// Note: this is not accounted for in the mytimer statistics (update_tcp_header_ns and send_ip_ns)
+				fast_send_tcp(i, prepare_tcp_backlog_index, ACK, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 			}
+			tcb->requested_acks = 0;
 		}
 	}
 
