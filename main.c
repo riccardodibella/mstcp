@@ -2136,6 +2136,7 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, tcp_totlen));
 
 	send_ip((unsigned char*) tcp, (unsigned char*) &(tcb->r_addr), tcp_totlen, TCP_PROTO);
+	myfree(tcp);
 }
 
 
@@ -3910,6 +3911,7 @@ int myaccept(int s, struct sockaddr* addr, int * len){
 		// Remove the entry from the stream backlog
 		fdinfo[s].ready_streams--;
 		fdinfo[s].stream_backlog_head.next = first->next;
+		myfree(first);
 
 		prepare_tcp(free_fd, -1,  ACK, NULL, 0, PAYLOAD_OPTIONS_TEMPLATE, sizeof(PAYLOAD_OPTIONS_TEMPLATE));
 		enable_signal_reception(false);
@@ -6278,6 +6280,7 @@ void full_duplex_server_app(int listening_socket){
 				num_clients--;
 				DEBUG("num_clients=%d", num_clients);
 				if(num_clients == 0){
+					myfree(clients);
 					clients = NULL;
 				}else{
 					clients = myrealloc(clients, sizeof(struct single_srv_data)*num_clients);
