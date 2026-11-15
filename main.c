@@ -31,7 +31,7 @@
 #define NOLOGS
 //#define SHORTLOGS
 
-//#define USE_CUSTOM_MALLOC
+#define USE_CUSTOM_MALLOC
 
 #define MIN(x,y) ( ((x) > (y)) ? (y) : (x) )
 #define MAX(x,y) ( ((x) < (y)) ? (y) : (x) )
@@ -5108,6 +5108,18 @@ enum client_state{
 };
 int num_images;
 char** img_list = NULL;
+void free_img_list() {
+	if (img_list == NULL) {
+		return;
+	}
+	for (int i = 0; i < num_images; i++) {
+		safe_myfree(img_list[i]);
+		img_list[i] = NULL;
+	}
+	safe_myfree(img_list);
+	img_list = NULL;
+	num_images = 0;
+}
 void parse_html(char* html, int length){
 	num_images = 0;
 	char* start_ptr = html;
@@ -5431,6 +5443,8 @@ void main_client_app(){
 			}
 		}
 	}
+
+	free_img_list();
 
 	int64_t meas_end = get_timestamp_ms();
 	int64_t meas_dur = meas_end - meas_start;
