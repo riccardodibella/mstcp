@@ -4727,7 +4727,9 @@ void myio(int ignored){
 											tcb->stream_rx_queue_tail[sid] = newrx_stream;
 										}
 									}else{
-										//DEBUG("Discarding subsequent LSS");
+										// https://claude.ai/share/ab71f5f1-3c3c-4158-97f0-508a2705790e
+										myfree(newrx_stream->segment);
+										myfree(newrx_stream);
 									}
 
 									
@@ -5098,6 +5100,14 @@ void safe_myfree(void* ptr){
 	enable_signal_reception(false);
 }
 
+// To be used in user code
+void* safe_myrealloc(void* ptr, size_t size){
+	disable_signal_reception(false);
+	void* to_return = myrealloc(ptr, size);
+	enable_signal_reception(false);
+	return to_return;
+}
+
 #if CL_MAIN == CL_MAIN_HTML
 enum client_state{
 	CLIENT_ST_IDLE = 0,
@@ -5345,7 +5355,7 @@ void main_client_app(){
 				if(res < 0){
 					if(myerrno == EAGAIN){
 						myerrno = 0;
-						return;
+						continue;
 					}else{
 						myperror("mywrite");
 						ERROR("mywrite error");
@@ -6294,10 +6304,10 @@ void full_duplex_server_app(int listening_socket){
 				num_clients--;
 				DEBUG("num_clients=%d", num_clients);
 				if(num_clients == 0){
-					myfree(clients);
+					safe_myfree(clients);
 					clients = NULL;
 				}else{
-					clients = myrealloc(clients, sizeof(struct single_srv_data)*num_clients);
+					clients = safe_myrealloc(clients, sizeof(struct single_srv_data)*num_clients);
 				}
 			}else{
 				cur++;
