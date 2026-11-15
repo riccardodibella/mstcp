@@ -5081,8 +5081,13 @@ void mytimer(int ignored){
 }
 
 
+/*
+if USE_CUSTOM_MALLOC is defined, the following functions (to be used only in user-space) become thin wrappers around glibc's implementation, because
+there will be no conflicts between the user malloc (based on glibc) and the TCP one (custom)
+*/
 // To be used in user code
 void* safe_mymalloc(size_t sz){
+	#ifndef USE_CUSTOM_MALLOC
 	disable_signal_reception(false);
 	void* ret = mymalloc(sz);
 	if(ret == NULL && sz != 0){
@@ -5091,21 +5096,30 @@ void* safe_mymalloc(size_t sz){
 	}
 	enable_signal_reception(false);
 	return ret;
+	#else
+	return malloc(sz);
+	#endif
 }
-
 // To be used in user code
 void safe_myfree(void* ptr){
+	#ifndef USE_CUSTOM_MALLOC
 	disable_signal_reception(false);
 	myfree(ptr);
 	enable_signal_reception(false);
+	#else
+	return free(ptr);
+	#endif
 }
-
 // To be used in user code
 void* safe_myrealloc(void* ptr, size_t size){
+	#ifndef USE_CUSTOM_MALLOC
 	disable_signal_reception(false);
 	void* to_return = myrealloc(ptr, size);
 	enable_signal_reception(false);
 	return to_return;
+	#else
+	return realloc(ptr, size);
+	#endif
 }
 
 #if CL_MAIN == CL_MAIN_HTML
