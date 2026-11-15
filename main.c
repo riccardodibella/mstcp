@@ -2038,7 +2038,8 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 		ERROR("cannot use DMP with fast_send_tcp");
 	}
 	
-	struct tcp_segment * tcp = /*txcb->segment =*/ (struct tcp_segment *) mymalloc(sizeof(struct tcp_segment));
+	struct tcp_segment segment_in_stack;
+	struct tcp_segment * tcp = &segment_in_stack;
 	tcp->s_port = fdinfo[s].l_port;
 	tcp->d_port = tcb->r_port;
 	// tcp->seq = htonl(tcb->seq_offs+tcb->sequence);
@@ -2136,7 +2137,6 @@ void fast_send_tcp(int s, int backlog_entry_index, uint16_t flags /*Host order*/
 	tcp->checksum = htons(tcp_checksum((uint8_t*) &pseudo, sizeof(pseudo), (uint8_t*) tcp, tcp_totlen));
 
 	send_ip((unsigned char*) tcp, (unsigned char*) &(tcb->r_addr), tcp_totlen, TCP_PROTO);
-	myfree(tcp);
 }
 
 
